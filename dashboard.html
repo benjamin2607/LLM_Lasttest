@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LM Studio Live Monitor</title>
+<!-- Served locally by lmstudio_monitor.py. No external scripts, fonts or CDNs. -->
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f2; --surface: #fcfcfb; --surface-2: #f0efec; --border: #e2e1dc;
+  --text: #0b0b0b; --text-2: #52514e; --text-3: #7a7974; --grid: #e6e5e0;
+  --s1: #2a78d6; --s2: #eb6834; --s1-fill: rgba(42,120,214,.14); --s2-fill: rgba(235,104,52,.12);
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --track: #e6e5e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2e2e2b;
+    --text: #f0efec; --text-2: #c3c2b7; --text-3: #8f8e86; --grid: #2c2c29;
+    --s1: #3987e5; --s2: #d95926; --s1-fill: rgba(57,135,229,.20); --s2-fill: rgba(217,89,38,.16);
+    --track: #2e2e2b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #232321; --border: #2e2e2b;
+  --text: #f0efec; --text-2: #c3c2b7; --text-3: #8f8e86; --grid: #2c2c29;
+  --s1: #3987e5; --s2: #d95926; --s1-fill: rgba(57,135,229,.20); --s2-fill: rgba(217,89,38,.16);
+  --track: #2e2e2b;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1480px; margin: 0 auto; padding: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 14px; }
+h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex: none; }
+.dot.good { background: var(--good); } .dot.warn { background: var(--warning); } .dot.bad { background: var(--critical); }
+.dot.pulse { animation: pulse 1s ease-out infinite; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(12,163,12,.55); } 100% { box-shadow: 0 0 0 7px rgba(12,163,12,0); } }
+.spacer { flex: 1; }
+.seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.seg button { border: 0; background: none; color: var(--text-2); font: inherit; font-size: 12px; padding: 4px 10px;
+  border-radius: 6px; cursor: pointer; }
+.seg button.on { background: var(--surface-2); color: var(--text); font-weight: 600; }
+.clock { font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 13px; }
+
+.alert { display: none; align-items: center; gap: 10px; border: 1px solid var(--critical); border-left-width: 4px;
+  background: var(--surface); border-radius: 8px; padding: 9px 12px; margin-bottom: 14px; font-weight: 600; }
+.alert.show { display: flex; }
+.alert .ico { color: var(--critical); font-size: 16px; }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.kpi .label { font-size: 12px; color: var(--text-2); }
+.kpi .value { font-size: 30px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; margin-top: 2px; }
+.kpi .value small { font-size: 14px; font-weight: 500; color: var(--text-2); margin-left: 3px; }
+.kpi .sub { font-size: 12px; color: var(--text-3); margin-top: 2px; min-height: 18px; }
+.status { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; }
+
+.hw { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.meter .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.meter .val { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.meter .val small { font-size: 12px; font-weight: 500; color: var(--text-2); margin-left: 2px; }
+.bar { position: relative; height: 8px; border-radius: 4px; background: var(--track); margin-top: 8px; overflow: hidden; }
+.bar > i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--s1); transition: width .5s ease; }
+.bar > b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text-3); }
+.meter .sub { font-size: 12px; color: var(--text-3); margin-top: 6px; min-height: 18px; }
+
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+.chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.now { font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+.legend i.dotkey { width: 9px; height: 9px; border-radius: 50%; }
+.plot { position: relative; height: 210px; }
+.plot canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.12); white-space: nowrap;
+  display: none; z-index: 5; font-variant-numeric: tabular-nums; }
+.tip .t { color: var(--text-3); margin-bottom: 2px; }
+.tip .r { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.tip .r i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+
+.running { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow: auto; padding-right: 4px; }
+.run { display: grid; grid-template-columns: 26px 1fr 64px; align-items: center; gap: 8px; font-size: 12px; }
+.run .n { color: var(--text-3); text-align: right; font-variant-numeric: tabular-nums; }
+.run .track { position: relative; height: 18px; background: var(--track); border-radius: 4px; overflow: hidden; }
+.run .track i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; transition: width .9s linear; }
+.run .track span { position: absolute; left: 8px; top: 0; line-height: 18px; color: var(--text); font-size: 11px; }
+.run .age { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+.empty { color: var(--text-3); font-size: 13px; padding: 22px 0; text-align: center; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+th { text-align: right; font-weight: 600; color: var(--text-2); padding: 6px 8px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); }
+td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--grid); color: var(--text); }
+th:first-child, td:first-child, th:last-child, td:last-child { text-align: left; }
+td.model { color: var(--text-2); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+tr.fresh td { animation: fresh 2s ease-out; }
+@keyframes fresh { from { background: var(--s1-fill); } to { background: transparent; } }
+.tablewrap { max-height: 260px; overflow: auto; }
+footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px 18px; }
+@media (max-width: 520px) { .kpi .value { font-size: 26px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LM Studio · Live Monitor</h1>
+    <div class="chips">
+      <span class="chip" id="chipConn"><span class="dot"></span><span>connecting …</span></span>
+      <span class="chip" id="chipApi"><span class="dot"></span><span>API</span></span>
+      <span class="chip" id="chipLog"><span class="dot"></span><span>Log</span></span>
+      <span class="chip" id="chipModel"><span class="dot"></span><span>Model –</span></span>
+    </div>
+    <div class="spacer"></div>
+    <div class="seg" id="range" role="group" aria-label="Time range">
+      <button data-min="5">5 min</button><button data-min="15" class="on">15 min</button><button data-min="30">30 min</button>
+    </div>
+    <span class="clock" id="clock"></span>
+  </header>
+
+  <div class="alert" id="alert" role="alert"><span class="ico">⚠</span><span id="alertText"></span></div>
+
+  <section class="kpis">
+    <div class="card kpi"><div class="label">Active requests</div><div class="value" id="kActive">–</div><div class="sub" id="kActiveSub"></div></div>
+    <div class="card kpi"><div class="label">Responses per minute</div><div class="value" id="kRpm">–</div><div class="sub">rolling, last 60 s</div></div>
+    <div class="card kpi"><div class="label">Generated tokens/s</div><div class="value" id="kTps">–</div><div class="sub">rolling, last 30 s</div></div>
+    <div class="card kpi"><div class="label">Response time p95</div><div class="value" id="kP95">–</div><div class="sub" id="kP95Sub">last 5 min</div></div>
+    <div class="card kpi"><div class="label">First token p95</div><div class="value" id="kTtft">–</div><div class="sub">last 5 min</div></div>
+    <div class="card kpi"><div class="label">Requests since start</div><div class="value" id="kTotal">–</div><div class="sub" id="kTotalSub"></div></div>
+  </section>
+
+  <section class="hw" id="hw"></section>
+
+  <section class="grid2">
+    <div class="card">
+      <div class="chart-head"><h2>Concurrent requests</h2><span class="now" id="nActive"></span></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>active total</span><span><i style="background:var(--s2)"></i>of which waiting for first token</span></div>
+      <div class="plot" id="cActive"></div>
+    </div>
+    <div class="card">
+      <div class="chart-head"><h2>Generated tokens per second</h2><span class="now" id="nTps"></span></div>
+      <div class="legend" style="visibility:hidden"><span><i></i>.</span></div>
+      <div class="plot" id="cTps"></div>
+    </div>
+    <div class="card">
+      <div class="chart-head"><h2>GPU utilisation and VRAM (%)</h2><span class="now" id="nGpu"></span></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>GPU utilisation</span><span><i style="background:var(--s2)"></i>VRAM used</span></div>
+      <div class="plot" id="cGpu"></div>
+    </div>
+    <div class="card">
+      <div class="chart-head"><h2>Response time per request (s)</h2><span class="now" id="nLat"></span></div>
+      <div class="legend"><span><i class="dotkey" style="background:var(--s1)"></i>total duration</span><span><i class="dotkey" style="background:var(--s2)"></i>time to first token</span></div>
+      <div class="plot" id="cLat"></div>
+    </div>
+  </section>
+
+  <section class="grid2">
+    <div class="card">
+      <div class="chart-head"><h2>Running requests</h2><span class="legend"><span><i style="background:var(--s2)"></i>queued / processing prompt</span><span><i style="background:var(--s1)"></i>generating response</span></span></div>
+      <div class="running" id="running"></div>
+    </div>
+    <div class="card">
+      <div class="chart-head"><h2>Recently completed</h2><span class="legend">metrics only, no content</span></div>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Time</th><th>Duration</th><th>First token</th><th>Tokens in</th><th>Tokens out</th><th>Tokens/s</th><th>Model</th></tr></thead>
+        <tbody id="recent"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-bottom:12px">
+    <div class="chart-head"><h2>Daily view – completed requests per interval</h2><span class="now" id="nHist"></span></div>
+    <div class="plot" id="cHist" style="height:170px"></div>
+  </section>
+
+  <footer>
+    <span>Privacy: only timing and token metrics are shown – no prompts, responses, IP addresses or user identifiers.</span>
+    <span id="footLog"></span>
+  </footer>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmt = (v, d = 0) => v == null || Number.isNaN(v) ? "–" : Number(v).toLocaleString("en-GB", { minimumFractionDigits: d, maximumFractionDigits: d });
+const hhmmss = t => new Date(t * 1000).toLocaleTimeString("en-GB");
+const STATUS = { good: ["var(--good)", "✓", "ok"], warning: ["var(--warning)", "▲", "elevated"], critical: ["var(--critical)", "⚠", "critical"] };
+
+let rangeMin = 15, series = [], history = [], state = {}, config = {}, latPoints = new Map(), lastHistLen = -1, seenRecent = new Set();
+try { rangeMin = +localStorage.getItem("lmsRange") || 15; } catch (e) {}
+
+// ---------- Chart engine (canvas, one y-axis per chart) ----------
+class Chart {
+  constructor(el, opts) {
+    this.el = el; this.o = opts;
+    this.cv = document.createElement("canvas"); el.appendChild(this.cv);
+    this.tip = document.createElement("div"); this.tip.className = "tip"; el.appendChild(this.tip);
+    this.hover = null;
+    el.addEventListener("mousemove", e => { const r = el.getBoundingClientRect(); this.hover = { x: e.clientX - r.left, y: e.clientY - r.top }; this.draw(); });
+    el.addEventListener("mouseleave", () => { this.hover = null; this.tip.style.display = "none"; this.draw(); });
+  }
+  draw() {
+    const { el, cv, o } = this, dpr = devicePixelRatio || 1, W = el.clientWidth, H = el.clientHeight;
+    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const data = o.data(), [x0, x1] = o.xRange(), L = 40, R = 10, T = 8, B = 22, pw = W - L - R, ph = H - T - B;
+    let yMax = o.yMax ?? 0;
+    if (o.yMax == null) {
+      for (const s of o.series) for (const d of data) { const v = d[s.key]; if (v != null && v > yMax) yMax = v; }
+      if (o.threshold?.() != null) yMax = Math.max(yMax, o.threshold() * 1.1);
+      yMax = niceMax(yMax || o.minMax || 1);
+    }
+    const X = t => L + (t - x0) / (x1 - x0) * pw, Y = v => T + ph - Math.min(v, yMax) / yMax * ph;
+    // Grid and axes (recessive styling)
+    g.font = "11px system-ui, sans-serif"; g.fillStyle = css("--text-3"); g.strokeStyle = css("--grid"); g.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const v = yMax * i / 4, y = Math.round(Y(v)) + .5;
+      g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+      g.textAlign = "right"; g.fillText(fmt(v, yMax < 4 ? 1 : 0), L - 6, y + 4);
+    }
+    g.textAlign = "center";
+    const ticks = o.xTicks || 5;
+    for (let i = 0; i <= ticks; i++) {
+      const t = x0 + (x1 - x0) * i / ticks, d = new Date(t * 1000);
+      g.fillText(d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }), Math.min(Math.max(X(t), L + 14), W - R - 14), H - 6);
+    }
+    // Threshold line
+    const th = o.threshold?.();
+    if (th != null && th <= yMax) {
+      const y = Math.round(Y(th)) + .5; g.strokeStyle = css("--critical"); g.setLineDash([4, 4]);
+      g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke(); g.setLineDash([]);
+      g.fillStyle = css("--text-2"); g.textAlign = "left"; g.fillText(o.thresholdLabel || "Limit", L + 4, y - 4);
+    }
+    g.save(); g.beginPath(); g.rect(L, T - 2, pw, ph + 4); g.clip();
+    for (const s of o.series) {
+      const col = css(s.color), pts = data.filter(d => d[s.key] != null && d.t >= x0 - 2);
+      if (s.type === "dots") {
+        for (const d of pts) { g.beginPath(); g.arc(X(d.t), Y(d[s.key]), 4, 0, 7); g.fillStyle = col; g.fill(); g.lineWidth = 2; g.strokeStyle = css("--surface"); g.stroke(); }
+        continue;
+      }
+      if (s.type === "bars") {
+        const bw = Math.max(2, pw / Math.max(1, (x1 - x0) / (o.barWidth || 60)) - 2);
+        g.fillStyle = col;
+        for (const d of pts) { const x = X(d.t) - bw / 2, y = Y(d[s.key]); roundTop(g, x, y, bw, T + ph - y, Math.min(4, bw / 2)); }
+        continue;
+      }
+      if (!pts.length) continue;
+      g.beginPath();
+      pts.forEach((d, i) => {
+        const x = X(d.t), y = Y(d[s.key]);
+        if (i === 0) g.moveTo(x, y); else if (s.step) { g.lineTo(x, Y(pts[i - 1][s.key])); g.lineTo(x, y); } else g.lineTo(x, y);
+      });
+      g.strokeStyle = col; g.lineWidth = 2; g.lineJoin = "round"; g.stroke();
+      if (s.fill) { g.lineTo(X(pts[pts.length - 1].t), T + ph); g.lineTo(X(pts[0].t), T + ph); g.closePath(); g.fillStyle = css(s.fill); g.fill(); }
+    }
+    g.restore();
+    // Hover: crosshair for line charts, nearest point for scatter charts
+    if (!this.hover || !data.length) return;
+    const hx = this.hover.x, hy = this.hover.y, tAt = x0 + (hx - L) / pw * (x1 - x0);
+    let best = null, bestD = Infinity;
+    const dotMode = o.series.some(s => s.type === "dots");
+    for (const d of data) {
+      if (d.t < x0 || d.t > x1) continue;
+      let dist = Math.abs(X(d.t) - hx);
+      if (dotMode) { const vs = o.series.map(s => d[s.key]).filter(v => v != null); dist = Math.min(...vs.map(v => Math.hypot(X(d.t) - hx, Y(v) - hy))); }
+      if (dist < bestD) { bestD = dist; best = d; }
+    }
+    if (!best || (dotMode && bestD > 18) || tAt < x0) { this.tip.style.display = "none"; return; }
+    const bx = X(best.t);
+    g.strokeStyle = css("--text-3"); g.lineWidth = 1; g.beginPath(); g.moveTo(bx + .5, T); g.lineTo(bx + .5, T + ph); g.stroke();
+    for (const s of o.series) { const v = best[s.key]; if (v == null || s.type === "bars") continue;
+      g.beginPath(); g.arc(bx, Y(v), 4.5, 0, 7); g.fillStyle = css(s.color); g.fill(); g.lineWidth = 2; g.strokeStyle = css("--surface"); g.stroke(); }
+    this.tip.innerHTML = `<div class="t">${hhmmss(best.t)}</div>` + o.series.map(s =>
+      `<div class="r"><i style="background:${css(s.color)}"></i>${s.label}: <b>${fmt(best[s.key], s.digits ?? 0)}${s.unit || ""}</b></div>`).join("");
+    this.tip.style.display = "block";
+    const tw = this.tip.offsetWidth; this.tip.style.left = (bx + 12 + tw > W ? bx - tw - 12 : bx + 12) + "px"; this.tip.style.top = "6px";
+  }
+}
+function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p; }
+function roundTop(g, x, y, w, h, r) { if (h <= 0) return; r = Math.min(r, h); g.beginPath(); g.moveTo(x, y + h); g.lineTo(x, y + r); g.quadraticCurveTo(x, y, x + r, y); g.lineTo(x + w - r, y); g.quadraticCurveTo(x + w, y, x + w, y + r); g.lineTo(x + w, y + h); g.closePath(); g.fill(); }
+
+// Time window: the selected range, but never earlier than the first data point (right after start-up)
+const liveRange = () => { const now = series.length ? series[series.length - 1].t : Date.now() / 1000;
+  const first = series.length ? series[0].t : now; return [Math.max(now - rangeMin * 60, Math.min(first, now - 60)), now]; };
+const charts = [
+  new Chart($("cActive"), { data: () => series, xRange: liveRange, minMax: 4, series: [
+    { key: "active", label: "active", color: "--s1", fill: "--s1-fill", step: true },
+    { key: "waiting", label: "waiting", color: "--s2", step: true }] }),
+  new Chart($("cTps"), { data: () => series, xRange: liveRange, minMax: 10, series: [
+    { key: "tokens_per_s", label: "Tokens/s", color: "--s1", fill: "--s1-fill", digits: 1 }] }),
+  new Chart($("cGpu"), { data: () => series, xRange: liveRange, yMax: 100, threshold: () => config.alert_vram_pct, thresholdLabel: "VRAM alert threshold", series: [
+    { key: "gpu_util", label: "GPU", color: "--s1", unit: " %" },
+    { key: "vram_pct", label: "VRAM", color: "--s2", unit: " %", digits: 1 }] }),
+  new Chart($("cLat"), { data: () => [...latPoints.values()].sort((a, b) => a.t - b.t), xRange: liveRange, minMax: 5,
+    threshold: () => config.alert_p95, thresholdLabel: "p95 alert threshold", series: [
+    { key: "duration", label: "total", color: "--s1", type: "dots", unit: " s", digits: 1 },
+    { key: "ttft", label: "first token", color: "--s2", type: "dots", unit: " s", digits: 1 }] }),
+];
+const histChart = new Chart($("cHist"), { data: () => history, xTicks: 6, minMax: 5,
+  xRange: () => { const n = Date.now() / 1000; return history.length ? [Math.min(history[0].t - config.interval, n - 3600), n] : [n - 3600, n]; },
+  get barWidth() { return config.interval || 60; },
+  series: [{ key: "requests_completed", label: "requests", color: "--s1", type: "bars" }] });
+
+// ---------- Rendering ----------
+function setChip(id, cls, text, pulse) {
+  const c = $(id); c.querySelector(".dot").className = "dot " + (cls || "") + (pulse ? " pulse" : ""); c.querySelector("span:last-child").textContent = text;
+}
+function statusOf(v, warn, crit) { return v == null ? null : v >= crit ? "critical" : v >= warn ? "warning" : "good"; }
+function statusHtml(st) { if (!st) return ""; const [c, ico, txt] = STATUS[st]; return `<span class="status" style="color:var(--text)"><span style="color:${c}">${ico}</span>${txt}</span>`; }
+
+function renderHw() {
+  const s = state.system || {}, gpu = state.gpu_available;
+  const vramGb = s.vram_used_mb != null ? s.vram_used_mb / 1024 : null, vramTot = s.vram_total_mb != null ? s.vram_total_mb / 1024 : null;
+  const items = [
+    { label: "GPU utilisation", v: s.gpu_util, unit: "%", max: 100, st: null, sub: gpu ? "" : "nvidia-smi not found" },
+    { label: "VRAM", v: vramGb, unit: vramTot ? `/ ${fmt(vramTot)} GB` : "GB", d: 1, max: vramTot || 96, mark: vramTot ? vramTot * config.alert_vram_pct / 100 : null,
+      st: statusOf(s.vram_pct, config.alert_vram_pct - 10, config.alert_vram_pct), sub: s.vram_pct != null ? `${fmt(s.vram_pct, 1)} % used` : "" },
+    { label: "GPU temperature", v: s.gpu_temp, unit: "°C", min: 25, max: 95, mark: config.alert_gpu_temp, st: statusOf(s.gpu_temp, config.alert_gpu_temp - 8, config.alert_gpu_temp) },
+    { label: "GPU power", v: s.gpu_power_w, unit: "W", max: 600 },
+    { label: "System memory", v: s.ram_pct, unit: "%", max: 100, st: statusOf(s.ram_pct, 85, 95), sub: s.ram_used_gb != null ? `${fmt(s.ram_used_gb, 1)} GB used` : "" },
+    { label: "CPU", v: s.cpu_pct, unit: "%", max: 100 },
+  ];
+  $("hw").innerHTML = items.map(it => {
+    const lo = it.min || 0, w = it.v == null ? 0 : Math.max(0, Math.min(100, (it.v - lo) / (it.max - lo) * 100));
+    const col = it.st === "critical" ? "var(--critical)" : it.st === "warning" ? "var(--warning)" : "var(--s1)";
+    const mark = it.mark != null ? `<b style="left:${(it.mark - lo) / (it.max - lo) * 100}%"></b>` : "";
+    return `<div class="card meter"><div class="top"><h2>${it.label}</h2>${it.st && it.st !== "good" ? statusHtml(it.st) : ""}</div>
+      <div class="val">${fmt(it.v, it.d || 0)}<small>${it.unit}</small></div>
+      <div class="bar"><i style="width:${w}%;background:${col}"></i>${mark}</div><div class="sub">${it.sub || ""}</div></div>`;
+  }).join("");
+}
+
+function renderRunning() {
+  const run = state.running || [];
+  if (!run.length) { $("running").innerHTML = `<div class="empty">No running requests</div>`; return; }
+  const scale = Math.max(config.alert_p95 || 60, ...run.map(r => r.age));
+  $("running").innerHTML = run.map((r, i) => `<div class="run"><span class="n">${i + 1}</span>
+    <div class="track"><i style="width:${Math.max(2, r.age / scale * 100)}%;background:${r.generating ? "var(--s1-fill)" : "var(--s2-fill)"};border-right:3px solid ${r.generating ? "var(--s1)" : "var(--s2)"}"></i>
+    <span>${r.generating ? "generating response" : "queued / processing prompt"}${r.model ? " · " + escapeHtml(r.model) : ""}</span></div>
+    <span class="age">${fmt(r.age, 0)} s</span></div>`).join("");
+}
+
+function renderRecent() {
+  const rows = state.recent || [];
+  $("recent").innerHTML = rows.length ? rows.map(r => {
+    const key = r.end + "|" + r.duration_s, fresh = !seenRecent.has(key); seenRecent.add(key);
+    return `<tr class="${fresh && seenRecent.size > rows.length ? "fresh" : ""}"><td>${hhmmss(r.end)}</td><td>${fmt(r.duration_s, 1)} s</td><td>${r.ttft_s != null ? fmt(r.ttft_s, 1) + " s" : "–"}</td>
+      <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.completion_tokens)}</td><td>${fmt(r.tokens_per_s, 1)}</td><td class="model">${escapeHtml(r.model || "–")}</td></tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">No completed requests since start</td></tr>`;
+  for (const r of rows) if (r.duration_s != null) latPoints.set(r.end + "|" + r.duration_s, { t: r.end, duration: r.duration_s, ttft: r.ttft_s });
+  const cutoff = Date.now() / 1000 - 1800;
+  for (const [k, p] of latPoints) if (p.t < cutoff) latPoints.delete(k);
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+function render() {
+  const s = state, sys = s.system || {}, tot = s.totals || {};
+  $("kActive").textContent = fmt(s.active);
+  $("kActiveSub").textContent = s.active ? `${fmt(s.waiting)} waiting for first token` : "idle";
+  $("kRpm").textContent = fmt(s.requests_per_min, 1);
+  $("kTps").textContent = fmt(s.tokens_per_s, 1);
+  $("kP95").innerHTML = s.latency_p95_s != null ? `${fmt(s.latency_p95_s, 1)}<small>s</small>` : "–";
+  const p95st = statusOf(s.latency_p95_s, config.alert_p95 * 0.75, config.alert_p95);
+  $("kP95Sub").innerHTML = (s.latency_avg_s != null ? `Ø ${fmt(s.latency_avg_s, 1)} s · ` : "") + "last 5 min " + (p95st && p95st !== "good" ? statusHtml(p95st) : "");
+  $("kTtft").innerHTML = s.ttft_p95_s != null ? `${fmt(s.ttft_p95_s, 1)}<small>s</small>` : "–";
+  $("kTotal").textContent = fmt(tot.completed);
+  $("kTotalSub").textContent = `${fmt(tot.completion_tokens)} tokens generated · ${fmt(tot.errors)} errors` + (s.monitor_started ? ` · since ${new Date(s.monitor_started * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}` : "");
+
+  setChip("chipApi", s.api_ok === true ? "good" : s.api_ok === false ? "bad" : "", s.api_ok === true ? "LM Studio online" : s.api_ok === false ? "LM Studio offline" : "API not queried");
+  const la = s.log_age_s;
+  setChip("chipLog", s.log_file ? (la != null && la < 120 ? "good" : "warn") : "bad",
+    !s.log_file ? "no log found" : la == null ? "log: no lines yet" : la < 60 ? `log active (${fmt(la)} s ago)` : `log idle for ${fmt(la / 60)} min`);
+  const models = s.models || [];
+  setChip("chipModel", models.length ? "good" : "", models.length ? models.join(", ") : "no model loaded");
+  $("footLog").textContent = s.log_file ? `Log file: ${s.log_file}` : "";
+
+  const al = s.alerts || [];
+  $("alert").classList.toggle("show", al.length > 0); $("alertText").textContent = al.length ? "Warning: " + al.join(" · ") : "";
+
+  $("nActive").textContent = `now ${fmt(s.active)}`;
+  $("nTps").textContent = `now ${fmt(s.tokens_per_s, 1)}`;
+  $("nGpu").textContent = sys.gpu_util != null ? `GPU ${fmt(sys.gpu_util)} % · VRAM ${fmt(sys.vram_pct, 1)} %` : "no GPU data";
+  $("nLat").textContent = s.latency_p95_s != null ? `p95 ${fmt(s.latency_p95_s, 1)} s` : "";
+  const hl = history[history.length - 1];
+  $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;
+
+  renderHw(); renderRunning(); renderRecent();
+  charts.forEach(c => c.draw()); histChart.draw();
+}
+
+// ---------- Initial load and live stream ----------
+async function loadFull() {
+  const d = await (await fetch("api/state", { cache: "no-store" })).json();
+  series = d.series; config = d.config; state = d.state || {};
+  history = d.history.map(h => ({ ...h, t: new Date(h.time).getTime() / 1000 }));
+  lastHistLen = d.history.length;
+  for (const p of d.latency_points || []) latPoints.set(p.t + "|" + p.duration, p);
+}
+let es, drawQueued = false;
+function queueRender() { if (!drawQueued) { drawQueued = true; requestAnimationFrame(() => { drawQueued = false; render(); }); } }
+function connect() {
+  es = new EventSource("api/stream");
+  es.onopen = () => setChip("chipConn", "good", "live", true);
+  es.onmessage = async ev => {
+    const m = JSON.parse(ev.data);
+    if (m.point && (!series.length || m.point.t > series[series.length - 1].t)) { series.push(m.point); if (series.length > 1800) series.shift(); }
+    state = m.state || state;
+    if (m.history_len !== lastHistLen) { try { await loadFull(); } catch (e) {} }
+    queueRender();
+  };
+  es.onerror = () => setChip("chipConn", "bad", "disconnected – retrying …");
+}
+document.querySelectorAll("#range button").forEach(b => {
+  b.classList.toggle("on", +b.dataset.min === rangeMin);
+  b.onclick = () => { rangeMin = +b.dataset.min; try { localStorage.setItem("lmsRange", rangeMin); } catch (e) {}
+    document.querySelectorAll("#range button").forEach(x => x.classList.toggle("on", x === b)); queueRender(); };
+});
+setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString("en-GB"); }, 1000);
+addEventListener("resize", queueRender);
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", queueRender);
+loadFull().then(render).catch(() => {}).finally(connect);
+</script>
+</body>
+</html>

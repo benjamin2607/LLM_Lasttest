@@ -1,9 +1,17 @@
-## Workstation am Campus:
-python -m locust -f "PFAD_ZUR_SKRIPT_DATEI" --host http://localhost:3001
+# Manual Locust run
 
-### Flags
-- "--wait-min", type=float, default=5.0, help="Minimale Denkpause in Sekunden"
-- "--wait-max", type=float, default=15.0, help="Maximale Denkpause in Sekunden"
-- "--mode", choices=["query", "chat"], default="query", help="query = nur RAG/Dokumente, chat = normaler Chat"
-- "--request-timeout", type=float, default=300.0, help="Timeout pro Anfrage in Sekunden"
-- "--messages-per-thread", type=int, default=5, help="Nach so vielen Nachrichten startet ein neuer Thread (0 = nie)"
+## Campus workstation
+```bash
+python -m locust -f main.py --host http://localhost:3001
+```
+
+### Options
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `--wait-min` | float | 5.0 | Minimum think time in seconds |
+| `--wait-max` | float | 15.0 | Maximum think time in seconds |
+| `--mode` | `query` \| `chat` | `query` | `query` = answer from workspace documents only (RAG), `chat` = regular chat |
+| `--request-timeout` | float | 300.0 | Timeout per request in seconds |
+| `--messages-per-thread` | int | 5 | Start a new thread after this many messages (0 = never) |
+
+For automated capacity testing see `auto_loadtest.py` in the README.
