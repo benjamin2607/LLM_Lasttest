@@ -1,3 +1,14 @@
+"""
+Locust user definition for load testing the AnythingLLM developer API.
+
+Each simulated user opens a workspace thread, sends questions from prompts.json
+and starts a new thread after a configurable number of messages to bound
+context growth.
+
+Required environment variables:
+    ANYTHING_API_KEY  AnythingLLM developer API key
+    WORKSPACE_SLUG    Slug of the workspace under test
+"""
 import os
 import random
 import uuid
@@ -8,29 +19,29 @@ from locust import HttpUser, task, events
 API_KEY = os.environ["ANYTHING_API_KEY"]
 WORKSPACE = os.environ["WORKSPACE_SLUG"]
 
-with open("prompts.json", "r") as f:
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.json"), "r", encoding="utf-8") as f:
     QUESTIONS = json.load(f)
 
 
-# ---------- Eigene Parameter (erscheinen auch in der Web-UI) ----------
+# ---------- Custom options (also shown in the Locust web UI) ----------
 @events.init_command_line_parser.add_listener
 def add_custom_args(parser):
-    g = parser.add_argument_group("LLM-Test")
+    g = parser.add_argument_group("LLM test")
     g.add_argument("--wait-min", type=float, default=5.0,
-                   help="Minimale Denkpause in Sekunden")
+                   help="Minimum think time in seconds")
     g.add_argument("--wait-max", type=float, default=15.0,
-                   help="Maximale Denkpause in Sekunden")
+                   help="Maximum think time in seconds")
     g.add_argument("--mode", choices=["query", "chat"], default="query",
-                   help="query = nur RAG/Dokumente, chat = normaler Chat")
+                   help="query = answer from workspace documents only (RAG), chat = regular chat")
     g.add_argument("--request-timeout", type=float, default=300.0,
-                   help="Timeout pro Anfrage in Sekunden")
+                   help="Timeout per request in seconds")
     g.add_argument("--messages-per-thread", type=int, default=5,
-                   help="Nach so vielen Nachrichten startet ein neuer Thread (0 = nie)")
+                   help="Start a new thread after this many messages (0 = never)")
 
 
 class AnythingLLMUser(HttpUser):
 
-    # wait_time als Methode, damit die Werte aus den Parametern kommen
+    # Defined as a method so the values can come from the command-line options.
     def wait_time(self):
         opts = self.environment.parsed_options
         return random.uniform(opts.wait_min, opts.wait_max)
@@ -65,13 +76,13 @@ class AnythingLLMUser(HttpUser):
                 response.success()
             except ValueError:
                 self.thread_slug = None
-                response.failure("Ungültige Antwort beim Erstellen des Threads")
+                response.failure("Invalid response while creating thread")
 
     @task
     def ask(self):
         opts = self.environment.parsed_options
 
-        # Neuer Thread nach N Nachrichten (begrenzt das Kontextwachstum)
+        # Rotate to a new thread after N messages to bound context growth.
         if opts.messages_per_thread and self.msg_count >= opts.messages_per_thread:
             self.create_thread()
 
@@ -87,7 +98,7 @@ class AnythingLLMUser(HttpUser):
             endpoint,
             headers=self.headers,
             json=payload,
-            name=f"/thread/chat [{opts.mode}]",   # trennt die Statistik nach Modus
+            name=f"/thread/chat [{opts.mode}]",   # Keeps statistics separate per mode.
             timeout=opts.request_timeout,
             catch_response=True,
         ) as response:
@@ -97,9 +108,9 @@ class AnythingLLMUser(HttpUser):
             try:
                 result = response.json()
                 if not result.get("textResponse"):
-                    response.failure("Keine textResponse erhalten")
+                    response.failure("No textResponse received")
                 else:
                     self.msg_count += 1
                     response.success()
             except ValueError:
-                response.failure("Antwort ist kein gültiges JSON")
+                response.failure("Response is not valid JSON")
