@@ -68,8 +68,9 @@ the monitor needs `ANYTHING_API_KEY` (and `--anythingllm-url` if AnythingLLM is 
 `http://localhost:3001`) to delete the threads. Without a running load test, the button only
 deletes the load-test threads.
 
-Results are written to `loadtest_results/<timestamp>/`: `report.html` (summary,
-recommendation and charts in one self-contained file), `report.md` (the same as Markdown,
+Results are written to `loadtest_results/<timestamp>/`: `report.html` (in the same layout as
+the live session reports: key figure tiles, statistics tiles with average, median, p95 and
+maximum at the stage with the highest stable throughput, charts, refusals and the stage table), `report.md` (the same as Markdown,
 charts as SVG files in `charts/`), `results.csv`/`results.json`, and a Locust HTML report
 plus log per stage. The charts show, per number of concurrent users: response time (average,
 p95, limit), throughput, generated tokens per second, failure and refusal rate, GPU
@@ -117,12 +118,13 @@ python lmstudio_monitor.py
 Opens the dashboard at `http://127.0.0.1:8765` (reachable from the local machine
 only). It updates **every second** via a live stream and shows:
 
-- **Status bar:** connection, LM Studio online/offline, whether the log is being written, loaded models, detected GPU, load test status, and **Clear**, which resets all values shown and starts afresh (stored CSV data is kept; a restart does not restore cleared values). Warnings appear only in the tile they belong to
-- **Load test card** at the bottom: status of a running load test and the "Stop & delete threads" button
+- **Status bar:** a compact row of status LEDs (connection, LM Studio, log, model, GPU) that expands into the details on click, the load test status, and **Clear**, which resets all values shown and starts afresh (stored CSV data is kept; a restart does not restore cleared values). Warnings appear only in the tile they belong to
+- **Load test card** at the bottom: status, link to the latest report, "Stop & delete threads", and **New load test** – a form with all main parameters (stages, durations, think time, mode, limits, threads kept) and their defaults that starts `auto_loadtest.py`. The monitor needs `ANYTHING_API_KEY` and `WORKSPACE_SLUG` (or enter them in the form; the key is passed to the process only and never stored)
+- **Sessions card** at the bottom: list of recorded sessions with links to their reports, and **Report for a past time range** (see below)
 - **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start. Below a divider, each tile also shows the average over the selected time range (5/15/30 min); the response time and first token tiles add the p95 for that range
 - **Statistics:** the tokens-per-second and response-time charts show mean (Ø), median and standard deviation (σ) for the selected range next to the current value
 - **Hardware:** GPU utilisation, VRAM (GB and %), temperature, power draw, system memory, CPU – with alert thresholds
-- **Live charts** (5/15/30 minutes, tooltips on hover): concurrent requests, tokens per second, GPU/VRAM, response time of every individual request
+- **Live charts** (5/15/30 minutes or **Max** – since the running session started, otherwise all kept data, up to `--keep-hours`, default 4 h; tooltips on hover): concurrent requests, tokens per second, GPU/VRAM, response time of every individual request
 - **Running requests** as bars that grow in real time (phase: queued/processing prompt or generating).
   A request without any log activity for 5 minutes (`--stall-minutes`) is marked **stalled** in red.
   Its "⋯" menu removes it from the monitor, and "Remove N stalled" removes all of them; each removal is
@@ -173,6 +175,12 @@ files at any time:
 ```bash
 python live_session.py --report monitoring/sessions/<folder>
 ```
+
+**Report for a past time range.** A session can also be created afterwards for any time range
+(Sessions card): requests are reconstructed from the LM Studio log, per-minute values come from
+the monitor's daily CSV files, and hardware values from the monitor's 5-second data where it still
+holds them, otherwise from the per-minute values. Without a running monitor in that time, only the
+request data is available.
 
 Sessions store only numbers, times and model names – no prompts, responses, IP addresses or
 user identifiers – so the data cannot be linked to individual students. Without a session,
