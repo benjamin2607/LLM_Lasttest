@@ -24,6 +24,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from live_session import SessionManager
 from lmstudio_log_parser import LogParser, diagnose, rnd
 from system_metrics import SystemSampler
 
@@ -216,9 +218,38 @@ class LiveRecorder(threading.Thread):
         self.models, self.api_ok, self._last_api = [], None, 0.0
         self.started = time.time()
         self.keep_s = keep_s
+        self.sessions = None  # SessionManager, set by main().
         self.hardware_file = Path(args.out) / ".live_hardware.json"
+        self.cleared_file = Path(args.out) / ".cleared_at"
+        self.cleared_at = self._load_cleared_at()
         self._saved_hardware = self._load_hardware()
         self._last_save = time.time()
+
+    # --- dashboard "Clear" ---
+    def _load_cleared_at(self):
+        try:
+            return float(self.cleared_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def clear(self):
+        """
+        Reset everything the dashboard shows and start afresh. Stored CSV data is kept; the time of
+        the reset is remembered so a restart does not restore the cleared values from the log.
+        """
+        now = time.time()
+        self.parser.reset()
+        with self.cond:
+            self.series.clear()
+            self.history.clear()
+            self.started = self.cleared_at = now
+            self._saved_hardware = {}
+        try:
+            self.cleared_file.write_text(str(now), encoding="utf-8")
+            self.hardware_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("[monitor] dashboard values cleared")
 
     # --- restoring state after a restart ---
     def _load_hardware(self):
@@ -227,7 +258,7 @@ class LiveRecorder(threading.Thread):
             points = json.loads(self.hardware_file.read_text(encoding="utf-8")).get("points", [])
         except (OSError, ValueError):
             return {}
-        cutoff = time.time() - self.keep_s
+        cutoff = max(time.time() - self.keep_s, self.cleared_at)
         return {int(p["t"]): p for p in points if p.get("t", 0) >= cutoff}
 
     def save_hardware(self):
@@ -251,7 +282,7 @@ class LiveRecorder(threading.Thread):
 
     def load_history(self, out_dir):
         """Fill the daily view from the CSV rows of the last 24 hours."""
-        cutoff = datetime.now().timestamp() - 24 * 3600
+        cutoff = max(datetime.now().timestamp() - 24 * 3600, self.cleared_at)
         rows = []
         for path in sorted(Path(out_dir).glob("lmstudio_metrics_*.csv"))[-2:]:
             try:
@@ -314,6 +345,8 @@ class LiveRecorder(threading.Thread):
                 self.state = state
                 self.seq += 1
                 self.cond.notify_all()
+            if self.sessions is not None and self.sessions.current is not None:
+                self.sessions.current.record_hardware(sysm)
             if time.time() - self._last_save >= self.SAVE_EVERY_S:
                 self._last_save = time.time()
                 self.save_hardware()
@@ -431,7 +464,7 @@ class LoadTestControl:
 DASHBOARD_FILE = Path(__file__).resolve().parent / "dashboard.html"
 
 
-def start_dashboard(port, recorder, control):
+def start_dashboard(port, recorder, control, sessions):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, body, ctype):
             self.send_response(200)
@@ -445,7 +478,16 @@ def start_dashboard(port, recorder, control):
             if path in ("/", "/index.html"):
                 self._send(DASHBOARD_FILE.read_bytes(), "text/html; charset=utf-8")
             elif path == "/api/state":
-                self._send(json.dumps({**recorder.full(), "control": control.state()}).encode(), "application/json")
+                self._send(json.dumps({**recorder.full(), "control": control.state(),
+                                       "session": sessions.state()}).encode(), "application/json")
+            elif path.startswith("/sessions/") and path.endswith("/report.html"):
+                folder = path.split("/")[2]
+                report = sessions.root / folder / "report.html"
+                # Only plain folder names inside the sessions directory are served.
+                if re.fullmatch(r"[\w.-]+", folder) and report.is_file():
+                    self._send(report.read_bytes(), "text/html; charset=utf-8")
+                else:
+                    self.send_error(404)
             elif path == "/api/stream":
                 self._stream()
             else:
@@ -457,10 +499,34 @@ def start_dashboard(port, recorder, control):
             from the dashboard's own origin (other sites would need a CORS preflight, which this server
             never grants), so third-party pages cannot trigger it.
             """
-            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop"):
+            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session"):
                 self.send_error(403)
                 return
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/monitor/clear":
+                recorder.clear()
+                session = sessions.current
+                if session is not None:  # "Clear" ends the running session (with report) and starts a new one.
+                    label = session.meta["label"]
+                    sessions.end()
+                    sessions.start(label, recorder.models)
+                self._send(json.dumps({"cleared": True}).encode(), "application/json")
+                return
+            if path == "/api/session/start":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    label = str(json.loads(self.rfile.read(length) or b"{}").get("label", ""))[:120]
+                except ValueError:
+                    label = ""
+                self._send(json.dumps(sessions.start(label or "Live test", recorder.models)).encode(),
+                           "application/json")
+                return
+            if path == "/api/session/end":
+                self._send(json.dumps(sessions.end() or {}).encode(), "application/json")
+                return
+            if path == "/api/session/report":
+                self._send(json.dumps(sessions.report_now() or {}).encode(), "application/json")
+                return
             if path == "/api/system/stop":
                 started = control.start()
                 self._send(json.dumps({"started": started}).encode(), "application/json")
@@ -491,6 +557,7 @@ def start_dashboard(port, recorder, control):
                         msg = {"point": recorder.series[-1] if recorder.series else None,
                                "state": recorder.state, "history_len": len(recorder.history)}
                     msg["control"] = control.state()
+                    msg["session"] = sessions.state()
                     self.wfile.write(f"data: {json.dumps(msg)}\n\n".encode())
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -523,6 +590,8 @@ def main():
                     help="AnythingLLM URL for deleting load-test threads (API key from env ANYTHING_API_KEY)")
     ap.add_argument("--project-dir", default=str(Path(__file__).resolve().parent),
                     help="Folder of auto_loadtest.py (status, stop and thread registry files)")
+    ap.add_argument("--session", metavar="LABEL",
+                    help="Start a recording session for a live test right away (or use the dashboard)")
     ap.add_argument("--stall-minutes", type=float, default=5,
                     help="Mark a running request as stalled after N minutes without any log activity")
     ap.add_argument("--replay-minutes", type=int, default=30,
@@ -556,13 +625,25 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     recorder = LiveRecorder(parser, sampler, args, follower)
     recorder.load_history(out_dir)
+    # Sessions are set up before the log replay, so requests made while the monitor was not
+    # running are added to a resumed session.
+    sessions = SessionManager(out_dir, sampler.gpu.info())
+    recorder.sessions = sessions
+    parser.on_request_done = lambda req, status: sessions.current and sessions.current.record_request(req, status)
+    if args.session:
+        if sessions.current:
+            print(f"[monitor] continuing the active session \"{sessions.current.meta['label']}\" "
+                  "(end it in the dashboard to start a new one)")
+        else:
+            sessions.start(args.session)
     if follower:
         # Restore the recent past so the dashboard is filled right after a restart.
         t0 = time.time()
         replay_window = 0 if args.from_start else args.replay_minutes * 60
+        replay_window = max(0, min(replay_window, time.time() - recorder.cleared_at))  # Not before a "Clear".
         follower.open_initial(replay_window=replay_window, sample=recorder.replay_sample)
         if replay_window:
-            print(f"[monitor] restored the last {args.replay_minutes} min from the log "
+            print(f"[monitor] restored the last {replay_window / 60:.0f} min from the log "
                   f"({len(parser.recent)} completed requests, {time.time() - t0:.1f}s)")
         follower.start()
     sampler.start()
@@ -576,7 +657,7 @@ def main():
     if args.dashboard_port:
         try:
             control = LoadTestControl(args.project_dir, args.anythingllm_url, os.environ.get("ANYTHING_API_KEY"))
-            start_dashboard(args.dashboard_port, recorder, control)
+            start_dashboard(args.dashboard_port, recorder, control, sessions)
         except OSError as exc:
             sys.exit(f"[monitor] ERROR: cannot bind dashboard to 127.0.0.1:{args.dashboard_port} ({exc.strerror}). "
                      "Is another monitor instance running? Choose a different port with --dashboard-port.")
@@ -604,6 +685,8 @@ def main():
             row["alerts"] = "WARNING: " + ", ".join(alerts) if alerts else ""
             with recorder.cond:
                 recorder.history.append(row)
+            if sessions.current is not None:
+                sessions.current.record_interval(row)
 
             csv_path = out_dir / f"lmstudio_metrics_{now:%Y-%m-%d}.csv"
             new_file = not csv_path.exists()
@@ -623,6 +706,10 @@ def main():
         print("\n[monitor] stopped.")
     finally:
         recorder.save_hardware()
+        if sessions.current is not None:
+            sessions.report_now()  # Report so far; the session stays active and resumes on the next start.
+            print(f"[monitor] session \"{sessions.current.meta['label']}\" stays active; "
+                  f"report so far: {sessions.current.folder / 'report.html'}")
         sampler.stop()
         if follower:
             follower.stop()

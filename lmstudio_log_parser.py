@@ -123,6 +123,9 @@ class LogParser:
         self.stall_after = stall_after            # Without any log activity for this long, a request is "stalled".
         self.clock = clock
         self.default_model = None         # Set by the caller when exactly one model is loaded.
+        # Called as on_request_done(request, status) when a request ends: "completed", "failed",
+        # "rejected", "stale" or "dismissed". Runs while the parser lock is held; keep it short.
+        self.on_request_done = None
         self.open = []                    # In-flight requests, oldest first.
         self.api_pending = deque()        # API requests awaiting their API-level completion entry.
         self.by_cid = {}                  # Streamed requests keyed by completion ID.
@@ -284,9 +287,16 @@ class LogParser:
             self._inc("errors")
             tag = model_tag(line.replace("[ERROR]", "[INFO]", 1))
             if tag:
-                self._abort_oldest(tag)
+                self._abort_oldest(tag, now)
 
-    def _abort_oldest(self, model):
+    def _notify(self, req, status):
+        if self.on_request_done is not None:
+            try:
+                self.on_request_done(req, status)
+            except Exception as exc:  # A failing consumer must never break log parsing.
+                print(f"[monitor] could not record request: {exc}")
+
+    def _abort_oldest(self, model, now):
         """
         An ERROR entry tagged with a model (e.g. "Model unloaded by user or API request") ends one
         of its requests without an answer: close the oldest open one as failed. Failed requests do
@@ -297,8 +307,10 @@ class LogParser:
             return
         self._drop(req)
         req["failed"] = True
+        req["end"] = now
         self.w["failed"] += 1
         self.totals["failed"] += 1
+        self._notify(req, "failed")
 
     def _is_stalled(self, req, now):
         return now - req["active_at"] > self.stall_after
@@ -327,6 +339,8 @@ class LogParser:
             for req in victims:
                 self._drop(req)
                 req["dismissed"] = True
+                req["end"] = now
+                self._notify(req, "dismissed")
             self.totals["dismissed"] += len(victims)
             return len(victims)
 
@@ -598,6 +612,7 @@ class LogParser:
             self.w["tps"].append(req["tps"])
         if req.get("model"):
             self.w["models"][req["model"]] = self.w["models"].get(req["model"], 0) + 1
+        self._notify(req, "completed")
 
     def _expire_stale(self, now):
         def never_started(r):
@@ -607,10 +622,15 @@ class LogParser:
         for req in list(self.open):
             if never_started(req) and now - req["start"] > self.dispatch_timeout:
                 self.totals["rejected"] += 1
+                status = "rejected"
             elif now - req["active_at"] <= self.stale_after:
                 continue  # Still showing activity (or not idle long enough to give up on it).
+            else:
+                status = "stale"
             self._drop(req)  # E.g. an aborted request that never logged a completion entry.
             self.w["stale"] += 1
+            req["end"] = now
+            self._notify(req, status)
 
     def replay(self, lines, since, until, sample=None):
         """
@@ -656,6 +676,14 @@ class LogParser:
         self.clock, self.use_log_time = live_clock, False
         with self.lock:
             self.last_line_wall = None
+            self.totals = {k: 0 for k in self.totals}
+            self._new_window()
+
+    def reset(self):
+        """Start the statistics afresh (dashboard "Clear"); requests still in flight keep being tracked."""
+        with self.lock:
+            self.recent.clear()
+            self.token_events.clear()
             self.totals = {k: 0 for k in self.totals}
             self._new_window()
 

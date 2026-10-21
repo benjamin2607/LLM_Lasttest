@@ -120,6 +120,23 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .btn-stop:hover { filter: brightness(1.08); }
 .btn-stop:disabled { opacity: .55; cursor: default; filter: none; }
 .btn-stop .sq { width: 9px; height: 9px; background: #fff; border-radius: 2px; display: inline-block; }
+.btn-clear { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; font: inherit;
+  font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.btn-clear:hover { background: var(--surface-2); }
+.control { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.session { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; }
+.session .text { flex: 1; min-width: 260px; color: var(--text-2); font-size: 13px; }
+.session .text b { color: var(--text); }
+.session.recording { border-color: var(--critical); }
+.rec { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--critical); margin-right: 6px;
+  vertical-align: middle; animation: rec 1.6s ease-in-out infinite; }
+@keyframes rec { 50% { opacity: .35; } }
+.session a { color: var(--s1); font-weight: 600; }
+.btn-rec { border: 1px solid var(--critical); background: var(--surface); color: var(--text); border-radius: 8px; font: inherit;
+  font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.btn-rec:hover, .btn-clear:hover { background: var(--surface-2); }
+.control .text { flex: 1; min-width: 240px; color: var(--text-2); font-size: 13px; }
+.control .text b { color: var(--text); }
 .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
   border-radius: 8px; padding: 7px 14px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 20; }
 .toast.show { opacity: 1; }
@@ -155,12 +172,19 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       <span class="chip" id="chipLoad"><span class="dot"></span><span>load test idle</span></span>
     </div>
     <div class="spacer"></div>
-    <button class="btn-stop" id="stopAll" title="Stop a running load test and delete all threads it created in AnythingLLM"><span class="sq"></span><span id="stopLabel">Stop &amp; delete threads</span></button>
+    <button class="btn-clear" id="clearAll" title="Reset all values shown in the dashboard and start afresh (stored CSV data is kept)">↺ Clear</button>
     <div class="seg" id="range" role="group" aria-label="Time range">
       <button data-min="5">5 min</button><button data-min="15" class="on">15 min</button><button data-min="30">30 min</button>
     </div>
     <span class="clock" id="clock"></span>
   </header>
+
+  <section class="card session" id="sessionBar">
+    <span class="text" id="sessionText">No recording session.</span>
+    <a id="sessionReport" href="#" target="_blank" rel="noopener" hidden>Open report</a>
+    <button class="btn-clear" id="sessionSnapshot" hidden title="Write the report of the running session now">Create report</button>
+    <button class="btn-rec" id="sessionToggle"><span class="rec" style="animation:none"></span><span id="sessionToggleLabel">Start session</span></button>
+  </section>
 
   <div class="notice" id="verboseNotice"><span>ⓘ</span><span><b>Verbose logging is off in LM Studio.</b>
     API requests (e.g. from AnythingLLM) are tracked, but chats in the LM Studio app are not.
@@ -223,6 +247,12 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
   <section class="card" style="margin-bottom:12px">
     <div class="chart-head"><h2>Daily view – completed requests per interval</h2><span class="now" id="nHist"></span></div>
     <div class="plot" id="cHist" style="height:170px"></div>
+  </section>
+
+  <section class="card control" style="margin-bottom:12px">
+    <h2>Load test</h2>
+    <span class="text" id="loadText">No load test is running.</span>
+    <button class="btn-stop" id="stopAll" title="Stop a running load test and delete all threads it created in AnythingLLM"><span class="sq"></span><span id="stopLabel">Stop &amp; delete threads</span></button>
   </section>
 
   <div class="toast" id="toast" role="status"></div>
@@ -471,6 +501,56 @@ function renderRangeStats() {
   $("sLat").innerHTML = st.lat ? `${line(st.lat, " s", 1)} · n ${st.lat.n}` : "";
 }
 
+// ---------- Recording sessions for live tests ----------
+let session = {};
+const hhmm = t => new Date(t * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+function renderSession() {
+  const s = session || {}, c = s.counts || {}, active = !!s.active;
+  const open = (c.failed || 0) + (c.rejected || 0) + (c.stale || 0) + (c.dismissed || 0);
+  $("sessionBar").classList.toggle("recording", active);
+  if (active) {
+    const mins = Math.max(0, (Date.now() / 1000 - s.started) / 60);
+    $("sessionText").innerHTML = `<span class="rec"></span><b>Recording “${escapeHtml(s.label)}”</b> since ${hhmm(s.started)}`
+      + ` (${duration(mins * 60)}) · ${fmt(c.completed || 0)} completed`
+      + (open ? ` · ${fmt(open)} not answered` : "") + ` · <code>${escapeHtml(s.folder)}</code>`;
+  } else if (s.label) {
+    $("sessionText").innerHTML = `Last session <b>“${escapeHtml(s.label)}”</b> ${hhmm(s.started)}–${s.ended ? hhmm(s.ended) : "?"}`
+      + ` · ${fmt(c.completed || 0)} completed. Start a session to record a new live test.`;
+  } else {
+    $("sessionText").innerHTML = "No recording session. For a live test, start a session: every request, the "
+      + "per-minute values and the hardware are stored in its own folder, and a report is created when it ends.";
+  }
+  $("sessionToggleLabel").textContent = active ? "End session" : "Start session";
+  $("sessionToggle").querySelector(".rec").style.animation = active ? "" : "none";
+  $("sessionSnapshot").hidden = !active;
+  $("sessionReport").hidden = !s.report;
+  if (s.report) $("sessionReport").href = `sessions/${encodeURIComponent(s.folder)}/report.html`;
+}
+async function sessionCall(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "X-Monitor-Action": "session", "Content-Type": "application/json" },
+                                  body: JSON.stringify(body || {}) });
+  return res.json();
+}
+$("sessionToggle").addEventListener("click", async () => {
+  try {
+    if (session && session.active) {
+      if (!confirm(`End the session “${session.label}” and create its report?`)) return;
+      session = await sessionCall("api/session/end");
+      toast("Session ended – report created");
+    } else {
+      const label = prompt("Name of the live test (e.g. course and date):", "Live test");
+      if (label === null) return;
+      session = await sessionCall("api/session/start", { label });
+      toast(`Recording “${session.label}”`);
+    }
+    renderSession();
+  } catch (e) { toast("Could not reach the monitor"); }
+});
+$("sessionSnapshot").addEventListener("click", async () => {
+  try { session = await sessionCall("api/session/report"); renderSession(); toast("Report written"); }
+  catch (e) { toast("Could not reach the monitor"); }
+});
+
 // ---------- Stop & delete threads ----------
 let control = {};
 function renderControl() {
@@ -478,6 +558,11 @@ function renderControl() {
   setChip("chipLoad", lt.running ? "warn" : "", lt.running
     ? `load test running · stage ${lt.stage || 0} · ${lt.users || 0} users` : "load test idle", lt.running);
   $("stopAll").disabled = busy || (!lt.running && !control.threads);
+  $("loadText").innerHTML = (lt.running
+    ? `<b>Running</b> – stage ${lt.stage || 0} with ${lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`
+    : "No load test is running.")
+    + ` ${control.threads || 0} load-test threads in AnythingLLM`
+    + (control.can_delete ? "." : " (set ANYTHING_API_KEY for the monitor to delete them).");
   $("stopLabel").textContent = busy ? (p.phase === "stopping" ? "Stopping …" : "Deleting threads …")
     : lt.running ? "Stop & delete threads" : `Delete ${control.threads || 0} load-test threads`;
   if (p.at && p.at !== renderControl.lastReported && (p.phase === "done" || p.phase === "error")) {
@@ -485,6 +570,18 @@ function renderControl() {
     if (renderControl.armed) toast(p.message);
   }
 }
+$("clearAll").addEventListener("click", async () => {
+  const note = session && session.active ? `\n\nThe running session “${session.label}” is ended (with report) and a new one is started.` : "";
+  if (!confirm("Reset all values shown in the dashboard and start afresh?\n\nStored CSV data in the monitoring folder is kept. Requests that are still running continue to be tracked." + note)) return;
+  try {
+    await fetch("api/monitor/clear", { method: "POST", headers: { "X-Monitor-Action": "clear" } });
+    series = []; history = []; latPoints.clear(); seenRecent.clear();
+    await loadFull();
+    queueRender();
+    toast("Dashboard cleared");
+  } catch (e) { toast("Could not reach the monitor"); }
+});
+
 $("stopAll").addEventListener("click", async () => {
   const lt = control.loadtest || {}, n = control.threads || 0;
   const text = (lt.running ? "Stop the running load test immediately" : "No load test is running.")
@@ -586,7 +683,7 @@ function render() {
   const hl = history[history.length - 1];
   $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;
 
-  renderHw(); renderRunning(); renderRecent(); renderRangeStats(); renderControl();
+  renderHw(); renderRunning(); renderRecent(); renderRangeStats(); renderControl(); renderSession();
   charts.forEach(c => c.draw()); histChart.draw();
 }
 
@@ -594,8 +691,10 @@ function render() {
 async function loadFull() {
   const d = await (await fetch("api/state", { cache: "no-store" })).json();
   series = d.series; config = d.config; state = d.state || {}; control = d.control || control;
+  session = d.session || session;
   history = d.history.map(h => ({ ...h, t: new Date(h.time).getTime() / 1000 }));
   lastHistLen = d.history.length;
+  latPoints.clear();
   for (const p of d.latency_points || []) latPoints.set(p.t + "|" + p.duration, p);
 }
 let es, drawQueued = false;
@@ -608,6 +707,7 @@ function connect() {
     if (m.point && (!series.length || m.point.t > series[series.length - 1].t)) { series.push(m.point); if (series.length > 1800) series.shift(); }
     state = m.state || state;
     control = m.control || control;
+    session = m.session || session;
     if (m.history_len !== lastHistLen) { try { await loadFull(); } catch (e) {} }
     queueRender();
   };

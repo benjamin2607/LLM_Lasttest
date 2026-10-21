@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 from lmstudio_monitor import LMStudioWatcher, find_log_target
+from report_charts import html_page, line_chart, markdown_to_html
 from system_metrics import SystemSampler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -431,6 +432,7 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
                 thread = f", thread `{ex['thread']}`" if ex.get("thread") else ""
                 lines.append(f"- `{ex['category']}` at {users} users{thread}: „{ex['prompt']}“ → {response}")
 
+    charts_at = len(lines)  # The charts section is inserted here (before the stage table).
     lines += ["", "## Stages", "",
               "| Users | Requests | Failures % | Refusals % | Chat avg s | Chat p95 s | Chat req/s | GPU avg % | VRAM max % | RAM max % | tok/s | Status |",
               "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
@@ -447,7 +449,49 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
     lines += ["", "Note: Locust users only wait for the configured think time (--wait-min/--wait-max). "
               "Real students send requests less frequently, hence the Little's law estimate above.",
               "Per-stage details: `stage_XX_uYYY.html` (Locust report) and `.log`."]
-    (out_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    charts = build_charts(ordered, args)
+    chart_dir = out_dir / "charts"
+    chart_dir.mkdir(exist_ok=True)
+    md_charts = ["", "## Charts", ""]
+    for name, title, standalone, _ in charts:
+        (chart_dir / f"{name}.svg").write_text(standalone, encoding="utf-8")
+        md_charts.append(f"![{title}](charts/{name}.svg)")
+    md = lines[:charts_at] + (md_charts if charts else []) + lines[charts_at:]
+    (out_dir / "report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    # report.html is a single self-contained file with the charts inline.
+    inline = ("<h2>Charts</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for *_, svg in charts)
+              + "</div>") if charts else None
+    (out_dir / "report.html").write_text(
+        html_page(f"Load test report {out_dir.name}", markdown_to_html("\n".join(lines), inline, "Stages")),
+        encoding="utf-8")
+
+
+def build_charts(ordered, args):
+    """Charts over the stages: (file name, title, standalone SVG, SVG for inline use)."""
+    if not ordered:
+        return []
+    labels = [r["users"] for r in ordered]
+    col = lambda key, factor=1: [None if r.get(key) is None else r[key] * factor for r in ordered]  # noqa: E731
+    specs = [
+        ("response_time", "Response time per chat request", [("average", col("chat_avg_s")), ("p95", col("chat_p95_s"))],
+         " s", None, (args.max_p95, "p95 limit")),
+        ("throughput", "Throughput: chat responses per second", [("responses/s", col("chat_rps"))], "/s", None, None),
+        ("tokens", "Generated tokens per second (LM Studio)", [("tokens/s", col("lm_gen_tokens_per_s"))], "", None, None),
+        ("failures", "Failure and refusal rate", [("failures", col("fail_rate", 100)), ("refusals", col("refusal_rate", 100))],
+         " %", None, (args.max_fail_rate * 100, "failure limit")),
+        ("gpu", "GPU utilisation and memory", [("GPU utilisation (avg)", col("gpu_util_avg")),
+                                               ("GPU memory (max)", col("vram_pct_max"))], " %", 100, None),
+        ("system_memory", "System memory (max)", [("system memory", col("ram_pct_max"))], " %", 100, None),
+    ]
+    charts = []
+    for name, title, series, unit, y_max, limit in specs:
+        series = [(label, vals) for label, vals in series if any(v is not None for v in vals)]
+        if not series:
+            continue  # E.g. no GPU metrics or no LM Studio log on this machine.
+        kwargs = dict(unit=unit, x_title="concurrent users", y_max=y_max, limit=limit)
+        charts.append((name, title, line_chart(title, labels, series, **kwargs),
+                       line_chart(title, labels, series, standalone=False, **kwargs)))
+    return charts
 
 
 def main():

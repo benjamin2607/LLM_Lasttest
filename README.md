@@ -11,6 +11,8 @@ leaves the machine.
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
 | `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
 | `dashboard.html` | Dashboard front end, served by the monitor (no external libraries) |
+| `report_charts.py` | Self-contained SVG charts and HTML rendering for the reports |
+| `live_session.py` | Recording sessions for live tests: per-request data, per-minute values, hardware and report |
 | `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
 | `prompts.json` | Questions sent by the simulated users |
 | `tests/` | Unit tests for the log parser |
@@ -58,7 +60,7 @@ request), `--max-vram-pct 98`, `--max-gpu-temp 88`. Everything after `--` is
 forwarded to `main.py` (e.g. `--mode chat`).
 
 **Stopping a run.** The stage limits above are evaluated when a stage ends. To stop a run at any
-time, use the **"Stop & delete threads"** button at the top of the live monitor's dashboard: it
+time, use the **"Stop & delete threads"** button at the bottom of the live monitor's dashboard: it
 stops Locust immediately (also during the pause between stages), runs no further stages, and
 then deletes all threads the load test created in AnythingLLM. The report notes the stop.
 The load test publishes its state in `.loadtest_status.json` and watches for `.loadtest_stop`;
@@ -66,9 +68,12 @@ the monitor needs `ANYTHING_API_KEY` (and `--anythingllm-url` if AnythingLLM is 
 `http://localhost:3001`) to delete the threads. Without a running load test, the button only
 deletes the load-test threads.
 
-Results are written to `loadtest_results/<timestamp>/`: `report.md` (summary and
-recommendation), `results.csv`/`results.json`, and a Locust HTML report plus log
-per stage. The report also identifies throughput saturation and estimates how
+Results are written to `loadtest_results/<timestamp>/`: `report.html` (summary,
+recommendation and charts in one self-contained file), `report.md` (the same as Markdown,
+charts as SVG files in `charts/`), `results.csv`/`results.json`, and a Locust HTML report
+plus log per stage. The charts show, per number of concurrent users: response time (average,
+p95, limit), throughput, generated tokens per second, failure and refusal rate, GPU
+utilisation and memory, and system memory. The report also identifies throughput saturation and estimates how
 many *real* students the system can serve, using Little's law with
 `--student-think-time` (default: 90 s between two questions).
 
@@ -112,7 +117,8 @@ python lmstudio_monitor.py
 Opens the dashboard at `http://127.0.0.1:8765` (reachable from the local machine
 only). It updates **every second** via a live stream and shows:
 
-- **Status bar:** connection, LM Studio online/offline, whether the log is being written, loaded models, detected GPU, load test status, and the "Stop & delete threads" button. Warnings appear only in the tile they belong to
+- **Status bar:** connection, LM Studio online/offline, whether the log is being written, loaded models, detected GPU, load test status, and **Clear**, which resets all values shown and starts afresh (stored CSV data is kept; a restart does not restore cleared values). Warnings appear only in the tile they belong to
+- **Load test card** at the bottom: status of a running load test and the "Stop & delete threads" button
 - **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start. Below a divider, each tile also shows the average over the selected time range (5/15/30 min); the response time and first token tiles add the p95 for that range
 - **Statistics:** the tokens-per-second and response-time charts show mean (Ø), median and standard deviation (σ) for the selected range next to the current value
 - **Hardware:** GPU utilisation, VRAM (GB and %), temperature, power draw, system memory, CPU – with alert thresholds
@@ -142,6 +148,35 @@ when the monitor was not running, and reloads the daily view from the CSV files.
 values are not in the log; the monitor saves them every 15 s to `monitoring/.live_hardware.json`
 (numbers only) and restores them, so they are available for the time the monitor was running.
 "Requests since start" counts new requests only.
+
+### Live tests with real users: recording sessions
+
+For a live test (e.g. a seminar where students use AnythingLLM), start a **session** in the bar
+below the dashboard header, or start the monitor with `--session "Seminar KI, 22.10."`. Each
+session gets its own folder `monitoring/sessions/<date_time>_<name>/`:
+
+| File | Content |
+|---|---|
+| `requests.csv` | One row per request: start, end, status (`completed`, `failed`, `rejected`, `stale`, `dismissed`), duration, time to first token, tokens in/out, tokens/s, model, source (API / LM Studio app), streamed |
+| `intervals.csv` | The monitor's per-interval values (default one row per minute): requests, concurrency, p95, tokens/s, GPU, memory |
+| `hardware.csv` | GPU utilisation, GPU memory, temperature, power, system memory, CPU every 5 s |
+| `session.json` | Name, start/end, host (GPU) and models |
+| `summary.json` / `report.html` | Key figures and charts: requests and response time per minute (median, p95), concurrency, tokens/s, GPU, memory, distribution of response times, per-model statistics |
+
+"End session" writes the report; "Create report" writes it at any time without ending the
+session, and the dashboard links to it. A session survives a monitor restart: it is resumed,
+and requests made while the monitor was not running are added from the LM Studio log without
+duplicates. When the monitor stops, it writes the report so far. "Clear" ends a running session
+(with report) and starts a new one with the same name. Reports can be regenerated from the CSV
+files at any time:
+
+```bash
+python live_session.py --report monitoring/sessions/<folder>
+```
+
+Sessions store only numbers, times and model names – no prompts, responses, IP addresses or
+user identifiers – so the data cannot be linked to individual students. Without a session,
+the monitor still writes the daily per-minute CSV (`monitoring/lmstudio_metrics_<date>.csv`).
 
 ### What the monitor can see
 
