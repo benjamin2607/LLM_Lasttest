@@ -51,14 +51,10 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .seg button.on { background: var(--surface-2); color: var(--text); font-weight: 600; }
 .clock { font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 13px; }
 
-.alert { display: none; align-items: center; gap: 10px; border: 1px solid var(--critical); border-left-width: 4px;
-  background: var(--surface); border-radius: 8px; padding: 9px 12px; margin-bottom: 14px; font-weight: 600; }
-.alert.show { display: flex; }
 .notice { display: none; gap: 10px; align-items: baseline; border: 1px solid var(--border); border-left: 4px solid var(--s1);
   background: var(--surface); border-radius: 8px; padding: 9px 12px; margin-bottom: 14px; color: var(--text-2); }
 .notice.show { display: flex; }
 .notice b { color: var(--text); }
-.alert .ico { color: var(--critical); font-size: 16px; }
 
 .card { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -119,6 +115,11 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
   font-size: 12px; padding: 3px 9px; cursor: pointer; display: none; }
 .btn-small.show { display: inline-flex; align-items: center; gap: 5px; }
 .btn-small:hover { background: var(--surface-2); }
+.btn-stop { border: 1px solid var(--critical); background: var(--critical); color: #fff; border-radius: 8px; font: inherit;
+  font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.btn-stop:hover { filter: brightness(1.08); }
+.btn-stop:disabled { opacity: .55; cursor: default; filter: none; }
+.btn-stop .sq { width: 9px; height: 9px; background: #fff; border-radius: 2px; display: inline-block; }
 .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
   border-radius: 8px; padding: 7px 14px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 20; }
 .toast.show { opacity: 1; }
@@ -151,15 +152,16 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       <span class="chip" id="chipLog"><span class="dot"></span><span>Log</span></span>
       <span class="chip" id="chipModel"><span class="dot"></span><span>Model –</span></span>
       <span class="chip" id="chipGpu"><span class="dot"></span><span>GPU –</span></span>
+      <span class="chip" id="chipLoad"><span class="dot"></span><span>load test idle</span></span>
     </div>
     <div class="spacer"></div>
+    <button class="btn-stop" id="stopAll" title="Stop a running load test and delete all threads it created in AnythingLLM"><span class="sq"></span><span id="stopLabel">Stop &amp; delete threads</span></button>
     <div class="seg" id="range" role="group" aria-label="Time range">
       <button data-min="5">5 min</button><button data-min="15" class="on">15 min</button><button data-min="30">30 min</button>
     </div>
     <span class="clock" id="clock"></span>
   </header>
 
-  <div class="alert" id="alert" role="alert"><span class="ico">⚠</span><span id="alertText"></span></div>
   <div class="notice" id="verboseNotice"><span>ⓘ</span><span><b>Verbose logging is off in LM Studio.</b>
     API requests (e.g. from AnythingLLM) are tracked, but chats in the LM Studio app are not.
     Enable it under Developer → Logging → Verbose Logging to monitor all requests.</span></div>
@@ -367,7 +369,7 @@ const charts = [
     { key: "waiting", label: "waiting", color: "--s2", step: true }] }),
   new Chart($("cTps"), { data: () => series, xRange: liveRange, minMax: 10, series: [
     { key: "tokens_per_s", label: "Tokens/s", color: "--s1", fill: "--s1-fill", digits: 1 }] }),
-  new Chart($("cGpu"), { data: () => series, xRange: liveRange, yMax: 100, threshold: () => config.alert_vram_pct, get thresholdLabel() { return memLabel() + " alert threshold"; }, series: [
+  new Chart($("cGpu"), { data: () => series, xRange: liveRange, yMax: 100, series: [
     { key: "gpu_util", label: "GPU", color: "--s1", unit: " %" },
     { key: "vram_pct", get label() { return memLabel(); }, color: "--s2", unit: " %", digits: 1 }] }),
   new Chart($("cLat"), { data: () => [...latPoints.values()].sort((a, b) => a.t - b.t), xRange: liveRange, minMax: 5,
@@ -469,6 +471,35 @@ function renderRangeStats() {
   $("sLat").innerHTML = st.lat ? `${line(st.lat, " s", 1)} · n ${st.lat.n}` : "";
 }
 
+// ---------- Stop & delete threads ----------
+let control = {};
+function renderControl() {
+  const lt = control.loadtest || {}, p = control.progress || {}, busy = p.phase === "stopping" || p.phase === "deleting";
+  setChip("chipLoad", lt.running ? "warn" : "", lt.running
+    ? `load test running · stage ${lt.stage || 0} · ${lt.users || 0} users` : "load test idle", lt.running);
+  $("stopAll").disabled = busy || (!lt.running && !control.threads);
+  $("stopLabel").textContent = busy ? (p.phase === "stopping" ? "Stopping …" : "Deleting threads …")
+    : lt.running ? "Stop & delete threads" : `Delete ${control.threads || 0} load-test threads`;
+  if (p.at && p.at !== renderControl.lastReported && (p.phase === "done" || p.phase === "error")) {
+    renderControl.lastReported = p.at;
+    if (renderControl.armed) toast(p.message);
+  }
+}
+$("stopAll").addEventListener("click", async () => {
+  const lt = control.loadtest || {}, n = control.threads || 0;
+  const text = (lt.running ? "Stop the running load test immediately" : "No load test is running.")
+    + (control.can_delete ? `\n\nThen delete all ${n} threads created by the load test in AnythingLLM.`
+                          : "\n\nThreads cannot be deleted: start the monitor with ANYTHING_API_KEY set.")
+    + "\n\nThreads not created by the load test are not affected.";
+  if (!confirm(text)) return;
+  renderControl.armed = true;
+  try {
+    const res = await fetch("api/system/stop", { method: "POST", headers: { "X-Monitor-Action": "stop" } });
+    const { started } = await res.json();
+    toast(started ? (lt.running ? "Stopping the load test …" : "Deleting load-test threads …") : "Already in progress");
+  } catch (e) { toast("Could not reach the monitor"); }
+});
+
 function closeMenu() { menuFor = null; $("runMenu").classList.remove("show"); }
 $("running").addEventListener("click", e => {
   const btn = e.target.closest(".menu-btn");
@@ -518,7 +549,10 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp
 function render() {
   const s = state, sys = s.system || {}, tot = s.totals || {};
   $("kActive").textContent = fmt(s.active);
-  $("kActiveSub").textContent = s.active ? `${fmt(s.waiting)} waiting for first token` : "idle";
+  // Warnings are shown in the tile they belong to (no global banner).
+  const activeSt = config.alert_active ? statusOf(s.active, config.alert_active * 0.75, config.alert_active) : null;
+  $("kActiveSub").innerHTML = (s.active ? `${fmt(s.waiting)} waiting for first token` : "idle")
+    + (activeSt && activeSt !== "good" ? " " + statusHtml(activeSt) : "");
   $("kRpm").textContent = fmt(s.requests_per_min, 1);
   $("kTps").textContent = fmt(s.tokens_per_s, 1);
   $("kP95").innerHTML = s.latency_p95_s != null ? `${fmt(s.latency_p95_s, 1)}<small>s</small>` : "–";
@@ -541,11 +575,9 @@ function render() {
   document.querySelectorAll(".memLabel").forEach(el => { el.textContent = memLabel(); });
   $("footLog").textContent = s.log_file ? `Log file: ${s.log_file}` : "";
 
-  const al = s.alerts || [];
   // Verbose logging is detected from DEBUG entries; the monitor's own model polling produces one within ~30 s.
   const sig = s.log_signals || {}, runningFor = s.monitor_started ? Date.now() / 1000 - s.monitor_started : 0;
   $("verboseNotice").classList.toggle("show", !!s.log_file && sig.verbose === false && runningFor > 45);
-  $("alert").classList.toggle("show", al.length > 0); $("alertText").textContent = al.length ? "Warning: " + al.join(" · ") : "";
 
   $("nActive").textContent = `now ${fmt(s.active)}`;
   $("nTps").textContent = `now ${fmt(s.tokens_per_s, 1)}`;
@@ -554,14 +586,14 @@ function render() {
   const hl = history[history.length - 1];
   $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;
 
-  renderHw(); renderRunning(); renderRecent(); renderRangeStats();
+  renderHw(); renderRunning(); renderRecent(); renderRangeStats(); renderControl();
   charts.forEach(c => c.draw()); histChart.draw();
 }
 
 // ---------- Initial load and live stream ----------
 async function loadFull() {
   const d = await (await fetch("api/state", { cache: "no-store" })).json();
-  series = d.series; config = d.config; state = d.state || {};
+  series = d.series; config = d.config; state = d.state || {}; control = d.control || control;
   history = d.history.map(h => ({ ...h, t: new Date(h.time).getTime() / 1000 }));
   lastHistLen = d.history.length;
   for (const p of d.latency_points || []) latPoints.set(p.t + "|" + p.duration, p);
@@ -575,6 +607,7 @@ function connect() {
     const m = JSON.parse(ev.data);
     if (m.point && (!series.length || m.point.t > series[series.length - 1].t)) { series.push(m.point); if (series.length > 1800) series.shift(); }
     state = m.state || state;
+    control = m.control || control;
     if (m.history_len !== lastHistLen) { try { await loadFull(); } catch (e) {} }
     queueRender();
   };

@@ -23,6 +23,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -151,37 +152,66 @@ def build_levels(args):
     return levels
 
 
-class EmergencyWatchdog:
-    """
-    Checks the hardware once per second while a stage runs. It trips when a reading stays at or
-    above its emergency limit for ``--stop-after`` seconds, so the stage can be stopped at once
-    instead of being evaluated only when it ends.
-    """
+# --- Control by the live monitor's dashboard ---
+STATUS_FILE = BASE_DIR / ".loadtest_status.json"  # Written while a run is active (heartbeat, stage).
+STOP_FILE = BASE_DIR / ".loadtest_stop"            # Created by the dashboard's stop button.
 
-    def __init__(self, sampler, args):
-        self.sampler = sampler
-        self.hold = args.stop_after
-        self.limits = [(key, label, unit, limit) for key, label, unit, limit in (
-            ("vram_pct", "VRAM", "%", args.stop_vram_pct),
-            ("ram_pct", "System memory", "%", args.stop_ram_pct),
-            ("gpu_temp", "GPU temperature", "°C", args.stop_gpu_temp)) if limit > 0]
-        self.above_since = {}
 
-    def describe(self):
-        return ", ".join(f"{label} ≥ {limit:g}{unit}" for _, label, unit, limit in self.limits) or "disabled"
+def write_status(**fields):
+    """Publish the run's state for the dashboard; written atomically."""
+    try:
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "heartbeat": time.time(), **fields}), encoding="utf-8")
+        os.replace(tmp, STATUS_FILE)
+    except OSError:
+        pass
 
-    def check(self, now):
-        """Return the reason for an emergency stop, or None."""
-        latest = self.sampler.latest
-        for key, label, unit, limit in self.limits:
-            value = latest.get(key)
-            if value is None or value < limit:
-                self.above_since.pop(key, None)
-                continue
-            since = self.above_since.setdefault(key, now)
-            if now - since >= self.hold:
-                return f"{label} {value:g}{unit} ≥ {limit:g}{unit} for {self.hold:g} s"
-        return None
+
+def clear_status():
+    for path in (STATUS_FILE, STATUS_FILE.with_suffix(".tmp")):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def stop_requested():
+    return STOP_FILE.exists()
+
+
+class StatusPublisher(threading.Thread):
+    """Keeps the status file fresh (every 2 s) for as long as the run is active."""
+
+    def __init__(self, run):
+        super().__init__(daemon=True)
+        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time()}
+        self._stop = threading.Event()
+
+    def update(self, **fields):
+        self.fields.update(fields)
+        write_status(**self.fields)
+
+    def run(self):
+        while not self._stop.is_set():
+            write_status(**self.fields)
+            self._stop.wait(2)
+
+    def close(self):
+        self._stop.set()
+        clear_status()
+
+
+STATUS = None  # StatusPublisher of the current run.
+
+
+def pause(seconds):
+    """Sleep between stages; returns True as soon as a stop is requested from the dashboard."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if stop_requested():
+            return True
+        time.sleep(min(1.0, max(0.0, end - time.time())))
+    return stop_requested()
 
 
 def popen_flags():
@@ -219,15 +249,16 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     if watcher:
         watcher.snapshot(reset=True)
     t0 = time.time()
-    dog, emergency = EmergencyWatchdog(sampler, args), None
+    stopped = None
+    STATUS.update(stage=idx, users=users, stage_started=t0)
     with open(f"{prefix}.log", "w", encoding="utf-8") as logf:
         proc = subprocess.Popen(cmd, cwd=args.locustfile.parent, stdout=logf, stderr=subprocess.STDOUT,
                                 **popen_flags())
         try:
             while proc.poll() is None:
-                emergency = dog.check(time.time())
-                if emergency:
-                    print(color(f"  !!! EMERGENCY STOP: {emergency} – stopping Locust now", "1;37;41"))
+                if stop_requested():
+                    stopped = "stopped from the dashboard"
+                    print(color("  !!! STOPPED FROM THE DASHBOARD – stopping Locust now", "1;37;41"))
                     stop_locust(proc)
                     break
                 time.sleep(1)
@@ -268,12 +299,12 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     result["refusal_breakdown"] = refusals
     result["refusal_examples"] = read_refusal_examples(f"{prefix}_refusals.jsonl")
     result["top_errors"] = read_failures(Path(f"{prefix}_failures.csv"))
-    result["emergency"] = emergency
+    result["stopped"] = stopped
     # Without statistics Locust did not run at all: a setup problem, not a capacity limit.
-    result["error"] = None if agg is not None or emergency else "\n".join(log_tail(f"{prefix}.log"))
+    result["error"] = None if agg is not None or stopped else "\n".join(log_tail(f"{prefix}.log"))
 
-    reasons = [f"EMERGENCY STOP: {emergency}"] if emergency else []
-    if agg is None and not emergency:
+    reasons = [stopped] if stopped else []
+    if agg is None and not stopped:
         reasons.append("Locust failed to run (see .log)")
     elif result["chat_requests"] == 0:
         reasons.append("no chat request completed")
@@ -300,7 +331,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         detail = ", ".join(f"{n}x {k}" for k, n in sorted(refusals.items(), key=lambda kv: -kv[1]))
         line = f"  !! REFUSALS: {rate:.1%} of chat requests ({detail})"
         print(color(line, "1;31" if rate >= args.refusal_warn_rate else "1;33"))
-    print("  -> " + ("PASSED" if result["passed"] else "LIMIT REACHED: " + result["reasons"]))
+    print("  -> " + ("PASSED" if result["passed"] else "STOPPED" if stopped else "LIMIT REACHED: " + result["reasons"]))
     for error, count in result["top_errors"][:3]:
         print(f"     {count}x {error}")
     if looks_like_setup_problem(result):
@@ -308,7 +339,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     return result
 
 
-def write_results(out_dir, results, args, last_ok, first_bad, aborted):
+def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop=False):
     """Write results.csv, results.json and the Markdown report."""
     if results:
         fields = [k for k in results[0] if k not in ("top_errors", "error", "refusal_breakdown", "refusal_examples")]
@@ -334,12 +365,14 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
              f"VRAM ≤ {args.max_vram_pct}%, GPU ≤ {args.max_gpu_temp}°C", ""]
     if aborted:
         lines += ["**The test was aborted manually; results are incomplete.**", ""]
+    if user_stop and not any(r.get("stopped") for r in results):
+        lines += ["**The test was stopped from the dashboard between stages; later stages were not run.**", ""]
     lines += ["## Result", ""]
-    stopped = next((r for r in results if r.get("emergency")), None)
+    stopped = next((r for r in results if r.get("stopped")), None)
     if stopped is not None:
-        lines += [f"### ⛔ Emergency stop at {stopped['users']} users (stage {stopped['stage']})", "",
-                  f"**{stopped['emergency']}.** Locust was stopped immediately; no further stages were run. "
-                  "The highest stage that passed before is the safe operating limit.", ""]
+        lines += [f"### ⛔ Stopped from the dashboard at {stopped['users']} users (stage {stopped['stage']})", "",
+                  "Locust was stopped immediately; no further stages were run. Results of this stage cover "
+                  "only the time until the stop.", ""]
     failed_run = next((r for r in results if r.get("error") is not None), None)
     if failed_run is not None:
         lines += [f"**The run stopped at stage {failed_run['stage']} because Locust failed to run. "
@@ -435,14 +468,6 @@ def main():
     ap.add_argument("--max-p95", type=float, default=120.0, help="Maximum p95 chat response time in seconds")
     ap.add_argument("--max-vram-pct", type=float, default=98.0)
     ap.add_argument("--max-gpu-temp", type=float, default=88.0)
-    ap.add_argument("--stop-vram-pct", type=float, default=99.0,
-                    help="Emergency stop when VRAM stays at or above this value during a stage (0 = off)")
-    ap.add_argument("--stop-ram-pct", type=float, default=99.0,
-                    help="Emergency stop when system memory stays at or above this value (0 = off)")
-    ap.add_argument("--stop-gpu-temp", type=float, default=90.0,
-                    help="Emergency stop when the GPU temperature stays at or above this value (0 = off)")
-    ap.add_argument("--stop-after", type=float, default=10.0,
-                    help="Seconds a reading must stay above its emergency limit before the stop")
     ap.add_argument("--refusal-warn-rate", type=float, default=0.10,
                     help="Refusal rate from which refusals are highlighted in red (they never fail a stage)")
     ap.add_argument("--refine", action="store_true",
@@ -474,9 +499,14 @@ def main():
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Results: {out_dir}")
 
-    sampler = SystemSampler(interval=1.0)
+    sampler = SystemSampler()
     sampler.start()
-    print(f"Emergency stop: {EmergencyWatchdog(sampler, args).describe()} for {args.stop_after:g} s")
+    global STATUS
+    if stop_requested():
+        STOP_FILE.unlink()  # A stop request from an earlier run must not end this one.
+    STATUS = StatusPublisher(out_dir.name)
+    STATUS.start()
+    print("Stop at any time with the \"Stop & delete threads\" button in the live monitor's dashboard.")
     if not sampler.gpu_available:
         print("Note: no supported GPU metrics source found, GPU limits will not be checked.")
     elif sampler.gpu.backend == "apple":
@@ -489,7 +519,7 @@ def main():
         else:
             print("Note: LM Studio log not found, no tokens/s metrics (use --lmstudio-log PATH).")
 
-    results, last_ok, first_bad, aborted = [], None, None, False
+    results, last_ok, first_bad, aborted, user_stop = [], None, None, False, False
     try:
         for users in levels:
             r = run_stage(len(results) + 1, users, args, args.passthrough, out_dir, sampler, watcher)
@@ -497,21 +527,29 @@ def main():
             write_results(out_dir, results, args, last_ok, first_bad, False)
             if r["error"] is not None:
                 break  # Setup problem: further stages would fail the same way.
-            if r["emergency"]:
-                break  # Hardware at its limit: no further stages, no refinement.
+            if r["stopped"]:
+                user_stop = True
+                break  # Stopped from the dashboard: no further stages, no refinement.
             if not r["passed"]:
                 first_bad = users
                 break
             last_ok = users
-            time.sleep(args.cooldown)
+            if pause(args.cooldown):
+                user_stop = True
+                break
 
-        if args.refine and first_bad is not None:
+        if args.refine and first_bad is not None and not user_stop:
             lo, hi = (last_ok or 0), first_bad
             while hi - lo > 1:
-                time.sleep(args.cooldown)
+                if pause(args.cooldown):
+                    user_stop = True
+                    break
                 mid = (lo + hi) // 2
                 r = run_stage(len(results) + 1, mid, args, args.passthrough, out_dir, sampler, watcher)
                 results.append(r)
+                if r["stopped"]:
+                    user_stop = True
+                    break
                 lo, hi = (mid, hi) if r["passed"] else (lo, mid)
                 write_results(out_dir, results, args, lo or None, hi, False)
             last_ok, first_bad = (lo or None), hi
@@ -519,10 +557,11 @@ def main():
         aborted = True
         print("\nAborted, writing partial results ...")
     finally:
+        STATUS.close()
         sampler.stop()
         if watcher:
             watcher.stop()
-        write_results(out_dir, results, args, last_ok, first_bad, aborted)
+        write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop)
         print(f"\nReport: {out_dir / 'report.md'}")
 
 

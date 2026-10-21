@@ -326,15 +326,112 @@ class LiveRecorder(threading.Thread):
                     "latency_points": self.parser.latency_points(),
                     "config": {"interval": self.args.interval, "alert_p95": self.args.alert_p95,
                                "alert_vram_pct": self.args.alert_vram_pct,
-                               "alert_gpu_temp": self.args.alert_gpu_temp,
+                               "alert_gpu_temp": self.args.alert_gpu_temp, "alert_active": self.args.alert_active,
                                "stall_after": self.parser.stall_after}}
+
+
+# --- Load test control (dashboard stop button) ---
+class LoadTestControl:
+    """
+    Stops a running auto_loadtest.py run and deletes the AnythingLLM threads it created.
+
+    The load test publishes its state in ``.loadtest_status.json`` and watches for
+    ``.loadtest_stop``; the threads it created are listed in ``.loadtest_threads.json``.
+    Only threads from that list are deleted, so chats of real users are never touched.
+    """
+
+    HEARTBEAT_TIMEOUT_S = 8
+    STOP_WAIT_S = 45
+
+    def __init__(self, project_dir, anythingllm_url, api_key):
+        project_dir = Path(project_dir)
+        self.status_file = project_dir / ".loadtest_status.json"
+        self.stop_file = project_dir / ".loadtest_stop"
+        self.registry_file = project_dir / ".loadtest_threads.json"
+        self.url = anythingllm_url.rstrip("/")
+        self.api_key = api_key
+        self.lock = threading.Lock()
+        self.progress = {"phase": "idle"}
+
+    def loadtest(self):
+        try:
+            status = json.loads(self.status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"running": False}
+        running = time.time() - status.get("heartbeat", 0) < self.HEARTBEAT_TIMEOUT_S
+        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users")}}
+
+    def threads(self):
+        try:
+            return json.loads(self.registry_file.read_text(encoding="utf-8")).get("threads", [])
+        except (OSError, ValueError):
+            return []
+
+    def state(self):
+        with self.lock:
+            progress = dict(self.progress)
+        return {"loadtest": self.loadtest(), "threads": len(self.threads()),
+                "can_delete": bool(self.api_key), "progress": progress}
+
+    def _set(self, **progress):
+        with self.lock:
+            self.progress = {"at": time.time(), **progress}
+        print(f"[monitor] stop & delete: {progress.get('message', progress.get('phase'))}")
+
+    def start(self):
+        """Run the stop-and-delete sequence in the background; returns False if one is already running."""
+        with self.lock:
+            if self.progress.get("phase") in ("stopping", "deleting"):
+                return False
+            self.progress = {"phase": "stopping", "at": time.time(), "message": "stopping the load test"}
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def _run(self):
+        if self.loadtest()["running"]:
+            self.stop_file.write_text(str(time.time()), encoding="utf-8")
+            deadline = time.time() + self.STOP_WAIT_S
+            while self.loadtest()["running"] and time.time() < deadline:
+                time.sleep(1)
+            if self.loadtest()["running"]:
+                self._set(phase="error", message="the load test did not stop within "
+                                                 f"{self.STOP_WAIT_S} s; no threads were deleted")
+                return
+        try:
+            self.stop_file.unlink()
+        except OSError:
+            pass
+        if not self.api_key:
+            self._set(phase="done", deleted=0, failed=0,
+                      message="load test stopped; set ANYTHING_API_KEY for the monitor to delete threads")
+            return
+        self._set(phase="deleting", message="deleting load-test threads")
+        remaining, deleted = [], 0
+        for entry in self.threads():
+            req = urllib.request.Request(f"{self.url}/api/v1/workspace/{entry['workspace']}/thread/{entry['slug']}",
+                                         method="DELETE", headers={"Authorization": f"Bearer {self.api_key}"})
+            try:
+                with urllib.request.urlopen(req, timeout=15):
+                    deleted += 1
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    deleted += 1  # Already deleted in AnythingLLM.
+                else:
+                    remaining.append(entry)
+            except (urllib.error.URLError, OSError):
+                remaining.append(entry)
+        tmp = self.registry_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"threads": remaining}, indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.registry_file)
+        message = f"deleted {deleted} load-test threads" + (f", {len(remaining)} failed" if remaining else "")
+        self._set(phase="done" if not remaining else "error", deleted=deleted, failed=len(remaining), message=message)
 
 
 # --- Local dashboard server (bound to 127.0.0.1 only) ---
 DASHBOARD_FILE = Path(__file__).resolve().parent / "dashboard.html"
 
 
-def start_dashboard(port, recorder):
+def start_dashboard(port, recorder, control):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, body, ctype):
             self.send_response(200)
@@ -348,7 +445,7 @@ def start_dashboard(port, recorder):
             if path in ("/", "/index.html"):
                 self._send(DASHBOARD_FILE.read_bytes(), "text/html; charset=utf-8")
             elif path == "/api/state":
-                self._send(json.dumps(recorder.full()).encode(), "application/json")
+                self._send(json.dumps({**recorder.full(), "control": control.state()}).encode(), "application/json")
             elif path == "/api/stream":
                 self._stream()
             else:
@@ -360,10 +457,14 @@ def start_dashboard(port, recorder):
             from the dashboard's own origin (other sites would need a CORS preflight, which this server
             never grants), so third-party pages cannot trigger it.
             """
-            if self.headers.get("X-Monitor-Action") != "dismiss":
+            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop"):
                 self.send_error(403)
                 return
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/system/stop":
+                started = control.start()
+                self._send(json.dumps({"started": started}).encode(), "application/json")
+                return
             if path == "/api/requests/dismiss-stalled":
                 removed, what = recorder.parser.dismiss(stalled_only=True), "stalled requests"
             elif path.startswith("/api/requests/") and path.endswith("/dismiss") and path.split("/")[3].isdigit():
@@ -389,6 +490,7 @@ def start_dashboard(port, recorder):
                         seq = recorder.seq
                         msg = {"point": recorder.series[-1] if recorder.series else None,
                                "state": recorder.state, "history_len": len(recorder.history)}
+                    msg["control"] = control.state()
                     self.wfile.write(f"data: {json.dumps(msg)}\n\n".encode())
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -417,6 +519,10 @@ def main():
                     help="Send a synthetic probe request every N seconds (0 = disabled)")
     ap.add_argument("--from-start", action="store_true", help="Parse the log from the beginning instead of new lines only")
     ap.add_argument("--no-api", action="store_true", help="Do not query the LM Studio API")
+    ap.add_argument("--anythingllm-url", default="http://localhost:3001",
+                    help="AnythingLLM URL for deleting load-test threads (API key from env ANYTHING_API_KEY)")
+    ap.add_argument("--project-dir", default=str(Path(__file__).resolve().parent),
+                    help="Folder of auto_loadtest.py (status, stop and thread registry files)")
     ap.add_argument("--stall-minutes", type=float, default=5,
                     help="Mark a running request as stalled after N minutes without any log activity")
     ap.add_argument("--replay-minutes", type=int, default=30,
@@ -469,7 +575,8 @@ def main():
 
     if args.dashboard_port:
         try:
-            start_dashboard(args.dashboard_port, recorder)
+            control = LoadTestControl(args.project_dir, args.anythingllm_url, os.environ.get("ANYTHING_API_KEY"))
+            start_dashboard(args.dashboard_port, recorder, control)
         except OSError as exc:
             sys.exit(f"[monitor] ERROR: cannot bind dashboard to 127.0.0.1:{args.dashboard_port} ({exc.strerror}). "
                      "Is another monitor instance running? Choose a different port with --dashboard-port.")

@@ -57,13 +57,14 @@ Limits (configurable): `--max-fail-rate 0.05`, `--max-p95 120` (seconds, chat
 request), `--max-vram-pct 98`, `--max-gpu-temp 88`. Everything after `--` is
 forwarded to `main.py` (e.g. `--mode chat`).
 
-**Emergency stop.** The stage limits above are evaluated when a stage ends. In addition, the
-hardware is checked every second while a stage runs: if VRAM, system memory or GPU temperature
-stays at or above its emergency limit for 10 s (`--stop-after`), Locust is stopped immediately,
-no further stages run, and the report opens with "⛔ Emergency stop". Defaults:
-`--stop-vram-pct 99`, `--stop-ram-pct 99`, `--stop-gpu-temp 90` (`0` disables a limit; the
-temperature is not available on macOS). The highest stage that passed before is the safe
-operating limit.
+**Stopping a run.** The stage limits above are evaluated when a stage ends. To stop a run at any
+time, use the **"Stop & delete threads"** button at the top of the live monitor's dashboard: it
+stops Locust immediately (also during the pause between stages), runs no further stages, and
+then deletes all threads the load test created in AnythingLLM. The report notes the stop.
+The load test publishes its state in `.loadtest_status.json` and watches for `.loadtest_stop`;
+the monitor needs `ANYTHING_API_KEY` (and `--anythingllm-url` if AnythingLLM is not on
+`http://localhost:3001`) to delete the threads. Without a running load test, the button only
+deletes the load-test threads.
 
 Results are written to `loadtest_results/<timestamp>/`: `report.md` (summary and
 recommendation), `results.csv`/`results.json`, and a Locust HTML report plus log
@@ -111,7 +112,7 @@ python lmstudio_monitor.py
 Opens the dashboard at `http://127.0.0.1:8765` (reachable from the local machine
 only). It updates **every second** via a live stream and shows:
 
-- **Status bar:** connection, LM Studio online/offline, whether the log is being written, loaded models, and an alert banner when thresholds are exceeded
+- **Status bar:** connection, LM Studio online/offline, whether the log is being written, loaded models, detected GPU, load test status, and the "Stop & delete threads" button. Warnings appear only in the tile they belong to
 - **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start. Below a divider, each tile also shows the average over the selected time range (5/15/30 min); the response time and first token tiles add the p95 for that range
 - **Statistics:** the tokens-per-second and response-time charts show mean (Ø), median and standard deviation (σ) for the selected range next to the current value
 - **Hardware:** GPU utilisation, VRAM (GB and %), temperature, power draw, system memory, CPU – with alert thresholds

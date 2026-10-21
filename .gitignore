@@ -8,3 +8,6 @@ monitoring/
 .loadtest_threads.json
 .loadtest_threads.tmp
 docker-diagnose.txt
+.loadtest_status.json
+.loadtest_status.tmp
+.loadtest_stop
