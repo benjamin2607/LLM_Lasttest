@@ -172,6 +172,18 @@ class SessionTests(unittest.TestCase):
         self.assertLess(s["overall"]["tokens_per_s"], 2)                       # 600 tokens / 600 s
         self.assertEqual(s["while_busy"]["gpu_util_pct"]["mean"], 90)
 
+    def test_delete_sessions_safely(self):
+        manager = SessionManager(self.out)
+        old = manager.start("Old")["folder"]
+        active = manager.start("Active")["folder"]  # Ends "Old".
+        (self.out / "outside").mkdir()
+        self.assertEqual(manager.delete(active)[0], False)  # Still recording.
+        self.assertEqual(manager.delete("../outside")[0], False)
+        self.assertEqual(manager.delete("missing")[0], False)
+        self.assertTrue(manager.delete(old)[0])
+        self.assertFalse((self.out / "sessions" / old).exists())
+        self.assertTrue((self.out / "outside").exists())
+
     def test_summary_of_empty_session(self):
         manager = SessionManager(self.out)
         manager.start("Empty")

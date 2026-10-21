@@ -23,6 +23,7 @@ import html
 import json
 import os
 import re
+import shutil
 import statistics
 import threading
 import time
@@ -214,6 +215,26 @@ class SessionManager:
     def end(self):
         with self.lock:
             return self._end_locked() if self.current else None
+
+    def delete(self, folder_name):
+        """
+        Delete a recorded session folder from disk. Only plain folder names inside the sessions
+        directory are accepted, and the session that is recording cannot be deleted.
+        Returns (ok, message).
+        """
+        if not re.fullmatch(r"[\w.-]+", folder_name or ""):
+            return False, "invalid session name"
+        folder = (self.root / folder_name).resolve()
+        if folder.parent != self.root.resolve() or not folder.is_dir():
+            return False, "session not found"
+        with self.lock:
+            if self.current is not None and self.current.folder.resolve() == folder:
+                return False, "the recording session cannot be deleted – end it first"
+            shutil.rmtree(folder)
+            if self.last is not None and self.last.folder.resolve() == folder:
+                self.last = None
+        print(f"[monitor] session deleted from disk: {folder_name}")
+        return True, "session deleted"
 
     def report_now(self):
         """Write a report for the active session without ending it."""

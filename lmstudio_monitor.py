@@ -26,6 +26,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -456,6 +457,24 @@ class LoadTestControl:
         return {"running": lt.get("running", False), "run": run, "stage": lt.get("stage"), "users": lt.get("users"),
                 "workspace": lt.get("workspace"), "config": cfg}
 
+    def delete_run(self, run):
+        """
+        Delete a load test result folder from disk. Only plain folder names inside loadtest_results
+        are accepted, and a running load test cannot be deleted. Returns (ok, message).
+        """
+        results_dir = (self.project_dir / "loadtest_results").resolve()
+        if not re.fullmatch(r"[\w.-]+", run or ""):
+            return False, "invalid load test name"
+        folder = (results_dir / run).resolve()
+        if folder.parent != results_dir or not folder.is_dir():
+            return False, "load test not found"
+        lt = self.loadtest()
+        if lt.get("running") and lt.get("run") == run:
+            return False, "a running load test cannot be deleted – stop it first"
+        shutil.rmtree(folder)
+        print(f"[monitor] load test deleted from disk: {run}")
+        return True, "load test deleted"
+
     def list_runs(self, limit=30):
         """Completed and running load tests (newest first) with their basic settings and results."""
         results_dir = self.project_dir / "loadtest_results"
@@ -704,7 +723,7 @@ def start_dashboard(port, recorder, control, sessions):
             from the dashboard's own origin (other sites would need a CORS preflight, which this server
             never grants), so third-party pages cannot trigger it.
             """
-            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest"):
+            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest", "delete"):
                 self.send_error(403)
                 return
             path = self.path.split("?")[0].rstrip("/")
@@ -727,6 +746,14 @@ def start_dashboard(port, recorder, control, sessions):
                 return
             if path == "/api/session/report":
                 self._send(json.dumps(sessions.report_now() or {}).encode(), "application/json")
+                return
+            if path == "/api/loadtest/delete":
+                ok, message = control.delete_run(str(self._json_body().get("run", "")))
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
+                return
+            if path == "/api/session/delete":
+                ok, message = sessions.delete(str(self._json_body().get("folder", "")))
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
                 return
             if path == "/api/loadtest/start":
                 ok, message = control.launch(self._json_body())
