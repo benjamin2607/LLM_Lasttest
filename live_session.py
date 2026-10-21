@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from report_charts import fmt_num, histogram_chart, html_page, time_chart
+from report_charts import TILE_CSS, count_tile, fmt_num, histogram_chart, html_page, stat_tile, tiles, time_chart
 
 REQUEST_FIELDS = ["start", "end", "status", "duration_s", "ttft_s", "prompt_tokens", "completion_tokens",
                   "tokens_estimated", "tokens_per_s", "model", "source", "streamed"]
@@ -81,6 +81,10 @@ class LiveSession:
         self.hardware = _CsvAppender(self.folder / "hardware.csv", HARDWARE_FIELDS)
         self.counts = {"completed": 0, "failed": 0, "rejected": 0, "dismissed": 0, "stale": 0}
         self._last_hw = 0.0
+        # When a session is resumed after a monitor restart, the log replay reports requests again that
+        # were written before the restart. Only those (ending up to this boundary) are checked for duplicates.
+        self.resume_boundary = meta.get("last_request_end", 0)
+        self._written = []
         self._count_existing()
 
     def _count_existing(self):
@@ -88,8 +92,16 @@ class LiveSession:
             with open(self.folder / "requests.csv", newline="", encoding="utf-8") as f:
                 for row in csv.DictReader(f):
                     self.counts[row["status"]] = self.counts.get(row["status"], 0) + 1
+                    end = _epoch(row.get("end"))
+                    if end is not None and end >= self.resume_boundary - 900:
+                        self._written.append((_epoch(row.get("start")), end, row.get("model"), row.get("status")))
         except OSError:
             pass
+
+    def _already_written(self, start, end, model, status):
+        # Rows store whole seconds and the replay works in log time (also whole seconds): allow 2 s.
+        return any(abs((s or 0) - (start or 0)) <= 2 and abs(e - end) <= 2 and m == (model or "") and st == status
+                   for s, e, m, st in self._written)
 
     def save_meta(self):
         tmp = self.folder / "session.json.tmp"
@@ -100,9 +112,12 @@ class LiveSession:
     def record_request(self, req, status):
         """Write one finished request. Requests that ended before the session started are skipped."""
         end = req.get("end") or time.time()
-        if end < self.meta["started"] or end <= self.meta.get("last_request_end", 0):
-            return  # Before the session, or already written before a monitor restart.
         start, first = req.get("start"), req.get("first")
+        if end < self.meta["started"]:
+            return  # Ended before the session started.
+        if self.resume_boundary and end <= self.resume_boundary + 2 and \
+                self._already_written(start, end, req.get("model"), status):
+            return  # Written before the monitor restarted.
         duration = end - start if start else None
         out_tok = req.get("completion_tokens")
         tps = req.get("tps") or (out_tok / duration if out_tok and duration else None)
@@ -116,7 +131,7 @@ class LiveSession:
             "model": req.get("model") or "", "source": "api" if req.get("api") else "app",
             "streamed": int(bool(req.get("streamed")))})
         self.counts[status] = self.counts.get(status, 0) + 1
-        self.meta["last_request_end"] = end
+        self.meta["last_request_end"] = max(end, self.meta.get("last_request_end", 0))
         self.save_meta()  # Lets a restarted monitor continue without writing requests twice.
 
     def record_interval(self, row):
@@ -209,6 +224,86 @@ class SessionManager:
     def state(self):
         session = self.current or self.last
         return session.info() if session else {"active": False}
+
+
+def build_from_log(root, label, start, end, log_files, metrics_dir, host=None, hardware_points=None):
+    """
+    Create a session for a past time range afterwards and write its report.
+
+    Requests come from the LM Studio log files (replayed for ``start``..``end``), per-interval
+    values from the monitor's daily CSV files in ``metrics_dir``. Hardware uses the monitor's
+    5-second points where available (``hardware_points``: list of dicts with ``t``), otherwise the
+    per-interval values. Only data that the log or the monitor recorded can be included.
+    """
+    from lmstudio_log_parser import LogParser  # Imported here: only needed for this function.
+
+    root = Path(root)
+    base = f"{datetime.fromtimestamp(start):%Y-%m-%d_%H%M%S}_{slug(label)}_from-log"
+    folder, n = root / base, 1
+    while folder.exists():
+        n += 1
+        folder = root / f"{base}-{n}"
+    folder.mkdir(parents=True)
+    meta = {"label": label.strip() or "Session", "started": start, "ended": end, "host": host or {},
+            "models": [], "retroactive": True}
+    session = LiveSession(folder, meta)
+    session.save_meta()
+
+    # Requests from the LM Studio log, in log time.
+    lines = []
+    for path in log_files:
+        try:
+            lines += Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+    parser = LogParser(use_log_time=True)
+    parser.on_request_done = session.record_request
+    parser.replay(lines, since=start, until=end)
+
+    # Per-interval values and hardware from the monitor's own files.
+    interval_rows = []
+    for path in sorted(Path(metrics_dir).glob("lmstudio_metrics_*.csv")):
+        for row in _read_csv(path):
+            t = _epoch(row.get("time"))
+            if t is not None and start <= t <= end:
+                interval_rows.append(row)
+    for row in interval_rows:
+        session.record_interval(row)
+    # 5-second points where the monitor still holds them, per-interval values for the rest of the range.
+    points = [p for p in (hardware_points or []) if start <= p.get("t", 0) <= end]
+    points = [p for i, p in enumerate(points) if i == 0 or int(p["t"]) // HARDWARE_EVERY_S
+              != int(points[i - 1]["t"]) // HARDWARE_EVERY_S]
+    covered = {int(p["t"] // 60) for p in points}
+    hw_rows = [(p["t"], {"time": iso(p["t"]), **{k: p.get(k) for k in HARDWARE_FIELDS if k != "time"}}) for p in points]
+    mapping = {"gpu_util": "gpu_util_avg", "vram_pct": "vram_pct_max", "vram_used_mb": "vram_used_mb_max",
+               "gpu_temp": "gpu_temp_max", "gpu_power_w": "gpu_power_w_avg", "ram_pct": "ram_pct_max",
+               "ram_used_gb": "ram_used_gb_max", "cpu_pct": "cpu_pct_avg"}
+    for row in interval_rows:
+        t = _epoch(row["time"])
+        if int(t // 60) not in covered:
+            hw_rows.append((t, {"time": row["time"], **{k: row.get(v) for k, v in mapping.items()}}))
+    for _, row in sorted(hw_rows, key=lambda item: item[0]):
+        session.hardware.append(row)
+    session.meta["models"] = sorted({r["model"] for r in _read_csv(folder / "requests.csv") if r.get("model")})
+    session.save_meta()
+    write_report(folder)
+    return session.info()
+
+
+def list_sessions(root, limit=20):
+    """The most recent sessions (newest first) for the dashboard."""
+    out = []
+    for folder in sorted((p for p in Path(root).iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)[:limit]:
+        try:
+            meta = json.loads((folder / "session.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        rows = _read_csv(folder / "requests.csv")
+        out.append({"folder": folder.name, "label": meta.get("label"), "started": meta.get("started"),
+                    "ended": meta.get("ended"), "retroactive": bool(meta.get("retroactive")),
+                    "completed": sum(1 for r in rows if r.get("status") == "completed"),
+                    "report": (folder / "report.html").exists()})
+    return out
 
 
 # --- Report ---
@@ -330,22 +425,21 @@ def write_report(folder):
         return f"{fmt_num(d[key])} s" if d.get(key) is not None else "–"
 
     rt, tt, hwd = s["response_time_s"], s["time_to_first_token_s"], s["hardware"]
-    tiles = [
+    # Count tiles: (label, value, note). Distribution tiles: (label, statistics, unit).
+    count_tiles = [
         ("Completed requests", fmt_num(s["requests"].get("completed", 0)), f"{fmt_num(s['requests']['per_hour'])} per hour"),
         ("Not answered", fmt_num(sum(s["requests"].get(k, 0) for k in ("failed", "rejected", "stale", "dismissed"))),
          ", ".join(f"{s['requests'][k]} {k}" for k in ("failed", "rejected", "stale", "dismissed")
                    if s["requests"].get(k)) or "none"),
-        ("Response time", sec(rt, "median"), f"median · Ø {sec(rt, 'mean')} · p95 {sec(rt, 'p95')} · max {sec(rt, 'max')}"),
-        ("First token", sec(tt, "median"), f"median · Ø {sec(tt, 'mean')} · p95 {sec(tt, 'p95')}"),
         ("Peak concurrency", fmt_num(s["peak_concurrency"]), "parallel requests (max per interval)"),
         ("Busiest minute", fmt_num(s["busiest_minute"]["requests"]) if s["busiest_minute"] else "–",
          f"requests at {s['busiest_minute']['time'][11:16]}" if s["busiest_minute"] else ""),
         ("Generated tokens", fmt_num(s["tokens"]["completion"]), f"{fmt_num(s['tokens']['prompt'])} prompt tokens"),
-        ("GPU", f"{fmt_num(hwd['gpu_util_pct'].get('mean'))} %" if hwd["gpu_util_pct"] else "–",
-         f"Ø utilisation · max {fmt_num(hwd['gpu_util_pct'].get('max'))} %" if hwd["gpu_util_pct"] else "no GPU data"),
-        ("GPU memory", f"{fmt_num(hwd['vram_pct'].get('max'))} %" if hwd["vram_pct"] else "–", "max"),
-        ("System memory", f"{fmt_num(hwd['ram_pct'].get('max'))} %" if hwd["ram_pct"] else "–", "max"),
     ]
+    stat_tiles = [("Response time", rt, " s"), ("First token", tt, " s"),
+                  ("Tokens/s per request", s["tokens"]["per_request_tokens_per_s"], ""),
+                  ("GPU utilisation", hwd["gpu_util_pct"], " %"), ("GPU memory", hwd["vram_pct"], " %"),
+                  ("System memory", hwd["ram_pct"], " %"), ("GPU temperature", hwd["gpu_temp_c"], " °C")]
 
     meta = json.loads((folder / "session.json").read_text(encoding="utf-8"))
     span = (meta["started"], meta.get("ended") or time.time())
@@ -383,9 +477,8 @@ def write_report(folder):
             f"<p class='meta'>{html.escape(s['started'].replace('T', ' '))} – "
             f"{html.escape((s['ended'] or 'running').replace('T', ' '))} · {fmt_num(s['duration_min'])} min"
             + (f" · {html.escape(host.get('gpu_name') or '')}" if host.get("gpu_name") else "") + "</p>",
-            "<div class='tiles'>" + "".join(
-                f"<div class='tile'><div class='label'>{html.escape(a)}</div><div class='big'>{html.escape(b)}</div>"
-                f"<div class='sub'>{html.escape(c)}</div></div>" for a, b, c in tiles) + "</div>",
+            tiles(count_tile(*t) for t in count_tiles),
+            tiles(stat_tile(*t) for t in stat_tiles if t[1]),
             "<h2>Charts</h2><div class='charts'>" + "".join(f"<figure>{c}</figure>" for c in charts) + "</div>"
             if charts else "<p>No completed requests recorded yet.</p>",
             "<h2>Models</h2><div class='table'><table><thead><tr><th>Model</th><th>Requests</th><th>Median</th>"
@@ -394,13 +487,7 @@ def write_report(folder):
             "<code>intervals.csv</code> (per interval), <code>hardware.csv</code> (every 5 s), "
             "<code>summary.json</code> (key figures). Only numbers, times and model names are stored – "
             "no prompts, responses, IP addresses or user identifiers.</p>"]
-    extra_css = """<style>
-.meta { color: var(--text-2); margin-top: -6px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 16px 0; }
-.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
-.tile .label { color: var(--text-2); font-size: 12px; } .tile .big { font-size: 24px; font-weight: 650; margin-top: 2px; }
-.tile .sub { color: var(--text-3); font-size: 12px; }
-</style>"""
+    extra_css = TILE_CSS
     page = html_page(f"Live session: {s['label']}", extra_css + "\n".join(body))
     (folder / "report.html").write_text(page, encoding="utf-8")
     return folder / "report.html"

@@ -25,6 +25,7 @@ import csv
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -35,7 +36,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from live_session import SessionManager
+from live_session import SessionManager, build_from_log, list_sessions
 from lmstudio_log_parser import LogParser, diagnose, rnd
 from system_metrics import SystemSampler
 
@@ -129,6 +130,14 @@ class LogFollower(threading.Thread):
         self._stop.set()
 
 
+def csv_header(path):
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return next(csv.reader(f), None)
+    except OSError:
+        return None
+
+
 def find_log_target(explicit=None):
     """Resolve the log file or directory: explicit path, LMSTUDIO_LOG_DIR, then default locations."""
     if explicit:
@@ -206,6 +215,7 @@ class LiveRecorder(threading.Thread):
     """Collects log, hardware and API state once per second and notifies dashboard clients."""
 
     SAVE_EVERY_S = 15
+    HARDWARE_STEP_S = 5  # Resolution of the saved hardware points (keeps the file small for long series).
 
     def __init__(self, parser, sampler, args, follower=None, keep_s=1800):
         super().__init__(daemon=True)
@@ -259,12 +269,13 @@ class LiveRecorder(threading.Thread):
         except (OSError, ValueError):
             return {}
         cutoff = max(time.time() - self.keep_s, self.cleared_at)
-        return {int(p["t"]): p for p in points if p.get("t", 0) >= cutoff}
+        return {int(p["t"]) - int(p["t"]) % self.HARDWARE_STEP_S: p for p in points if p.get("t", 0) >= cutoff}
 
     def save_hardware(self):
         """Persist the hardware part of the live series (numbers only) for the next start."""
         with self.cond:
-            points = [{"t": p["t"], **{k: p.get(k) for k in HARDWARE_FIELDS}} for p in self.series]
+            points = [{"t": p["t"], **{k: p.get(k) for k in HARDWARE_FIELDS}} for p in self.series
+                      if int(p["t"]) % self.HARDWARE_STEP_S == 0]
         try:
             tmp = self.hardware_file.with_suffix(".tmp")
             tmp.write_text(json.dumps({"points": points}), encoding="utf-8")
@@ -272,10 +283,22 @@ class LiveRecorder(threading.Thread):
         except OSError:
             pass
 
+    def log_files_since(self, start):
+        """LM Studio log files that may contain entries from ``start`` onwards."""
+        if self.follower is None:
+            return []
+        return [p for p in self.follower._log_files() if p.stat().st_mtime >= start]
+
+    def hardware_points(self):
+        """Hardware points currently kept in memory (for sessions built afterwards)."""
+        with self.cond:
+            return [{"t": p["t"], **{k: p.get(k) for k in HARDWARE_FIELDS}} for p in self.series
+                    if p.get("gpu_util") is not None or p.get("ram_pct") is not None]
+
     def replay_sample(self, second):
         """Called by the log replay once per second: rebuild one data point of the live series."""
-        live = self.parser.live()
-        hw = self._saved_hardware.get(second, {})
+        live = self.parser.live_point()
+        hw = self._saved_hardware.get(second - second % self.HARDWARE_STEP_S, {})
         self.series.append({"t": float(second), "active": live["active"], "waiting": live["waiting"],
                             "tokens_per_s": live["tokens_per_s"], "requests_per_min": live["requests_per_min"],
                             **{k: hw.get(k) for k in HARDWARE_FIELDS}})
@@ -356,11 +379,11 @@ class LiveRecorder(threading.Thread):
         """Complete state for the initial page load."""
         with self.cond:
             return {"series": list(self.series), "history": list(self.history), "state": self.state,
-                    "latency_points": self.parser.latency_points(),
+                    "latency_points": self.parser.latency_points(window=self.keep_s),
                     "config": {"interval": self.args.interval, "alert_p95": self.args.alert_p95,
                                "alert_vram_pct": self.args.alert_vram_pct,
                                "alert_gpu_temp": self.args.alert_gpu_temp, "alert_active": self.args.alert_active,
-                               "stall_after": self.parser.stall_after}}
+                               "stall_after": self.parser.stall_after, "keep_s": self.keep_s}}
 
 
 # --- Load test control (dashboard stop button) ---
@@ -376,8 +399,18 @@ class LoadTestControl:
     HEARTBEAT_TIMEOUT_S = 8
     STOP_WAIT_S = 45
 
+    # Parameters of a custom load test started from the dashboard: (type, min, max) or allowed values.
+    LAUNCH_PARAMS = {
+        "stage_duration": (int, 10, 7200), "spawn_rate": (float, 0.1, 50), "cooldown": (int, 0, 600),
+        "stop_timeout": (int, 0, 600), "max_p95": (float, 1, 3600), "max_fail_rate": (float, 0, 1),
+        "student_think_time": (float, 1, 3600), "wait_min": (float, 0, 600), "wait_max": (float, 0, 600),
+        "request_timeout": (float, 5, 3600), "max_threads": (int, 0, 10000),
+    }
+
     def __init__(self, project_dir, anythingllm_url, api_key):
-        project_dir = Path(project_dir)
+        self.project_dir = project_dir = Path(project_dir)
+        self.process = None
+        self.launch_info = None
         self.status_file = project_dir / ".loadtest_status.json"
         self.stop_file = project_dir / ".loadtest_stop"
         self.registry_file = project_dir / ".loadtest_threads.json"
@@ -403,8 +436,90 @@ class LoadTestControl:
     def state(self):
         with self.lock:
             progress = dict(self.progress)
+            launch = dict(self.launch_info) if self.launch_info else None
+        if launch and self.process is not None and self.process.poll() is not None:
+            launch["exit_code"] = self.process.returncode
+            if self.process.returncode:  # Failed early, e.g. preflight: show why.
+                launch["log_tail"] = self._log_tail(launch["log"])
         return {"loadtest": self.loadtest(), "threads": len(self.threads()),
-                "can_delete": bool(self.api_key), "progress": progress}
+                "can_delete": bool(self.api_key), "progress": progress, "launch": launch,
+                "latest_report": self.latest_report(),
+                "defaults": {"host": self.url, "workspace": os.environ.get("WORKSPACE_SLUG", ""),
+                             "api_key_set": bool(self.api_key)}}
+
+    def latest_report(self):
+        results = self.project_dir / "loadtest_results"
+        runs = sorted((p for p in results.glob("*/report.html")), key=lambda p: p.stat().st_mtime) if results.is_dir() else []
+        return runs[-1].parent.name if runs else None
+
+    @staticmethod
+    def _log_tail(path, lines=12):
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+        except OSError:
+            return []
+
+    def launch(self, params):
+        """
+        Start auto_loadtest.py with validated parameters from the dashboard. Returns (ok, message).
+        The process is started without a shell; every value is checked against a fixed rule.
+        """
+        if self.loadtest()["running"] or (self.process is not None and self.process.poll() is None):
+            return False, "a load test is already running"
+        users = str(params.get("users", "")).replace(" ", "")
+        if not re.fullmatch(r"\d{1,4}(,\d{1,4}){0,40}", users) or not all(int(u) > 0 for u in users.split(",")):
+            return False, "users must be a comma-separated list of positive numbers, e.g. 1,2,4,8"
+        host = str(params.get("host") or self.url).strip()
+        if not re.fullmatch(r"https?://[\w.\-\[\]:]+(/[\w./\-]*)?", host):
+            return False, "host must be an http(s) URL"
+        workspace = str(params.get("workspace") or os.environ.get("WORKSPACE_SLUG", "")).strip()
+        if not re.fullmatch(r"[\w-]{1,100}", workspace):
+            return False, "workspace slug is missing or invalid"
+        api_key = str(params.get("api_key") or self.api_key or "")
+        if not api_key:
+            return False, "an AnythingLLM API key is required (field or env ANYTHING_API_KEY)"
+        mode = params.get("mode", "query")
+        if mode not in ("query", "chat"):
+            return False, "mode must be query or chat"
+        values = {}
+        for key, (kind, lo, hi) in self.LAUNCH_PARAMS.items():
+            if params.get(key) in (None, ""):
+                continue
+            try:
+                value = kind(params[key])
+            except (TypeError, ValueError):
+                return False, f"{key} must be a number"
+            if not lo <= value <= hi:
+                return False, f"{key} must be between {lo} and {hi}"
+            values[key] = value
+        if values.get("wait_min", 0) > values.get("wait_max", values.get("wait_min", 0)):
+            return False, "wait_min must not exceed wait_max"
+
+        cmd = [sys.executable, str(self.project_dir / "auto_loadtest.py"), "--host", host, "--users", users]
+        for key in ("stage_duration", "spawn_rate", "cooldown", "stop_timeout", "max_p95", "max_fail_rate",
+                    "student_think_time"):
+            if key in values:
+                cmd += [f"--{key.replace('_', '-')}", str(values[key])]
+        if params.get("refine"):
+            cmd.append("--refine")
+        cmd += ["--", "--mode", mode]
+        for key in ("wait_min", "wait_max", "request_timeout", "max_threads"):
+            if key in values:
+                cmd += [f"--{key.replace('_', '-')}", str(values[key])]
+        env = {**os.environ, "ANYTHING_API_KEY": api_key, "WORKSPACE_SLUG": workspace}
+        log_dir = self.project_dir / "loadtest_results"
+        log_dir.mkdir(exist_ok=True)
+        log = log_dir / f"dashboard_{datetime.now():%Y%m%d_%H%M%S}.log"
+        flags = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+        with open(log, "w", encoding="utf-8") as out:
+            self.process = subprocess.Popen(cmd, cwd=self.project_dir, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                            **flags)
+        with self.lock:
+            self.launch_info = {"pid": self.process.pid, "started": time.time(), "log": str(log),
+                                "users": users, "mode": mode, "host": host, "workspace": workspace}
+        printable = [c for c in cmd if c != api_key]
+        print(f"[monitor] load test started from the dashboard: {' '.join(printable[1:])}")
+        return True, f"load test started (log: {log.name})"
 
     def _set(self, **progress):
         with self.lock:
@@ -480,6 +595,15 @@ def start_dashboard(port, recorder, control, sessions):
             elif path == "/api/state":
                 self._send(json.dumps({**recorder.full(), "control": control.state(),
                                        "session": sessions.state()}).encode(), "application/json")
+            elif path == "/api/sessions":
+                self._send(json.dumps(list_sessions(sessions.root)).encode(), "application/json")
+            elif path.startswith("/loadtest/") and path.endswith("/report.html"):
+                run = path.split("/")[2]
+                report = control.project_dir / "loadtest_results" / run / "report.html"
+                if re.fullmatch(r"[\w.-]+", run) and report.is_file():
+                    self._send(report.read_bytes(), "text/html; charset=utf-8")
+                else:
+                    self.send_error(404)
             elif path.startswith("/sessions/") and path.endswith("/report.html"):
                 folder = path.split("/")[2]
                 report = sessions.root / folder / "report.html"
@@ -493,13 +617,21 @@ def start_dashboard(port, recorder, control, sessions):
             else:
                 self.send_error(404)
 
+        def _json_body(self):
+            length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return {}
+            return body if isinstance(body, dict) else {}
+
         def do_POST(self):
             """
             Remove hung requests from tracking. A custom header is required: browsers only send it
             from the dashboard's own origin (other sites would need a CORS preflight, which this server
             never grants), so third-party pages cannot trigger it.
             """
-            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session"):
+            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest"):
                 self.send_error(403)
                 return
             path = self.path.split("?")[0].rstrip("/")
@@ -513,11 +645,7 @@ def start_dashboard(port, recorder, control, sessions):
                 self._send(json.dumps({"cleared": True}).encode(), "application/json")
                 return
             if path == "/api/session/start":
-                length = int(self.headers.get("Content-Length") or 0)
-                try:
-                    label = str(json.loads(self.rfile.read(length) or b"{}").get("label", ""))[:120]
-                except ValueError:
-                    label = ""
+                label = str(self._json_body().get("label", ""))[:120]
                 self._send(json.dumps(sessions.start(label or "Live test", recorder.models)).encode(),
                            "application/json")
                 return
@@ -526,6 +654,28 @@ def start_dashboard(port, recorder, control, sessions):
                 return
             if path == "/api/session/report":
                 self._send(json.dumps(sessions.report_now() or {}).encode(), "application/json")
+                return
+            if path == "/api/loadtest/start":
+                ok, message = control.launch(self._json_body())
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
+                return
+            if path == "/api/session/build":
+                body = self._json_body()
+                try:
+                    start = datetime.fromisoformat(str(body.get("start"))).timestamp()
+                    end = datetime.fromisoformat(str(body.get("end"))).timestamp()
+                except ValueError:
+                    self._send(json.dumps({"ok": False, "message": "invalid start or end"}).encode(), "application/json")
+                    return
+                if not start < end <= time.time() + 60:
+                    self._send(json.dumps({"ok": False, "message": "the range must lie in the past and end after it starts"}
+                                          ).encode(), "application/json")
+                    return
+                info = build_from_log(sessions.root, str(body.get("label") or "Past session")[:120], start, end,
+                                      recorder.log_files_since(start), recorder.args.out, sessions.host_info,
+                                      recorder.hardware_points())
+                print(f"[monitor] session built from the log: {info['folder']} ({info['counts']['completed']} requests)")
+                self._send(json.dumps({"ok": True, **info}).encode(), "application/json")
                 return
             if path == "/api/system/stop":
                 started = control.start()
@@ -592,6 +742,8 @@ def main():
                     help="Folder of auto_loadtest.py (status, stop and thread registry files)")
     ap.add_argument("--session", metavar="LABEL",
                     help="Start a recording session for a live test right away (or use the dashboard)")
+    ap.add_argument("--keep-hours", type=float, default=4,
+                    help="Hours of per-second data kept for the dashboard (time range \"Max\")")
     ap.add_argument("--stall-minutes", type=float, default=5,
                     help="Mark a running request as stalled after N minutes without any log activity")
     ap.add_argument("--replay-minutes", type=int, default=30,
@@ -623,7 +775,7 @@ def main():
     sampler = SystemSampler(interval=1.0, gpu_index=args.gpu_index)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    recorder = LiveRecorder(parser, sampler, args, follower)
+    recorder = LiveRecorder(parser, sampler, args, follower, keep_s=int(args.keep_hours * 3600))
     recorder.load_history(out_dir)
     # Sessions are set up before the log replay, so requests made while the monitor was not
     # running are added to a resumed session.
@@ -640,6 +792,10 @@ def main():
         # Restore the recent past so the dashboard is filled right after a restart.
         t0 = time.time()
         replay_window = 0 if args.from_start else args.replay_minutes * 60
+        if sessions.current is not None and not args.from_start:
+            # "Max" covers the whole running session, so rebuild it completely (within the kept range).
+            replay_window = max(replay_window, time.time() - sessions.current.meta["started"])
+        replay_window = min(replay_window, recorder.keep_s)
         replay_window = max(0, min(replay_window, time.time() - recorder.cleared_at))  # Not before a "Clear".
         follower.open_initial(replay_window=replay_window, sample=recorder.replay_sample)
         if replay_window:
@@ -690,8 +846,10 @@ def main():
 
             csv_path = out_dir / f"lmstudio_metrics_{now:%Y-%m-%d}.csv"
             new_file = not csv_path.exists()
+            header = list(row.keys()) if new_file else csv_header(csv_path) or list(row.keys())
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(row.keys()), extrasaction="ignore")
+                # An existing file keeps its columns, so rows stay aligned after an update adds metrics.
+                writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
                 if new_file:
                     writer.writeheader()
                 writer.writerow(row)

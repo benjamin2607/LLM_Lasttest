@@ -9,7 +9,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from live_session import SessionManager, summarise  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+from live_session import SessionManager, build_from_log, list_sessions, summarise  # noqa: E402
 
 
 def request(end, duration=4.0, ttft=1.0, tokens=120, model="google/gemma-4-e4b"):
@@ -56,6 +58,14 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(rows(folder, "requests.csv")), 2)
         self.assertEqual(resumed.current.counts["completed"], 2)
 
+    def test_requests_finishing_out_of_order_or_in_the_same_second_are_all_kept(self):
+        manager = SessionManager(self.out)
+        manager.start("Order")
+        now = float(int(time.time())) + 5
+        for end in (now, now, now - 0.5, now + 1):  # Same second twice, one booked after a later one.
+            manager.current.record_request(request(end), "completed")
+        self.assertEqual(len(rows(manager.current.folder, "requests.csv")), 4)
+
     def test_end_writes_report_and_summary(self):
         manager = SessionManager(self.out, {"gpu_name": "Test GPU"})
         manager.start("Report test")
@@ -98,6 +108,39 @@ class SessionTests(unittest.TestCase):
         second = manager.start("Same")["folder"]  # Ends the first one (like "Clear").
         self.assertNotEqual(first, second)
         self.assertTrue((self.out / "sessions" / first / "report.html").is_file())
+
+    def test_build_session_for_a_past_time_range(self):
+        base = float(int(time.time()) - 3600)
+
+        def at(epoch, level="INFO"):
+            return "[" + datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S") + f"][{level}][google/gemma-4-e4b]"
+
+        lines = []
+        for offset in (60, 600, 1200, 3000):  # The last one lies outside the chosen range.
+            t = base + offset
+            lines += [f"{at(t)} Running chat completion on conversation with 1 messages.",
+                      f"{at(t + 3)} Generated prediction: {{", '  "usage": {', '    "prompt_tokens": 10,',
+                      '    "completion_tokens": 50', "  }", "}", f"{at(t + 3)} Model generated tool calls: []"]
+        log = self.out / "server.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        metrics = self.out / "monitoring"
+        metrics.mkdir()
+        with open(metrics / "lmstudio_metrics_test.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["time", "max_active", "gpu_util_avg", "vram_pct_max", "ram_pct_max"])
+            writer.writeheader()
+            for offset in (0, 600, 3000):
+                writer.writerow({"time": datetime.fromtimestamp(base + offset).isoformat(timespec="seconds"),
+                                 "max_active": 1, "gpu_util_avg": 70, "vram_pct_max": 55, "ram_pct_max": 60})
+
+        info = build_from_log(metrics / "sessions", "Seminar afterwards", base, base + 1800, [log], metrics)
+        folder = metrics / "sessions" / info["folder"]
+        self.assertEqual(len(rows(folder, "requests.csv")), 3)
+        self.assertEqual(len(rows(folder, "intervals.csv")), 2)
+        self.assertEqual(rows(folder, "hardware.csv")[0]["gpu_util"], "70")
+        self.assertTrue((folder / "report.html").is_file())
+        listed = list_sessions(metrics / "sessions")
+        self.assertEqual(listed[0]["completed"], 3)
+        self.assertTrue(listed[0]["retroactive"])
 
     def test_summary_of_empty_session(self):
         manager = SessionManager(self.out)

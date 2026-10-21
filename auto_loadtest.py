@@ -17,9 +17,11 @@ Example:
 """
 import argparse
 import csv
+import html
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -31,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 from lmstudio_monitor import LMStudioWatcher, find_log_target
-from report_charts import html_page, line_chart, markdown_to_html
+from report_charts import TILE_CSS, count_tile, html_page, line_chart, markdown_to_html, stat_tile, tiles
 from system_metrics import SystemSampler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -458,12 +460,104 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
         md_charts.append(f"![{title}](charts/{name}.svg)")
     md = lines[:charts_at] + (md_charts if charts else []) + lines[charts_at:]
     (out_dir / "report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
-    # report.html is a single self-contained file with the charts inline.
-    inline = ("<h2>Charts</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for *_, svg in charts)
-              + "</div>") if charts else None
-    (out_dir / "report.html").write_text(
-        html_page(f"Load test report {out_dir.name}", markdown_to_html("\n".join(lines), inline, "Stages")),
-        encoding="utf-8")
+    # report.html is a single self-contained file in the same layout as the live session reports.
+    summary = {"last_ok": last_ok, "first_bad": first_bad, "knee": knee, "best": best, "aborted": aborted,
+               "user_stop": user_stop}
+    (out_dir / "report.html").write_text(html_report(out_dir, ordered, results, args, summary, lines, charts),
+                                         encoding="utf-8")
+
+
+def passthrough_value(args, flag):
+    """Value of ``flag`` among the arguments forwarded to main.py, or None."""
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def html_report(out_dir, ordered, results, args, summary, lines, charts):
+    """Load test report with key figure tiles, statistics tiles, charts and the detailed sections."""
+    last_ok, first_bad, knee, best = summary["last_ok"], summary["first_bad"], summary["knee"], summary["best"]
+    stopped = next((r for r in results if r.get("stopped")), None)
+    failed = next((r for r in results if r.get("error") is not None), None)
+    chat_total = sum(r["chat_requests"] for r in ordered)
+    fail_total = sum(r["chat_failures"] for r in ordered)
+    refused = sum(r["rejected"] + r["refused_no_context"] for r in ordered)
+    # Statistics refer to the operating point that matters in practice: the stage with the highest
+    # stable throughput (otherwise the highest passing stage, otherwise the last stage run).
+    ref = best or next((r for r in reversed(ordered) if r["passed"]), None) or (ordered[-1] if ordered else None)
+
+    if last_ok is not None:
+        limit_note = f"limit at {first_bad} users" if first_bad else "limit not reached – increase the users"
+    else:
+        limit_note = "a limit was exceeded at the first stage" if first_bad else "no stage passed"
+    count = [
+        count_tile("Highest passing stage", f"{last_ok} users" if last_ok is not None else "–", limit_note),
+        count_tile("Throughput saturation", f"{knee} users" if knee else "not reached",
+                   "more users only add waiting time" if knee else "throughput still grows with users"),
+        count_tile("Max stable throughput", f"{best['chat_rps'] * 60:.1f}/min" if best else "–",
+                   f"{best['chat_rps']:.2f} responses/s at {best['users']} users" if best else ""),
+        count_tile("Estimated students", f"≈ {best['chat_rps'] * (args.student_think_time + (best['chat_avg_s'] or 0)):.0f}"
+                   if best else "–", f"Little's law, {args.student_think_time:g} s between questions"),
+        count_tile("Chat requests", f"{chat_total:,}", f"{fail_total / chat_total:.1%} failed" if chat_total else ""),
+        count_tile("Refusals", f"{refused / chat_total:.1%}" if chat_total else "–",
+                   f"{refused} of {chat_total} (rejected or no relevant documents)" if chat_total else ""),
+    ]
+    if ref and ref.get("lm_gen_tokens_per_s") is not None:
+        count.append(count_tile("Generated tokens/s", f"{ref['lm_gen_tokens_per_s']:g}", f"at {ref['users']} users"))
+
+    stat = []
+    if ref:
+        at = f" at {ref['users']} users"
+        pick = lambda mean, median, p95, mx, n=None: {"mean": ref.get(mean), "median": ref.get(median),  # noqa: E731
+                                                      "p95": ref.get(p95), "max": ref.get(mx), "n": n}
+        for label, stats, unit in (
+                ("Response time" + at, pick("chat_avg_s", "chat_median_s", "chat_p95_s", "chat_max_s",
+                                            ref["chat_requests"]), " s"),
+                ("GPU utilisation" + at, pick("gpu_util_avg", "gpu_util_median", "gpu_util_p95", "gpu_util_max"), " %"),
+                ("GPU memory" + at, pick("vram_pct_avg", "vram_pct_median", "vram_pct_p95", "vram_pct_max"), " %"),
+                ("System memory" + at, pick("ram_pct_avg", "ram_pct_median", "ram_pct_p95", "ram_pct_max"), " %"),
+                ("GPU temperature" + at, pick("gpu_temp_avg", "gpu_temp_median", "gpu_temp_p95", "gpu_temp_max"), " °C")):
+            if any(stats[k] is not None for k in ("mean", "median", "p95", "max")):
+                stat.append(stat_tile(label, stats, unit, note=None if stats["n"] is not None else ""))
+
+    banners = []
+    if stopped:
+        banners.append(f"Stopped from the dashboard at {stopped['users']} users (stage {stopped['stage']}); "
+                       "no further stages were run.")
+    elif summary["user_stop"]:
+        banners.append("Stopped from the dashboard between stages; later stages were not run.")
+    if summary["aborted"]:
+        banners.append("The test was aborted manually; results are incomplete.")
+    if failed:
+        banners.append(f"Locust failed to run at stage {failed['stage']} – a setup problem, not a capacity limit.")
+    errors = next((r for r in ordered if not r["passed"] and r.get("top_errors")), None)
+
+    gpu = getattr(args, "gpu_name", None)
+    started = datetime.strptime(out_dir.name, "%Y%m%d_%H%M%S") if re.fullmatch(r"\d{8}_\d{6}", out_dir.name) else None
+    body = [f"<h1>Load test {html.escape(out_dir.name)}</h1>",
+            "<p class='meta'>" + " · ".join(html.escape(x) for x in filter(None, [
+                started.strftime("%Y-%m-%d %H:%M") if started else None, args.host,
+                f"mode {passthrough_value(args.passthrough, '--mode') or 'query'}", f"{args.stage_duration} s per stage",
+                gpu])) + "</p>"]
+    body += [f"<div class='banner'>{html.escape(b)}</div>" for b in banners]
+    if failed:
+        body.append(f"<pre>{html.escape(failed['error'])}</pre>")
+    body += [tiles(count), tiles(stat) if stat else ""]
+    if errors:
+        body.append(f"<h2>Most frequent errors at {errors['users']} users</h2><ul>"
+                    + "".join(f"<li>{n}× <code>{html.escape(e)}</code></li>" for e, n in errors["top_errors"]) + "</ul>")
+        if looks_like_setup_problem(errors):
+            body.append(f"<blockquote>{html.escape(SETUP_HINT)}</blockquote>")
+    if charts:
+        body.append("<h2>Charts</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for *_, svg in charts)
+                    + "</div>")
+    # Detailed sections from the Markdown report (refusals, stage table, notes); the result summary is in the tiles.
+    rest = next((i for i, line in enumerate(lines) if line.startswith("## ") and not line.startswith("## Result")), len(lines))
+    body.append(markdown_to_html("\n".join(lines[rest:])))
+    return html_page(f"Load test {out_dir.name}", TILE_CSS + "\n".join(body))
 
 
 def build_charts(ordered, args):
@@ -545,6 +639,7 @@ def main():
 
     sampler = SystemSampler()
     sampler.start()
+    args.gpu_name = sampler.gpu.info().get("gpu_name")
     global STATUS
     if stop_requested():
         STOP_FILE.unlink()  # A stop request from an earlier run must not end this one.

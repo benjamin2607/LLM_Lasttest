@@ -31,13 +31,25 @@
   --track: #2e2e2b;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }  /* Buttons set their own display; hidden must still win. */
 body { margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 .wrap { max-width: 1480px; margin: 0 auto; padding: 16px; }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 14px; }
 h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
 h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.status-menu { position: relative; }
+.status-toggle { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 999px; padding: 5px 10px; cursor: pointer; font: inherit; color: var(--text-2); }
+.status-toggle:hover, .status-toggle[aria-expanded="true"] { background: var(--surface-2); color: var(--text); }
+.status-toggle .chev { font-size: 10px; margin-left: 2px; transition: transform .15s; }
+.status-toggle[aria-expanded="true"] .chev { transform: rotate(180deg); }
+.status-panel { position: absolute; top: calc(100% + 6px); left: 0; z-index: 15; display: none; flex-direction: column;
+  align-items: flex-start; gap: 6px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.18); min-width: 240px; }
+.status-panel.show { display: flex; }
+.status-panel .chip { border: 0; background: none; padding: 2px 0; font-size: 13px; color: var(--text); }
 .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border);
   border-radius: 999px; padding: 3px 10px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex: none; }
@@ -124,6 +136,22 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
   font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
 .btn-clear:hover { background: var(--surface-2); }
 .control { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.tool details { margin-top: 10px; border-top: 1px solid var(--grid); padding-top: 8px; }
+.tool summary { cursor: pointer; font-weight: 600; color: var(--text); font-size: 13px; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 14px; margin: 12px 0 4px; }
+.form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-2); }
+.form-grid label.wide { grid-column: span 2; }
+.form-grid label.check { flex-direction: row; align-items: center; gap: 8px; font-size: 13px; color: var(--text); }
+.form-grid input, .form-grid select { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; min-width: 0; }
+.form-grid input:focus, .form-grid select:focus { outline: 2px solid var(--s1); outline-offset: 0; }
+.form-foot { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; justify-content: space-between; }
+.form-foot .text { color: var(--text-2); font-size: 12px; flex: 1; min-width: 220px; }
+.hint { grid-column: 1 / -1; color: var(--text-3); font-size: 12px; margin: 0; }
+#ltLog { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px;
+  white-space: pre-wrap; margin: 10px 0 0; color: var(--text); }
+.badge { font-size: 11px; color: var(--text-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
+@media (max-width: 520px) { .form-grid label.wide { grid-column: auto; } }
 .session { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; }
 .session .text { flex: 1; min-width: 260px; color: var(--text-2); font-size: 13px; }
 .session .text b { color: var(--text); }
@@ -164,17 +192,24 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
   <header>
     <h1>LM Studio · Live Monitor</h1>
     <div class="chips">
-      <span class="chip" id="chipConn"><span class="dot"></span><span>connecting …</span></span>
-      <span class="chip" id="chipApi"><span class="dot"></span><span>API</span></span>
-      <span class="chip" id="chipLog"><span class="dot"></span><span>Log</span></span>
-      <span class="chip" id="chipModel"><span class="dot"></span><span>Model –</span></span>
-      <span class="chip" id="chipGpu"><span class="dot"></span><span>GPU –</span></span>
+      <div class="status-menu">
+        <button class="status-toggle" id="statusToggle" aria-expanded="false" aria-controls="statusPanel" title="System status">
+          <span class="dot" data-led="chipConn"></span><span class="dot" data-led="chipApi"></span><span class="dot" data-led="chipLog"></span><span class="dot" data-led="chipModel"></span><span class="dot" data-led="chipGpu"></span><span class="chev">▾</span>
+        </button>
+        <div class="status-panel" id="statusPanel" role="group" aria-label="System status">
+          <span class="chip" id="chipConn"><span class="dot"></span><span>connecting …</span></span>
+          <span class="chip" id="chipApi"><span class="dot"></span><span>API</span></span>
+          <span class="chip" id="chipLog"><span class="dot"></span><span>Log</span></span>
+          <span class="chip" id="chipModel"><span class="dot"></span><span>Model –</span></span>
+          <span class="chip" id="chipGpu"><span class="dot"></span><span>GPU –</span></span>
+        </div>
+      </div>
       <span class="chip" id="chipLoad"><span class="dot"></span><span>load test idle</span></span>
     </div>
     <div class="spacer"></div>
     <button class="btn-clear" id="clearAll" title="Reset all values shown in the dashboard and start afresh (stored CSV data is kept)">↺ Clear</button>
     <div class="seg" id="range" role="group" aria-label="Time range">
-      <button data-min="5">5 min</button><button data-min="15" class="on">15 min</button><button data-min="30">30 min</button>
+      <button data-min="5">5 min</button><button data-min="15" class="on">15 min</button><button data-min="30">30 min</button><button data-min="max" title="Since the start of the running session, otherwise all data the monitor keeps">Max</button>
     </div>
     <span class="clock" id="clock"></span>
   </header>
@@ -249,10 +284,56 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <div class="plot" id="cHist" style="height:170px"></div>
   </section>
 
-  <section class="card control" style="margin-bottom:12px">
-    <h2>Load test</h2>
-    <span class="text" id="loadText">No load test is running.</span>
-    <button class="btn-stop" id="stopAll" title="Stop a running load test and delete all threads it created in AnythingLLM"><span class="sq"></span><span id="stopLabel">Stop &amp; delete threads</span></button>
+  <section class="card tool" style="margin-bottom:12px">
+    <div class="control">
+      <h2>Load test</h2>
+      <span class="text" id="loadText">No load test is running.</span>
+      <a id="ltReport" href="#" target="_blank" rel="noopener" hidden>Latest report</a>
+      <button class="btn-stop" id="stopAll" title="Stop a running load test and delete all threads it created in AnythingLLM"><span class="sq"></span><span id="stopLabel">Stop &amp; delete threads</span></button>
+    </div>
+    <details id="ltDetails">
+      <summary>New load test …</summary>
+      <form id="ltForm" class="form-grid" autocomplete="off">
+        <label>AnythingLLM URL<input name="host" type="url" required></label>
+        <label>Workspace slug<input name="workspace" required pattern="[A-Za-z0-9_\-]+"></label>
+        <label>API key<input name="api_key" type="password" id="ltKey" placeholder="from ANYTHING_API_KEY"></label>
+        <label>Mode<select name="mode"><option value="query">query (RAG, documents only)</option><option value="chat">chat</option></select></label>
+        <label class="wide">Stages: concurrent users<input name="users" value="1,2,4,8,16" required pattern="\d+(,\d+)*"></label>
+        <label>Measurement per stage (s)<input name="stage_duration" type="number" min="10" value="300"></label>
+        <label>New users per second<input name="spawn_rate" type="number" min="0.1" step="any" value="1"></label>
+        <label>Pause between stages (s)<input name="cooldown" type="number" min="0" value="30"></label>
+        <label>Grace for running requests (s)<input name="stop_timeout" type="number" min="0" value="120"></label>
+        <label>Think time min (s)<input name="wait_min" type="number" min="0" step="any" value="5"></label>
+        <label>Think time max (s)<input name="wait_max" type="number" min="0" step="any" value="15"></label>
+        <label>Request timeout (s)<input name="request_timeout" type="number" min="5" value="300"></label>
+        <label>Limit: p95 response time (s)<input name="max_p95" type="number" min="1" value="120"></label>
+        <label>Limit: failure rate (%)<input name="max_fail_pct" type="number" min="0" max="100" step="any" value="5"></label>
+        <label>Student think time for estimate (s)<input name="student_think_time" type="number" min="1" value="90"></label>
+        <label>Threads kept in AnythingLLM<input name="max_threads" type="number" min="0" value="30"></label>
+        <label class="check"><input name="refine" type="checkbox"> Find the exact limit (bisection)</label>
+        <div class="form-foot">
+          <span class="text" id="ltEstimate"></span>
+          <button type="submit" class="btn-rec">▶ Start load test</button>
+        </div>
+        <p class="hint">The load test sends real requests to AnythingLLM and LM Studio. Do not run it while students are using the system.</p>
+      </form>
+    </details>
+    <pre id="ltLog" hidden></pre>
+  </section>
+
+  <section class="card tool" style="margin-bottom:12px">
+    <h2>Sessions</h2>
+    <form id="rangeForm" class="form-grid" autocomplete="off">
+      <label class="wide">Report for a past time range – name<input name="label" value="Past session" required maxlength="120"></label>
+      <label>From<input name="start" type="datetime-local" required></label>
+      <label>To<input name="end" type="datetime-local" required></label>
+      <div class="form-foot"><span class="text">Requests come from the LM Studio log; per-minute and hardware values from the monitor's CSV files (when it was running).</span>
+        <button type="submit" class="btn-clear">Create report</button></div>
+    </form>
+    <div class="tablewrap" style="max-height:none"><table>
+      <thead><tr><th>Name</th><th>Period</th><th>Requests</th><th>Report</th></tr></thead>
+      <tbody id="sessionList"></tbody>
+    </table></div>
   </section>
 
   <div class="toast" id="toast" role="status"></div>
@@ -270,8 +351,9 @@ const fmt = (v, d = 0) => v == null || Number.isNaN(v) ? "–" : Number(v).toLoc
 const hhmmss = t => new Date(t * 1000).toLocaleTimeString("en-GB");
 const STATUS = { good: ["var(--good)", "✓", "ok"], warning: ["var(--warning)", "▲", "elevated"], critical: ["var(--critical)", "⚠", "critical"] };
 
+// rangeMin: 5, 15 or 30 minutes, or "max" (since the session started, otherwise all data kept).
 let rangeMin = 15, series = [], history = [], state = {}, config = {}, latPoints = new Map(), lastHistLen = -1, seenRecent = new Set();
-try { rangeMin = +localStorage.getItem("lmsRange") || 15; } catch (e) {}
+try { const r = localStorage.getItem("lmsRange"); rangeMin = r === "max" ? "max" : (+r || 15); } catch (e) {}
 
 // ---------- Chart engine (canvas, one y-axis per chart) ----------
 class Chart {
@@ -317,7 +399,9 @@ class Chart {
     }
     g.save(); g.beginPath(); g.rect(L, T - 2, pw, ph + 4); g.clip();
     for (const s of o.series) {
-      const col = css(s.color), pts = data.filter(d => d[s.key] != null && d.t >= x0 - 2);
+      let pts = data.filter(d => d[s.key] != null && d.t >= x0 - 2);
+      const col = css(s.color);
+      if (s.type !== "dots") pts = decimate(pts, s.key, pw, X);
       if (s.type === "dots") {
         for (const d of pts) { g.beginPath(); g.arc(X(d.t), Y(d[s.key]), 4, 0, 7); g.fillStyle = col; g.fill(); g.lineWidth = 2; g.strokeStyle = css("--surface"); g.stroke(); }
         continue;
@@ -362,12 +446,30 @@ class Chart {
 }
 // Macs share system memory with the GPU, so "VRAM" is labelled "GPU memory" there.
 function memLabel() { return state.unified_memory ? "GPU memory" : "VRAM"; }
+// Long ranges (e.g. "Max") have more points than pixels: keep the maximum per pixel column,
+// so peaks stay visible and drawing stays fast.
+function decimate(pts, key, pw, X) {
+  if (pts.length <= pw * 2) return pts;
+  const out = []; let col = null, best = null;
+  for (const p of pts) {
+    const c = Math.round(X(p.t));
+    if (c !== col) { if (best) out.push(best); col = c; best = p; }
+    else if (p[key] > best[key]) best = p;
+  }
+  if (best) out.push(best);
+  return out;
+}
 function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p; }
 function roundTop(g, x, y, w, h, r) { if (h <= 0) return; r = Math.min(r, h); g.beginPath(); g.moveTo(x, y + h); g.lineTo(x, y + r); g.quadraticCurveTo(x, y, x + r, y); g.lineTo(x + w - r, y); g.quadraticCurveTo(x + w, y, x + w, y + r); g.lineTo(x + w, y + h); g.closePath(); g.fill(); }
 
 // Time window: the selected range, but never earlier than the first data point (right after start-up)
 const liveRange = () => { const now = series.length ? series[series.length - 1].t : Date.now() / 1000;
-  const first = series.length ? series[0].t : now; return [Math.max(now - rangeMin * 60, Math.min(first, now - 60)), now]; };
+  const first = series.length ? series[0].t : now;
+  if (rangeMin === "max") {
+    const start = session && session.active ? session.started : first;
+    return [Math.min(Math.max(start, first), now - 60), now];
+  }
+  return [Math.max(now - rangeMin * 60, Math.min(first, now - 60)), now]; };
 // ---------- Statistics over the selected time range ----------
 function describe(values) {
   const v = values.filter(x => x != null && !Number.isNaN(x)).sort((a, b) => a - b);
@@ -391,7 +493,10 @@ function rangeStats() {
     rpm: done.length / minutes,
   };
 }
-const rangeLabel = st => `Ø ${st.minutes >= rangeMin - 0.5 ? rangeMin : Math.max(1, Math.round(st.minutes))} min`;
+const rangeLabel = st => {
+  if (rangeMin === "max") return `Ø since ${hhmm(liveRange()[0])}`;
+  return `Ø ${st.minutes >= rangeMin - 0.5 ? rangeMin : Math.max(1, Math.round(st.minutes))} min`;
+};
 
 const charts = [
   new Chart($("cActive"), { data: () => series, xRange: liveRange, minMax: 4, series: [
@@ -415,7 +520,21 @@ const histChart = new Chart($("cHist"), { data: () => history, xTicks: 6, minMax
 // ---------- Rendering ----------
 function setChip(id, cls, text, pulse) {
   const c = $(id); c.querySelector(".dot").className = "dot " + (cls || "") + (pulse ? " pulse" : ""); c.querySelector("span:last-child").textContent = text;
+  // The collapsed status menu mirrors every chip as a single LED (with the text as tooltip).
+  const led = document.querySelector(`.status-toggle [data-led="${id}"]`);
+  if (led) { led.className = "dot " + (cls || ""); led.title = text; }
 }
+$("statusToggle").addEventListener("click", e => {
+  e.stopPropagation();
+  const open = $("statusPanel").classList.toggle("show");
+  $("statusToggle").setAttribute("aria-expanded", open);
+});
+document.addEventListener("click", e => {
+  if (!e.target.closest(".status-menu")) { $("statusPanel").classList.remove("show"); $("statusToggle").setAttribute("aria-expanded", false); }
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { $("statusPanel").classList.remove("show"); $("statusToggle").setAttribute("aria-expanded", false); }
+});
 function statusOf(v, warn, crit) { return v == null ? null : v >= crit ? "critical" : v >= warn ? "warning" : "good"; }
 function statusHtml(st) { if (!st) return ""; const [c, ico, txt] = STATUS[st]; return `<span class="status" style="color:var(--text)"><span style="color:${c}">${ico}</span>${txt}</span>`; }
 
@@ -424,8 +543,9 @@ function renderHw() {
   const vramGb = s.vram_used_mb != null ? s.vram_used_mb / 1024 : null, vramTot = s.vram_total_mb != null ? s.vram_total_mb / 1024 : null;
   const items = [
     { label: "GPU utilisation", v: s.gpu_util, unit: "%", max: 100, st: null, sub: gpu ? "" : "no GPU metrics available" },
-    { label: memLabel(), v: vramGb, unit: vramTot ? `/ ${fmt(vramTot)} GB` : "GB", d: 1, max: vramTot || 96, mark: vramTot ? vramTot * config.alert_vram_pct / 100 : null,
-      st: statusOf(s.vram_pct, config.alert_vram_pct - 10, config.alert_vram_pct), sub: s.vram_pct != null ? `${fmt(s.vram_pct, 1)} % ${state.unified_memory ? "of GPU memory limit" : "used"}` : "" },
+    { label: memLabel(), v: s.vram_pct, unit: "%", max: 100, mark: config.alert_vram_pct,
+      st: statusOf(s.vram_pct, config.alert_vram_pct - 10, config.alert_vram_pct),
+      sub: vramGb != null ? `${fmt(vramGb, 1)} / ${fmt(vramTot, 0)} GB ${state.unified_memory ? "of GPU memory limit" : "used"}` : "" },
     { label: "GPU temperature", v: s.gpu_temp, unit: "°C", min: 25, max: 95, mark: config.alert_gpu_temp, st: statusOf(s.gpu_temp, config.alert_gpu_temp - 8, config.alert_gpu_temp) },
     { label: "GPU power", v: s.gpu_power_w, unit: "W", max: 600 },
     { label: "System memory", v: s.ram_pct, unit: "%", max: 100, st: statusOf(s.ram_pct, 85, 95), sub: s.ram_used_gb != null ? `${fmt(s.ram_used_gb, 1)} GB used` : "" },
@@ -537,6 +657,7 @@ $("sessionToggle").addEventListener("click", async () => {
       if (!confirm(`End the session “${session.label}” and create its report?`)) return;
       session = await sessionCall("api/session/end");
       toast("Session ended – report created");
+      loadSessions();
     } else {
       const label = prompt("Name of the live test (e.g. course and date):", "Live test");
       if (label === null) return;
@@ -597,6 +718,72 @@ $("stopAll").addEventListener("click", async () => {
   } catch (e) { toast("Could not reach the monitor"); }
 });
 
+// ---------- Custom load test ----------
+let ltDefaultsSet = false;
+function renderLoadTestTools() {
+  const d = control.defaults || {}, f = $("ltForm");
+  if (!ltDefaultsSet && control.defaults) {
+    f.host.value = d.host || "http://localhost:3001"; f.workspace.value = d.workspace || "";
+    $("ltKey").placeholder = d.api_key_set ? "from ANYTHING_API_KEY (set)" : "required: ANYTHING_API_KEY is not set";
+    $("ltKey").required = !d.api_key_set;
+    ltDefaultsSet = true;
+  }
+  $("ltReport").hidden = !control.latest_report;
+  if (control.latest_report) $("ltReport").href = `loadtest/${encodeURIComponent(control.latest_report)}/report.html`;
+  const l = control.launch, log = $("ltLog");
+  const failed = l && l.exit_code && l.log_tail && l.log_tail.length;
+  log.hidden = !failed;
+  if (failed) log.textContent = `The load test started at ${hhmm(l.started)} ended with exit code ${l.exit_code}:\n\n` + l.log_tail.join("\n");
+  const users = (f.users.value || "").split(",").map(Number).filter(n => n > 0);
+  const rate = +f.spawn_rate.value || 1, sec = users.reduce((a, u) => a + Math.ceil(u / rate) + (+f.stage_duration.value || 0) + (+f.cooldown.value || 0), 0);
+  $("ltEstimate").textContent = users.length ? `${users.length} stages, up to about ${duration(sec)}` + (f.refine.checked ? " plus bisection" : "") : "";
+}
+$("ltForm").addEventListener("input", renderLoadTestTools);
+$("ltForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target, body = Object.fromEntries(new FormData(f));
+  body.refine = f.refine.checked;
+  body.max_fail_rate = (+body.max_fail_pct || 0) / 100; delete body.max_fail_pct;
+  if (!confirm(`Start a load test with ${body.users} concurrent users against ${body.host}?\n\nIt sends real requests to AnythingLLM and LM Studio.`)) return;
+  try {
+    const res = await fetch("api/loadtest/start", { method: "POST", headers: { "X-Monitor-Action": "loadtest", "Content-Type": "application/json" },
+                                                     body: JSON.stringify(body) });
+    const r = await res.json();
+    toast(r.ok ? "Load test started" : `Not started: ${r.message}`);
+    if (r.ok) { $("ltKey").value = ""; $("ltDetails").open = false; }
+  } catch (err) { toast("Could not reach the monitor"); }
+});
+
+// ---------- Sessions: list and reports for a past time range ----------
+const localInput = t => { const d = new Date(t * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+(function initRangeForm() {
+  const now = Date.now() / 1000, f = $("rangeForm");
+  f.start.value = localInput(now - 3600); f.end.value = localInput(now);
+})();
+async function loadSessions() {
+  try {
+    const list = await (await fetch("api/sessions", { cache: "no-store" })).json();
+    $("sessionList").innerHTML = list.length ? list.map(x => `<tr><td>${escapeHtml(x.label || x.folder)}${x.retroactive ? '<span class="badge">from log</span>' : ""}</td>
+      <td>${new Date(x.started * 1000).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" })} – ${x.ended ? hhmm(x.ended) : "running"}</td>
+      <td>${fmt(x.completed)}</td>
+      <td>${x.report ? `<a href="sessions/${encodeURIComponent(x.folder)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td></tr>`).join("")
+      : `<tr><td colspan="4" class="empty">No sessions yet</td></tr>`;
+  } catch (e) {}
+}
+$("rangeForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target, btn = f.querySelector("button");
+  btn.disabled = true; btn.textContent = "Creating …";
+  try {
+    const r = await sessionCall("api/session/build", { label: f.label.value, start: f.start.value, end: f.end.value });
+    if (r.ok) { toast(`Report created: ${fmt(r.counts.completed)} requests`); window.open(`sessions/${encodeURIComponent(r.folder)}/report.html`, "_blank", "noopener"); }
+    else toast(`Not created: ${r.message}`);
+  } catch (err) { toast("Could not reach the monitor"); }
+  btn.disabled = false; btn.textContent = "Create report";
+  loadSessions();
+});
+loadSessions(); setInterval(loadSessions, 20000);
+
 function closeMenu() { menuFor = null; $("runMenu").classList.remove("show"); }
 $("running").addEventListener("click", e => {
   const btn = e.target.closest(".menu-btn");
@@ -638,7 +825,7 @@ function renderRecent() {
       <td>${fmt(r.prompt_tokens)}</td><td title="${r.tokens_estimated ? "estimated" : ""}">${r.tokens_estimated && r.completion_tokens != null ? "≈ " : ""}${fmt(r.completion_tokens)}</td><td>${fmt(r.tokens_per_s, 1)}</td><td class="model">${escapeHtml(r.model || "–")}</td><td>${r.source === "app" ? "LM Studio app" : "API"}</td></tr>`;
   }).join("") : `<tr><td colspan="8" class="empty">No completed requests since start</td></tr>`;
   for (const r of rows) if (r.duration_s != null) latPoints.set(r.end + "|" + r.duration_s, { t: r.end, duration: r.duration_s, ttft: r.ttft_s });
-  const cutoff = Date.now() / 1000 - 1800;
+  const cutoff = Date.now() / 1000 - (config.keep_s || 1800);
   for (const [k, p] of latPoints) if (p.t < cutoff) latPoints.delete(k);
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
@@ -683,7 +870,7 @@ function render() {
   const hl = history[history.length - 1];
   $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;
 
-  renderHw(); renderRunning(); renderRecent(); renderRangeStats(); renderControl(); renderSession();
+  renderHw(); renderRunning(); renderRecent(); renderRangeStats(); renderControl(); renderSession(); renderLoadTestTools();
   charts.forEach(c => c.draw()); histChart.draw();
 }
 
@@ -698,13 +885,21 @@ async function loadFull() {
   for (const p of d.latency_points || []) latPoints.set(p.t + "|" + p.duration, p);
 }
 let es, drawQueued = false;
-function queueRender() { if (!drawQueued) { drawQueued = true; requestAnimationFrame(() => { drawQueued = false; render(); }); } }
+// Rendering is synchronised with the display; the timer fallback keeps the view current where the
+// browser pauses animation frames (background tabs, embedded or minimised windows).
+function queueRender() {
+  if (drawQueued) return;
+  drawQueued = true;
+  const run = () => { if (!drawQueued) return; drawQueued = false; render(); };
+  requestAnimationFrame(run);
+  setTimeout(run, 1000);
+}
 function connect() {
   es = new EventSource("api/stream");
   es.onopen = () => setChip("chipConn", "good", "live", true);
   es.onmessage = async ev => {
     const m = JSON.parse(ev.data);
-    if (m.point && (!series.length || m.point.t > series[series.length - 1].t)) { series.push(m.point); if (series.length > 1800) series.shift(); }
+    if (m.point && (!series.length || m.point.t > series[series.length - 1].t)) { series.push(m.point); if (series.length > (config.keep_s || 1800)) series.shift(); }
     state = m.state || state;
     control = m.control || control;
     session = m.session || session;
@@ -714,8 +909,9 @@ function connect() {
   es.onerror = () => setChip("chipConn", "bad", "disconnected – retrying …");
 }
 document.querySelectorAll("#range button").forEach(b => {
-  b.classList.toggle("on", +b.dataset.min === rangeMin);
-  b.onclick = () => { rangeMin = +b.dataset.min; try { localStorage.setItem("lmsRange", rangeMin); } catch (e) {}
+  const value = b.dataset.min === "max" ? "max" : +b.dataset.min;
+  b.classList.toggle("on", value === rangeMin);
+  b.onclick = () => { rangeMin = value; try { localStorage.setItem("lmsRange", rangeMin); } catch (e) {}
     document.querySelectorAll("#range button").forEach(x => x.classList.toggle("on", x === b)); queueRender(); };
 });
 setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString("en-GB"); }, 1000);

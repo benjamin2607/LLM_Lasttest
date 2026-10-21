@@ -142,7 +142,7 @@ class LogParser:
         self.lines_seen = 0
         self.signals = Counter()          # Recognised entry types (for diagnostics; no content).
         self.token_events = deque(maxlen=200_000)  # (time, tokens) as tokens are generated.
-        self.recent = deque(maxlen=500)   # Completed requests (numeric fields only).
+        self.recent = deque(maxlen=5000)  # Completed requests (numeric fields only).
         self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "rejected": 0, "failed": 0,
                        "dismissed": 0,
                        "prompt_tokens": 0, "completion_tokens": 0}
@@ -666,6 +666,8 @@ class LogParser:
                     if t < since:
                         started = False
                         continue
+                    if t > until:
+                        break  # Entries after the window are not part of this replay.
                     started = True
                     advance(int(t))
                     self._replay_now = t
@@ -711,6 +713,35 @@ class LogParser:
     def active(self):
         with self.lock:
             return len(self.open)
+
+    def live_point(self, stream_window=10, tps_window=30, rate_window=60):
+        """
+        The request part of one live data point (active, waiting, tokens/s, requests/min).
+        Cheaper than :meth:`live` because it only looks at the most recent entries, which matters
+        when the replay after a restart rebuilds hours of per-second points.
+        """
+        now = self.clock()
+        with self.lock:
+            self._expire_stale(now)
+            active = len(self.open)
+            waiting = sum(1 for r in self.open if r["first"] is None or r["first"] > now)
+            chunks = 0
+            for t, n in reversed(self.token_events):
+                if now - t > stream_window:
+                    break
+                chunks += n
+            done_rate = done_tokens = 0
+            for r in reversed(self.recent):
+                age = now - r["end"]
+                if age > max(rate_window, tps_window):
+                    break
+                if age <= rate_window:
+                    done_rate += 1
+                if age <= tps_window and not r.get("live_tokens"):
+                    done_tokens += r.get("completion_tokens") or 0
+        return {"active": active, "waiting": waiting,
+                "tokens_per_s": rnd(chunks / stream_window + done_tokens / tps_window, 1),
+                "requests_per_min": round(done_rate * 60 / rate_window, 1)}
 
     def latency_points(self, window=1800):
         """Duration and time-to-first-token of completed requests within ``window`` seconds."""

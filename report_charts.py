@@ -66,6 +66,8 @@ def line_chart(title, labels, series, unit="", x_title="", y_max=None, limit=Non
     left, right, top, bottom = 52, 16, 44 if len(series) > 1 else 34, 44
     pw, ph = width - left - right, height - top - bottom
     values = [v for _, vals in series for v in vals if v is not None]
+    if limit and values and max(values) < limit[0] * 0.5:
+        limit = None  # Far below the limit: scale to the data instead of flattening it under the limit line.
     peak = max(values + ([limit[0] * 1.1] if limit else [])) if values else 1
     ymax = y_max or nice_max(peak)
     n = len(labels)
@@ -234,6 +236,42 @@ def histogram_chart(title, values, unit="", bins=12, width=640, height=280, stan
                    f'{fmt_num(lo + i * step)}{html.escape(unit) if i == 0 else ""}</text>')
     out.append("</svg>")
     return "\n".join(out)
+
+
+# --- Key figure tiles shared by the load test and live session reports ---
+TILE_CSS = """<style>
+.meta { color: var(--text-2); margin-top: -6px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 16px 0; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.tile .label { color: var(--text-2); font-size: 12px; } .tile .big { font-size: 24px; font-weight: 650; margin-top: 2px; }
+.tile .sub { color: var(--text-3); font-size: 12px; }
+.tile table.stats { width: 100%; margin-top: 6px; font-size: 14px; }
+.tile table.stats th, .tile table.stats td { border: 0; padding: 2px 0; }
+.tile table.stats th { text-align: left; color: var(--text-2); font-weight: 500; }
+.tile table.stats td { text-align: right; font-weight: 650; }
+.banner { border: 1px solid var(--critical); border-left: 4px solid var(--critical); background: var(--surface);
+  border-radius: 8px; padding: 10px 12px; margin: 12px 0; font-weight: 600; }
+</style>"""
+
+
+def count_tile(label, value, note=""):
+    """Tile with one large value and a note below."""
+    return (f"<div class='tile'><div class='label'>{html.escape(label)}</div><div class='big'>{html.escape(str(value))}</div>"
+            f"<div class='sub'>{html.escape(note)}</div></div>")
+
+
+def stat_tile(label, stats, unit="", note=None):
+    """Tile listing average, median, p95 and maximum below each other (missing values show as –)."""
+    rows = "".join(
+        f"<tr><th>{name}</th><td>{html.escape(fmt_num(stats.get(key)) + unit) if stats.get(key) is not None else '–'}</td></tr>"
+        for name, key in (("Ø", "mean"), ("Median", "median"), ("p95", "p95"), ("Max", "max")))
+    note = note if note is not None else (f"n = {stats['n']}" if stats.get("n") is not None else "")
+    return (f"<div class='tile'><div class='label'>{html.escape(label)}</div><table class='stats'>{rows}</table>"
+            f"<div class='sub'>{html.escape(note)}</div></div>")
+
+
+def tiles(items):
+    return "<div class='tiles'>" + "".join(items) + "</div>"
 
 
 # --- Minimal Markdown rendering for the reports this project generates ---

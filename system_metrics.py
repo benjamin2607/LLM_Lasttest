@@ -206,7 +206,18 @@ class SystemSampler(threading.Thread):
             v = vals(key)
             return round(max(v), 1) if v else None
 
-        return {
+        def median(key):
+            v = vals(key)
+            return round(statistics.median(v), 1) if v else None
+
+        def p95(key):
+            v = sorted(vals(key))
+            return round(v[max(0, min(len(v) - 1, round(0.95 * len(v)) - 1))], 1) if v else None
+
+        distribution = {f"{key}_{name}": fn(key) for key in ("gpu_util", "vram_pct", "ram_pct", "gpu_temp")
+                        for name, fn in (("median", median), ("p95", p95))}
+        distribution.update({"vram_pct_avg": avg("vram_pct"), "ram_pct_avg": avg("ram_pct"), "gpu_temp_avg": avg("gpu_temp")})
+        return {**distribution,
             "gpu_util_avg": avg("gpu_util"), "gpu_util_max": mx("gpu_util"),
             "vram_used_mb_max": mx("vram_used_mb"), "vram_pct_max": mx("vram_pct"),
             "gpu_temp_max": mx("gpu_temp"), "gpu_power_w_avg": avg("gpu_power_w"),
