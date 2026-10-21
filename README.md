@@ -1,12 +1,20 @@
-# Load Testing & Monitoring – AnythingLLM + LM Studio
+# LLM Load Test & Monitoring – AnythingLLM + LM Studio
 
 Tools to determine the capacity limits of a self-hosted AnythingLLM + LM Studio
-setup and to monitor its load in production. Everything runs locally; no data
-leaves the machine.
+setup and to monitor its load in production and in live tests with students.
+Everything runs locally; no data leaves the machine.
+
+**Quick start**
+
+1. `pip install locust` (in a virtual environment)
+2. `python lmstudio_monitor.py` – opens the live dashboard at `http://127.0.0.1:8765`
+3. Set `ANYTHING_API_KEY` and `WORKSPACE_SLUG`, then `python auto_loadtest.py --users 1,2,4,8,16` – or start a load test from the dashboard
+
+All options with descriptions and guideline values: **[PARAMETERS.md](PARAMETERS.md)**.
 
 | File | Purpose |
 |---|---|
-| `main.py` | Locust user behaviour against the AnythingLLM developer API (see `start_command.md`) |
+| `main.py` | Locust user behaviour against the AnythingLLM developer API (manual runs: `start_command.md`) |
 | `auto_loadtest.py` | Automated capacity test: increases concurrent users stage by stage until a limit is exceeded |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
 | `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
@@ -15,7 +23,8 @@ leaves the machine.
 | `live_session.py` | Recording sessions for live tests: per-request data, per-minute values, hardware and report |
 | `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
 | `prompts.json` | Questions sent by the simulated users |
-| `tests/` | Unit tests for the log parser |
+| `tests/` | Unit tests for the log parser and the live sessions |
+| `PARAMETERS.md` | Reference of all options and environment variables with guideline values |
 
 No additional packages are required beyond `locust` (which ships `psutil`) and
 the Python standard library.
@@ -68,15 +77,17 @@ the monitor needs `ANYTHING_API_KEY` (and `--anythingllm-url` if AnythingLLM is 
 `http://localhost:3001`) to delete the threads. Without a running load test, the button only
 deletes the load-test threads.
 
-Results are written to `loadtest_results/<timestamp>/`: `report.html` (in the same layout as
-the live session reports: key figure tiles, statistics tiles with average, median, p95 and
-maximum at the stage with the highest stable throughput, charts, refusals and the stage table), `report.md` (the same as Markdown,
-charts as SVG files in `charts/`), `results.csv`/`results.json`, and a Locust HTML report
-plus log per stage. The charts show, per number of concurrent users: response time (average,
-p95, limit), throughput, generated tokens per second, failure and refusal rate, GPU
-utilisation and memory, and system memory. The report also identifies throughput saturation and estimates how
-many *real* students the system can serve, using Little's law with
-`--student-think-time` (default: 90 s between two questions).
+Results are written to `loadtest_results/<timestamp>/`:
+
+| File | Content |
+|---|---|
+| `report.html` | The report, in the same layout as the live session reports. Sections: **Result** (stable limit, throughput, estimated number of students, models), **Requests** (answered, failed, refusals), **Response times**, **Tokens** and **Hardware** – each as tiles with average, median, p95 and maximum at the stage with the highest stable throughput – then the most frequent errors, **charts by load** (response time, throughput, tokens/s, failures and refusals, GPU and memory per number of users), **charts over time** (every request and the hardware over the whole run), refusals and the stage table |
+| `report.md` | The same as Markdown, charts as SVG files in `charts/` |
+| `results.csv` / `results.json` | All figures per stage |
+| `stage_XX_*` | Locust HTML report, CSV statistics and log per stage |
+
+The report also identifies throughput saturation and estimates how many *real* students the
+system can serve, using Little's law with `--student-think-time` (default: 90 s between two questions).
 
 Tip: run once with `--mode query` and once with `--mode chat`; for overnight runs, choose a generous `--users` list.
 

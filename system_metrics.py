@@ -188,6 +188,17 @@ class SystemSampler(threading.Thread):
     def stop(self):
         self._stop.set()
 
+    def samples_since(self, since, step=5):
+        """Samples taken since ``since``, thinned to one per ``step`` seconds (for timelines in reports)."""
+        with self.lock:
+            samples = [s for s in self.samples if s["ts"] >= since]
+        out, last = [], None
+        for sample in samples:
+            if last is None or sample["ts"] - last >= step:
+                out.append({k: sample.get(k) for k in ("ts", "gpu_util", "vram_pct", "ram_pct", "gpu_temp")})
+                last = sample["ts"]
+        return out
+
     def summary(self, reset=True):
         """Return averages and maxima of all samples since the last reset."""
         with self.lock:

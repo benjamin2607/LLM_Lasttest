@@ -462,11 +462,10 @@ class LoadTestControl:
         Delete a load test result folder from disk. Only plain folder names inside loadtest_results
         are accepted, and a running load test cannot be deleted. Returns (ok, message).
         """
-        results_dir = (self.project_dir / "loadtest_results").resolve()
-        if not re.fullmatch(r"[\w.-]+", run or ""):
+        folder = safe_child(self.project_dir / "loadtest_results", run)
+        if folder is None:
             return False, "invalid load test name"
-        folder = (results_dir / run).resolve()
-        if folder.parent != results_dir or not folder.is_dir():
+        if not folder.is_dir():
             return False, "load test not found"
         lt = self.loadtest()
         if lt.get("running") and lt.get("run") == run:
@@ -667,8 +666,30 @@ class LoadTestControl:
 DASHBOARD_FILE = Path(__file__).resolve().parent / "dashboard.html"
 
 
+def safe_child(root, name):
+    """Path of folder ``name`` directly inside ``root``, or None if the name could reach anywhere else."""
+    if not re.fullmatch(r"[\w][\w.-]*", name or ""):
+        return None
+    root = Path(root).resolve()
+    child = (root / name).resolve()
+    return child if child.parent == root else None
+
+
 def start_dashboard(port, recorder, control, sessions):
+    # The server only listens on 127.0.0.1. Checking Host and Origin as well defeats DNS rebinding:
+    # a web page whose domain is re-pointed to 127.0.0.1 must not be able to read data or trigger actions.
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed_origins = {f"http://{host}" for host in allowed_hosts}
+
     class Handler(BaseHTTPRequestHandler):
+        def _trusted(self):
+            host = (self.headers.get("Host") or "").lower()
+            origin = (self.headers.get("Origin") or "").lower()
+            if host not in allowed_hosts or (origin and origin not in allowed_origins):
+                self.send_error(403, "Requests are accepted from the local dashboard only")
+                return False
+            return True
+
         def _send(self, body, ctype):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -677,6 +698,8 @@ def start_dashboard(port, recorder, control, sessions):
             self.wfile.write(body)
 
         def do_GET(self):
+            if not self._trusted():
+                return
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 self._send(DASHBOARD_FILE.read_bytes(), "text/html; charset=utf-8")
@@ -689,18 +712,12 @@ def start_dashboard(port, recorder, control, sessions):
                 self._send(json.dumps(control.loadtest_details()).encode(), "application/json")
             elif path == "/api/sessions":
                 self._send(json.dumps(list_sessions(sessions.root)).encode(), "application/json")
-            elif path.startswith("/loadtest/") and path.endswith("/report.html"):
-                run = path.split("/")[2]
-                report = control.project_dir / "loadtest_results" / run / "report.html"
-                if re.fullmatch(r"[\w.-]+", run) and report.is_file():
-                    self._send(report.read_bytes(), "text/html; charset=utf-8")
-                else:
-                    self.send_error(404)
-            elif path.startswith("/sessions/") and path.endswith("/report.html"):
-                folder = path.split("/")[2]
-                report = sessions.root / folder / "report.html"
-                # Only plain folder names inside the sessions directory are served.
-                if re.fullmatch(r"[\w.-]+", folder) and report.is_file():
+            elif path.startswith(("/loadtest/", "/sessions/")) and path.endswith("/report.html") and path.count("/") == 3:
+                # Only report.html of a folder directly inside the results or sessions directory is served.
+                root = control.project_dir / "loadtest_results" if path.startswith("/loadtest/") else sessions.root
+                folder = safe_child(root, path.split("/")[2])
+                report = folder / "report.html" if folder else None
+                if report is not None and report.is_file():
                     self._send(report.read_bytes(), "text/html; charset=utf-8")
                 else:
                     self.send_error(404)
@@ -710,7 +727,10 @@ def start_dashboard(port, recorder, control, sessions):
                 self.send_error(404)
 
         def _json_body(self):
-            length = min(int(self.headers.get("Content-Length") or 0), 64 * 1024)
+            try:
+                length = max(0, min(int(self.headers.get("Content-Length") or 0), 64 * 1024))
+            except ValueError:
+                return {}
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
             except ValueError:
@@ -719,10 +739,12 @@ def start_dashboard(port, recorder, control, sessions):
 
         def do_POST(self):
             """
-            Remove hung requests from tracking. A custom header is required: browsers only send it
-            from the dashboard's own origin (other sites would need a CORS preflight, which this server
-            never grants), so third-party pages cannot trigger it.
+            Actions of the dashboard. Besides the Host/Origin check, a custom header is required: browsers
+            only send it from the dashboard's own origin (other sites would need a CORS preflight, which
+            this server never grants).
             """
+            if not self._trusted():
+                return
             if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest", "delete"):
                 self.send_error(403)
                 return

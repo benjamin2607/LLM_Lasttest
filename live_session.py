@@ -550,6 +550,17 @@ def write_report(folder):
                   gpu_tile, ("GPU memory", hwd["vram_pct"], " %"),
                   ("System memory", hwd["ram_pct"], " %"), ("GPU temperature", hwd["gpu_temp_c"], " °C")]
 
+    # Tiles grouped by topic, in the same categories as the load test report.
+    by_label = {t[0]: count_tile(*t) for t in count_tiles}
+    by_label.update({t[0]: stat_tile(*t) for t in stat_tiles if t[1]})
+    groups = [("Requests", ["Completed requests", "Not answered", "Busy time", "Peak concurrency", "Busiest minute"]),
+              ("Response times", ["Response time", "First token"]),
+              ("Tokens", ["Throughput while busy", "Generated tokens", "Tokens in per request", "Tokens out per request",
+                          "Tokens/s per request"]),
+              ("Hardware", [gpu_tile[0], "GPU memory", "System memory", "GPU temperature"])]
+    sections = [f"<h2>{title}</h2>" + tiles(by_label[name] for name in names if name in by_label)
+                for title, names in groups if any(name in by_label for name in names)]
+
     meta = json.loads((folder / "session.json").read_text(encoding="utf-8"))
     span = (meta["started"], meta.get("ended") or time.time())
     charts = []
@@ -591,8 +602,7 @@ def write_report(folder):
             f"<p class='meta'>{html.escape(s['started'].replace('T', ' '))} – "
             f"{html.escape((s['ended'] or 'running').replace('T', ' '))} · {fmt_num(s['duration_min'])} min"
             + (f" · {html.escape(host.get('gpu_name') or '')}" if host.get("gpu_name") else "") + "</p>",
-            tiles(count_tile(*t) for t in count_tiles),
-            tiles(stat_tile(*t) for t in stat_tiles if t[1]),
+            *sections,
             "<h2>Charts</h2><div class='charts'>" + "".join(f"<figure>{c}</figure>" for c in charts) + "</div>"
             if charts else "<p>No completed requests recorded yet.</p>",
             "<h2>Models</h2><div class='table'><table><thead><tr><th>Model</th><th>Requests</th><th>Median</th>"

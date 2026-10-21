@@ -817,8 +817,10 @@ class LogParser:
     def completed_since(self, since):
         """Numeric fields of the requests completed since ``since`` (epoch seconds)."""
         with self.lock:
-            return [{"start": r["start"], "end": r["end"], "duration": r["end"] - r["start"], "tokens_in": r.get("prompt_tokens"),
-                     "tokens_out": r.get("completion_tokens"), "tps": tokens_per_second(r)}
+            return [{"start": r["start"], "end": r["end"], "duration": r["end"] - r["start"],
+                     "ttft": max(0.0, r["first"] - r["start"]) if r["first"] is not None else None,
+                     "tokens_in": r.get("prompt_tokens"), "tokens_out": r.get("completion_tokens"),
+                     "tps": tokens_per_second(r), "model": r.get("model")}
                     for r in self.recent if r["end"] >= since]
 
     def latency_points(self, window=1800):

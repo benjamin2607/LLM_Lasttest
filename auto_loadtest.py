@@ -35,7 +35,7 @@ from pathlib import Path
 
 from live_session import busy_periods, busy_stats
 from lmstudio_monitor import LMStudioWatcher, find_log_target
-from report_charts import TILE_CSS, count_tile, html_page, line_chart, markdown_to_html, stat_tile, tiles
+from report_charts import TILE_CSS, count_tile, html_page, line_chart, markdown_to_html, stat_tile, tiles, time_chart
 from system_metrics import SystemSampler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -69,6 +69,34 @@ def read_locust_stats(path):
     refusals = {f"{r['Type']} {r['Name']}": int(num(r["Request Count"]) or 0)
                 for r in rows if r.get("Type") in REFUSAL_TYPES}
     return totals, chat, refusals
+
+
+PERCENTILE_COLUMNS = ("50%", "66%", "75%", "80%", "90%", "95%", "98%", "99%", "99.9%", "100%")
+
+
+def chat_percentiles(chat):
+    """Response time percentiles of the chat requests (seconds) from a Locust stats row."""
+    if not chat:
+        return None
+    values = {col: num(chat.get(col)) for col in PERCENTILE_COLUMNS}
+    return {col: round(v / 1000, 2) for col, v in values.items() if v is not None} or None
+
+
+def read_history(path):
+    """Per-second history of the chat requests from Locust (users, responses/s, median and p95 in seconds)."""
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("Name", "").startswith("/thread/chat")]
+    out = []
+    for r in rows:
+        t = num(r.get("Timestamp"))
+        if t is None:
+            continue
+        ms = lambda key: round(num(r.get(key)) / 1000, 2) if num(r.get(key)) is not None else None  # noqa: E731
+        out.append({"t": t, "users": num(r.get("User Count")), "rps": num(r.get("Requests/s")),
+                    "median": ms("50%"), "p95": ms("95%")})
+    return out
 
 
 def read_refusal_examples(path):
@@ -249,13 +277,13 @@ def token_stats(requests, span=None):
         out_tokens = sum(r.get("tokens_out") or 0 for r in requests)
         out.update({"busy_share": busy["busy_share"],
                     "tokens_per_s_busy": round(out_tokens / busy["busy_s"], 1) if busy["busy_s"] >= 1 else None})
-    for key in ("tokens_in", "tokens_out"):
+    for key in ("tokens_in", "tokens_out", "ttft", "tps"):
         values = sorted(r[key] for r in requests if r.get(key) is not None)
         if not values:
             continue
-        out.update({f"{key}_mean": round(sum(values) / len(values), 1), f"{key}_median": statistics.median(values),
-                    f"{key}_p95": values[max(0, min(len(values) - 1, round(0.95 * len(values)) - 1))],
-                    f"{key}_max": values[-1], f"{key}_n": len(values)})
+        out.update({f"{key}_mean": round(sum(values) / len(values), 2), f"{key}_median": round(statistics.median(values), 2),
+                    f"{key}_p95": round(values[max(0, min(len(values) - 1, round(0.95 * len(values)) - 1))], 2),
+                    f"{key}_max": round(values[-1], 2), f"{key}_n": len(values)})
     return out
 
 
@@ -267,7 +295,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
            "--host", args.host, "-u", str(users), "-r", str(args.spawn_rate),
            "-t", f"{ramp + args.stage_duration}s", "--reset-stats",
            "--stop-timeout", str(args.stop_timeout), "--only-summary",
-           "--csv", str(prefix), "--html", f"{prefix}.html",
+           "--csv", str(prefix), "--csv-full-history", "--html", f"{prefix}.html",
            "--refusal-log", f"{prefix}_refusals.jsonl",
            "--run-id", f"{out_dir.name}-s{idx:02d}",  # Thread names identify run and stage.
            *passthrough]
@@ -293,6 +321,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         except KeyboardInterrupt:
             stop_locust(proc)
             raise
+    hardware_timeline = sampler.samples_since(t0)
     sysm = sampler.summary(reset=True)
     lm = watcher.snapshot(reset=True) if watcher else {}
     tokens = token_stats(watcher.parser.completed_since(t0), (t0, time.time())) if watcher else {}
@@ -320,7 +349,11 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "lm_gen_tokens_per_s": lm.get("gen_tokens_per_s_total"),
         "lm_tokens_per_s_per_request": lm.get("tokens_per_s_per_request_avg"),
         "lm_ttft_p95_s": lm.get("ttft_p95_s"), "lm_max_active": lm.get("max_active"),
-        "lm_completion_tokens": lm.get("completion_tokens"),
+        "lm_completion_tokens": lm.get("completion_tokens"), "lm_prompt_tokens": lm.get("prompt_tokens"),
+        "models": lm.get("models_used") or None,
+        "chat_percentiles": chat_percentiles(chat),
+        "timeline": read_history(Path(f"{prefix}_stats_history.csv")),
+        "hardware_timeline": hardware_timeline,
         **tokens,
     }
 
@@ -372,9 +405,13 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
 def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop=False):
     """Write results.csv, results.json and the Markdown report."""
     if results:
-        fields = [k for k in results[0] if k not in ("top_errors", "error", "refusal_breakdown", "refusal_examples")]
+        # Union of all keys in stage order: later stages can have fields the first one lacks (e.g. token
+        # statistics when no request completed in stage 1). Nested data stays in results.json only.
+        nested = ("top_errors", "error", "refusal_breakdown", "refusal_examples", "chat_percentiles", "timeline",
+                  "hardware_timeline")
+        fields = list(dict.fromkeys(k for r in results for k in r if k not in nested))
         with open(out_dir / "results.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
             writer.writeheader()
             writer.writerows(results)
     (out_dir / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -520,7 +557,11 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
         limit_note = f"limit at {first_bad} users" if first_bad else "limit not reached – increase the users"
     else:
         limit_note = "a limit was exceeded at the first stage" if first_bad else "no stage passed"
-    count = [
+    not_answered = {"failed": fail_total, "rejected": sum(r["rejected"] for r in ordered),
+                    "no relevant documents": sum(r["refused_no_context"] for r in ordered)}
+
+    # --- Result: the capacity of the system ---
+    result_tiles = [
         count_tile("Highest passing stage", f"{last_ok} users" if last_ok is not None else "–", limit_note),
         count_tile("Throughput saturation", f"{knee} users" if knee else "not reached",
                    "more users only add waiting time" if knee else "throughput still grows with users"),
@@ -528,36 +569,71 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
                    f"{best['chat_rps']:.2f} responses/s at {best['users']} users" if best else ""),
         count_tile("Estimated students", f"≈ {best['chat_rps'] * (args.student_think_time + (best['chat_avg_s'] or 0)):.0f}"
                    if best else "–", f"Little's law, {args.student_think_time:g} s between questions"),
-        count_tile("Chat requests", f"{chat_total:,}", f"{fail_total / chat_total:.1%} failed" if chat_total else ""),
+    ]
+
+    at = f" at {ref['users']} users" if ref else ""
+
+    def pick(prefix_or_keys, n=None):
+        """Statistics of the reference stage: either a key prefix (prefix_mean, …) or explicit keys."""
+        keys = ({"mean": f"{prefix_or_keys}_mean", "median": f"{prefix_or_keys}_median", "p95": f"{prefix_or_keys}_p95",
+                 "max": f"{prefix_or_keys}_max"} if isinstance(prefix_or_keys, str) else prefix_or_keys)
+        stats = {k: ref.get(v) for k, v in keys.items()} if ref else {}
+        stats["n"] = n
+        return stats if any(stats.get(k) is not None for k in ("mean", "median", "p95", "max")) else None
+
+    def stat(label, stats, unit):
+        return stat_tile(label + at, stats, unit, note=None if stats.get("n") is not None else "") if stats else ""
+
+    # --- Requests ---
+    request_tiles = [
+        count_tile("Chat requests", f"{chat_total:,}", f"over {len(ordered)} stages"),
+        count_tile("Not answered", f"{sum(not_answered.values()):,}",
+                   ", ".join(f"{n} {k}" for k, n in not_answered.items() if n) or "none"),
         count_tile("Refusals", f"{refused / chat_total:.1%}" if chat_total else "–",
                    f"{refused} of {chat_total} (rejected or no relevant documents)" if chat_total else ""),
     ]
-    if ref and ref.get("tokens_per_s_busy") is not None:
-        count.append(count_tile("Throughput while busy", f"{ref['tokens_per_s_busy']:g} tokens/s",
-                                f"at {ref['users']} users · overall {ref.get('lm_gen_tokens_per_s') or '–'} tokens/s"))
-        count.append(count_tile("Busy time", f"{ref['busy_share'] * 100:.0f} %",
-                                f"share of the stage with a request in flight, at {ref['users']} users"))
-    elif ref and ref.get("lm_gen_tokens_per_s") is not None:
-        count.append(count_tile("Generated tokens/s", f"{ref['lm_gen_tokens_per_s']:g}", f"at {ref['users']} users"))
+    if ref and ref.get("lm_max_active") is not None:
+        request_tiles.append(count_tile("Peak concurrency in LM Studio", f"{ref['lm_max_active']:g}",
+                                        f"parallel requests{at}"))
+    if ref and ref.get("busy_share") is not None:
+        request_tiles.append(count_tile("Busy time", f"{ref['busy_share'] * 100:.0f} %",
+                                        f"share of the stage with a request in flight{at}"))
+    if ref and ref.get("models"):
+        names = [m.rsplit(":", 1)[0] for m in ref["models"].split(";")]
+        request_tiles.append(count_tile("Models", str(len(names)), ", ".join(names) + at))
 
-    stat = []
-    if ref:
-        at = f" at {ref['users']} users"
-        pick = lambda mean, median, p95, mx, n=None: {"mean": ref.get(mean), "median": ref.get(median),  # noqa: E731
-                                                      "p95": ref.get(p95), "max": ref.get(mx), "n": n}
-        for label, stats, unit in (
-                ("Response time" + at, pick("chat_avg_s", "chat_median_s", "chat_p95_s", "chat_max_s",
-                                            ref["chat_requests"]), " s"),
-                ("Tokens in per request" + at, pick("tokens_in_mean", "tokens_in_median", "tokens_in_p95", "tokens_in_max",
-                                                    ref.get("tokens_in_n")), ""),
-                ("Tokens out per request" + at, pick("tokens_out_mean", "tokens_out_median", "tokens_out_p95",
-                                                     "tokens_out_max", ref.get("tokens_out_n")), ""),
-                ("GPU utilisation" + at, pick("gpu_util_avg", "gpu_util_median", "gpu_util_p95", "gpu_util_max"), " %"),
-                ("GPU memory" + at, pick("vram_pct_avg", "vram_pct_median", "vram_pct_p95", "vram_pct_max"), " %"),
-                ("System memory" + at, pick("ram_pct_avg", "ram_pct_median", "ram_pct_p95", "ram_pct_max"), " %"),
-                ("GPU temperature" + at, pick("gpu_temp_avg", "gpu_temp_median", "gpu_temp_p95", "gpu_temp_max"), " °C")):
-            if any(stats[k] is not None for k in ("mean", "median", "p95", "max")):
-                stat.append(stat_tile(label, stats, unit, note=None if stats["n"] is not None else ""))
+    # --- Response times ---
+    response_tiles = [
+        stat("Response time", pick({"mean": "chat_avg_s", "median": "chat_median_s", "p95": "chat_p95_s",
+                                    "max": "chat_max_s"}, ref["chat_requests"] if ref else None), " s"),
+        stat("First token (LM Studio)", pick("ttft", ref.get("ttft_n") if ref else None), " s"),
+    ]
+
+    # --- Tokens ---
+    token_tiles = []
+    if ref and ref.get("tokens_per_s_busy") is not None:
+        token_tiles.append(count_tile("Throughput while busy", f"{ref['tokens_per_s_busy']:g} tokens/s",
+                                      f"overall {ref.get('lm_gen_tokens_per_s') or '–'} tokens/s{at}"))
+    elif ref and ref.get("lm_gen_tokens_per_s") is not None:
+        token_tiles.append(count_tile("Generated tokens/s", f"{ref['lm_gen_tokens_per_s']:g}", at.strip()))
+    if any(r.get("lm_completion_tokens") for r in ordered):
+        token_tiles.append(count_tile("Generated tokens", f"{sum(r.get('lm_completion_tokens') or 0 for r in ordered):,}",
+                                      f"{sum(r.get('lm_prompt_tokens') or 0 for r in ordered):,} prompt tokens, all stages"))
+    token_tiles += [stat("Tokens in per request", pick("tokens_in", ref.get("tokens_in_n") if ref else None), ""),
+                    stat("Tokens out per request", pick("tokens_out", ref.get("tokens_out_n") if ref else None), ""),
+                    stat("Tokens/s per request", pick("tps", ref.get("tps_n") if ref else None), "")]
+
+    # --- Hardware ---
+    hardware_tiles = [
+        stat("GPU utilisation", pick({"mean": "gpu_util_avg", "median": "gpu_util_median", "p95": "gpu_util_p95",
+                                      "max": "gpu_util_max"}), " %"),
+        stat("GPU memory", pick({"mean": "vram_pct_avg", "median": "vram_pct_median", "p95": "vram_pct_p95",
+                                 "max": "vram_pct_max"}), " %"),
+        stat("System memory", pick({"mean": "ram_pct_avg", "median": "ram_pct_median", "p95": "ram_pct_p95",
+                                    "max": "ram_pct_max"}), " %"),
+        stat("GPU temperature", pick({"mean": "gpu_temp_avg", "median": "gpu_temp_median", "p95": "gpu_temp_p95",
+                                      "max": "gpu_temp_max"}), " °C"),
+    ]
 
     banners = []
     if stopped:
@@ -581,19 +657,69 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
     body += [f"<div class='banner'>{html.escape(b)}</div>" for b in banners]
     if failed:
         body.append(f"<pre>{html.escape(failed['error'])}</pre>")
-    body += [tiles(count), tiles(stat) if stat else ""]
+
+    def section(title, items, note=None):
+        items = [i for i in items if i]
+        if items:
+            body.append(f"<h2>{html.escape(title)}</h2>" + (f"<p class='meta'>{html.escape(note)}</p>" if note else "")
+                        + tiles(items))
+
+    reference_note = (f"Statistics refer to the stage with the highest stable throughput ({ref['users']} users)."
+                      if ref and ref is best else
+                      f"Statistics refer to stage {ref['stage']} ({ref['users']} users)." if ref else None)
+    section("Result", result_tiles)
+    section("Requests", request_tiles)
+    section("Response times", response_tiles, reference_note)
+    section("Tokens", token_tiles, "Token figures come from the LM Studio log." if token_tiles else None)
+    section("Hardware", hardware_tiles)
     if errors:
         body.append(f"<h2>Most frequent errors at {errors['users']} users</h2><ul>"
                     + "".join(f"<li>{n}× <code>{html.escape(e)}</code></li>" for e, n in errors["top_errors"]) + "</ul>")
         if looks_like_setup_problem(errors):
             body.append(f"<blockquote>{html.escape(SETUP_HINT)}</blockquote>")
     if charts:
-        body.append("<h2>Charts</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for *_, svg in charts)
+        body.append("<h2>Charts by load</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for *_, svg in charts)
+                    + "</div>")
+    over_time = time_charts(ordered, ref)
+    if over_time:
+        body.append("<h2>Charts over time</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for svg in over_time)
                     + "</div>")
     # Detailed sections from the Markdown report (refusals, stage table, notes); the result summary is in the tiles.
     rest = next((i for i, line in enumerate(lines) if line.startswith("## ") and not line.startswith("## Result")), len(lines))
     body.append(markdown_to_html("\n".join(lines[rest:])))
     return html_page(f"Load test {out_dir.name}", TILE_CSS + "\n".join(body))
+
+
+def time_charts(ordered, ref):
+    """Charts over the whole run: users and responses/s, response times, hardware; percentiles of the reference stage."""
+    # Stages in run order; a gap point between stages keeps the pause from being drawn as a line.
+    runs = sorted(ordered, key=lambda r: r["stage"])
+    timeline, hardware = [], []
+    for r in runs:
+        if timeline and r.get("timeline"):
+            timeline.append({"t": timeline[-1]["t"] + 1, "users": None, "rps": None, "median": None, "p95": None})
+        timeline += r.get("timeline") or []
+        if hardware and r.get("hardware_timeline"):
+            hardware.append({"ts": hardware[-1]["ts"] + 1})
+        hardware += r.get("hardware_timeline") or []
+    charts = []
+    if timeline:
+        t = [p["t"] for p in timeline]
+        charts.append(time_chart("Simulated users over time", t, [("users", [p["users"] for p in timeline])]))
+        charts.append(time_chart("Chat responses per second over time", t, [("responses/s", [p["rps"] for p in timeline])],
+                                 unit="/s"))
+        charts.append(time_chart("Chat response time over time", t, [("median", [p["median"] for p in timeline]),
+                                                                     ("p95", [p["p95"] for p in timeline])], unit=" s"))
+    if hardware and any(p.get("gpu_util") is not None for p in hardware):
+        charts.append(time_chart("GPU utilisation and memory over time", [p["ts"] for p in hardware],
+                                 [("GPU utilisation", [p.get("gpu_util") for p in hardware]),
+                                  ("GPU memory", [p.get("vram_pct") for p in hardware])], unit=" %", y_max=100))
+    if ref and ref.get("chat_percentiles"):
+        pct = ref["chat_percentiles"]
+        charts.append(line_chart(f"Response time percentiles at {ref['users']} users", list(pct.keys()),
+                                 [("response time", list(pct.values()))], unit=" s", x_title="share of requests faster than",
+                                 standalone=False))
+    return charts
 
 
 def build_charts(ordered, args):
