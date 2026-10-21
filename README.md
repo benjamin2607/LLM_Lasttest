@@ -14,7 +14,7 @@ All options with descriptions and guideline values: **[PARAMETERS.md](PARAMETERS
 
 | File | Purpose |
 |---|---|
-| `main.py` | Locust user behaviour against the AnythingLLM developer API (manual runs: `start_command.md`) |
+| `main.py` | Locust user behaviour against the AnythingLLM developer API (options for manual Locust runs: `PARAMETERS.md`) |
 | `auto_loadtest.py` | Automated capacity test: increases concurrent users stage by stage until a limit is exceeded |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
 | `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
