@@ -28,7 +28,7 @@ import re
 import statistics
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from datetime import datetime
 from pathlib import Path
 
@@ -50,6 +50,10 @@ FIRST_TOKEN_RE = re.compile(r"First token generated", re.I)
 STREAM_DONE_RE = re.compile(r"Finished streaming response", re.I)
 PREDICTION_RE = re.compile(r"Generated prediction", re.I)
 PACKET_RE = re.compile(r"Generated packet", re.I)
+# Non-streaming responses: one entry per generated token. Only the count is read; the text after it is ignored.
+ACCUMULATED_RE = re.compile(r"\] Accumulated \d+ tokens in (?:response|reasoning content)")
+ACCUMULATED_RECENT_S = 60   # While such entries appear, non-streaming tokens are counted live from them.
+IDLE_CLOSE_S = 2.0          # A multi-line entry counts as complete after this long without a new line.
 # Only these fields are read from JSON bodies; all other content is ignored.
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]{1,200})"')
 PROMPT_TOK_RE = re.compile(r'"prompt_tokens"\s*:\s*(\d+)')
@@ -94,6 +98,26 @@ def rnd(value, digits=2):
     return round(value, digits) if value is not None else None
 
 
+MIN_GENERATION_S = 0.5  # Shorter generation times give no meaningful tokens/s (log entries arrive in bursts).
+BACKLOG_S = 1.5         # Entries read this much later than their timestamp get their log time.
+
+
+def tokens_per_second(req):
+    """
+    Generation speed of one request: the engine's or LM Studio's own figure if available, otherwise
+    completion tokens over the time from the first token (or the start) to the end. Returns None
+    when that time is too short to be meaningful.
+    """
+    if req.get("tps"):
+        return req["tps"]
+    out_tok, start, first, end = req.get("completion_tokens"), req.get("start"), req.get("first"), req.get("end")
+    if not out_tok or start is None or end is None:
+        return None
+    begin = first if first is not None and start <= first <= end else start
+    span = end - begin
+    return out_tok / span if span >= MIN_GENERATION_S else None
+
+
 def model_tag(line):
     """Return the model name from an INFO entry tagged with a model, or None."""
     m = MODEL_TAG_RE.match(line)
@@ -129,6 +153,9 @@ class LogParser:
         self.open = []                    # In-flight requests, oldest first.
         self.api_pending = deque()        # API requests awaiting their API-level completion entry.
         self.by_cid = {}                  # Streamed requests keyed by completion ID.
+        self.done_cids = OrderedDict()    # Recently finished streams: late chunks (e.g. usage) belong to them.
+        self._entry_now = None            # Time assigned to the current log entry (continuation lines inherit it).
+        self._last_accumulated = None     # Time of the last per-token entry of a non-streaming response.
         self.by_task = {}                 # Engine tasks keyed by (engine id, task id).
         self.engines = []                 # Known engine processes: {"id", "base", "model", "file"}.
         self.pending_stream_done = 0      # Streams finished by their final chunk, awaiting "Finished streaming".
@@ -163,7 +190,17 @@ class LogParser:
 
     def _now(self, ts_match):
         if not self.use_log_time:
-            return self.clock()
+            # Live: the time a line is read, unless it is read clearly later than it was written (LM Studio
+            # writes in bursts under load, or the monitor catches up): then the entry's own timestamp counts.
+            wall = self.clock()
+            if ts_match is None:
+                return self._entry_now if self._entry_now is not None else wall
+            try:
+                logged = datetime.strptime(ts_match.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                logged = wall
+            self._entry_now = logged + 0.5 if wall - logged > BACKLOG_S else wall
+            return self._entry_now
         if ts_match:
             try:
                 self.last_ts = datetime.strptime(ts_match.group(1).replace("T", " "),
@@ -246,6 +283,10 @@ class LogParser:
         if STREAMING_RE.search(line):
             if self.last_running is not None:
                 self.last_running["stream_flag"] = True
+            return
+        if ACCUMULATED_RE.search(line):
+            self.token_events.append((now, 1))
+            self._last_accumulated = now
             return
         if PACKET_RE.search(line):
             self.signals["api_packet"] += 1
@@ -402,6 +443,11 @@ class LogParser:
         if m and "req" not in pkt:
             cid, now = m.group(1), pkt["now"]
             req = self.by_cid.get(cid)
+            if req is None and cid in self.done_cids:
+                # A chunk after the final one (e.g. the usage block of stream_options.include_usage):
+                # it belongs to the finished request and must not start a new one.
+                pkt["req"] = self.done_cids[cid]
+                return
             if req is None:
                 # First chunk of a new stream: bind to the oldest open streaming API request without an ID.
                 unbound = [r for r in self.open if r["api"] and not r.get("cid") and r.get("stream_flag") is not False]
@@ -431,8 +477,12 @@ class LogParser:
                 req["model"] = m.group(1)
         for regex, key in ((PROMPT_TOK_RE, "prompt_tokens"), (COMPL_TOK_RE, "completion_tokens")):
             m = regex.search(line)
-            if m:  # Optional usage block in the final chunk (stream_options.include_usage).
-                req[key] = int(m.group(1))
+            if m:  # Optional usage block (stream_options.include_usage), possibly after the request was booked.
+                value = int(m.group(1))
+                if req.get("booked"):
+                    self._inc(key, value - (req.get(key) or 0))  # Replace the chunk-count estimate.
+                    req["tokens_estimated"] = False
+                req[key] = value
                 req["usage_seen"] = True
         m = FINISH_REASON_RE.search(line)
         if m and not req.get("api_done"):
@@ -521,8 +571,13 @@ class LogParser:
             n, tg = int(ng.group(1)), float(ng.group(2))
             if req["first"] is None:
                 req["first"] = now
-            if not req.get("streamed") and n > req["ngen"]:
-                self.token_events.append((now, n - req["ngen"]))
+            delta = n - req["ngen"]
+            # Never count more than the reported speed allows in the elapsed engine time (guards against
+            # mismatched or restarted counters, which would show as huge spikes).
+            plausible = max(tg, req.get("tg") or 0, 1.0) * max(uptime - req["ngen_et"], 1.0) * 1.5 + 32
+            counted_elsewhere = req.get("streamed") or (req["api"] and self._accumulated_recent(now))
+            if not counted_elsewhere and 0 < delta <= plausible:
+                self.token_events.append((now, delta))
                 req["live_tokens"] = True
             req.update(ngen=n, ngen_et=uptime, tg=tg)
             return
@@ -577,10 +632,15 @@ class LogParser:
         self.by_task[b["task"]] = b
 
     # ------------------------------------------------------------- completion
+    def _accumulated_recent(self, now):
+        return self._last_accumulated is not None and now - self._last_accumulated <= ACCUMULATED_RECENT_S
+
     def _finish(self, req, now):
         """Mark ``req`` as finished and record latency metrics."""
         if req in self.open:
             self.open.remove(req)
+        if req["api"] and not req.get("streamed") and self._accumulated_recent(now):
+            req["live_tokens"] = True  # Its tokens were already counted from the per-token entries.
         req["end"] = now
         self._inc("completed")
         self.recent.append(req)
@@ -598,6 +658,9 @@ class LogParser:
             return  # Engine still running.
         if req.get("cid"):
             self.by_cid.pop(req["cid"], None)
+            self.done_cids[req["cid"]] = req
+            while len(self.done_cids) > 2000:
+                self.done_cids.popitem(last=False)
         req["booked"] = True
         if not req.get("usage_seen"):
             if "engine_completion_tokens" in req:
@@ -613,6 +676,11 @@ class LogParser:
         if req.get("model"):
             self.w["models"][req["model"]] = self.w["models"].get(req["model"], 0) + 1
         self._notify(req, "completed")
+
+    def _close_idle_ctx(self, now):
+        """Book a multi-line entry (e.g. the usage block of the last response) when no further line follows."""
+        if self.ctx is not None and self.last_line_wall is not None and now - self.last_line_wall > IDLE_CLOSE_S:
+            self._close_ctx()
 
     def _expire_stale(self, now):
         def never_started(r):
@@ -722,6 +790,7 @@ class LogParser:
         """
         now = self.clock()
         with self.lock:
+            self._close_idle_ctx(now)
             self._expire_stale(now)
             active = len(self.open)
             waiting = sum(1 for r in self.open if r["first"] is None or r["first"] > now)
@@ -755,6 +824,7 @@ class LogParser:
         """Real-time snapshot for the dashboard, using sliding windows on wall-clock time."""
         now = self.clock()
         with self.lock:
+            self._close_idle_ctx(now)
             self._expire_stale(now)
             running = [{"id": r["seq"], "age": round(now - r["start"], 1),
                         "generating": r["first"] is not None and r["first"] <= now,
@@ -785,7 +855,7 @@ class LogParser:
                     "ttft_s": rnd(max(0.0, r["first"] - r["start"])) if r["first"] is not None else None,
                     "prompt_tokens": r.get("prompt_tokens"), "completion_tokens": out_tok,
                     "tokens_estimated": bool(r.get("tokens_estimated")),
-                    "tokens_per_s": rnd(r.get("tps") or (out_tok / dur if out_tok and dur else None), 1),
+                    "tokens_per_s": rnd(tokens_per_second(r), 1),
                     "model": r.get("model"), "source": "app" if not r["api"] else "api"}
 
         # Tokens are counted as they are generated where possible; otherwise once the request completes.
@@ -806,6 +876,8 @@ class LogParser:
         """Aggregate the current window into a flat dict (one CSV row) and optionally start a new window."""
         with self.lock:
             now = self.last_ts if self.use_log_time else self.clock()
+            if not self.use_log_time:
+                self._close_idle_ctx(now)
             self._expire_stale(now)
             w, duration = self.w, max(now - self.w_start, 1e-6)
             lat, ttft = w["latencies"], w["ttfts"]

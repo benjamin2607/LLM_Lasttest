@@ -28,6 +28,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from lmstudio_log_parser import tokens_per_second
 from report_charts import TILE_CSS, count_tile, fmt_num, histogram_chart, html_page, stat_tile, tiles, time_chart
 
 REQUEST_FIELDS = ["start", "end", "status", "duration_s", "ttft_s", "prompt_tokens", "completion_tokens",
@@ -120,7 +121,7 @@ class LiveSession:
             return  # Written before the monitor restarted.
         duration = end - start if start else None
         out_tok = req.get("completion_tokens")
-        tps = req.get("tps") or (out_tok / duration if out_tok and duration else None)
+        tps = tokens_per_second({**req, "end": end})
         self.requests.append({
             "start": iso(start), "end": iso(end), "status": status,
             "duration_s": round(duration, 2) if duration is not None and status == "completed" else "",
@@ -235,7 +236,7 @@ def build_from_log(root, label, start, end, log_files, metrics_dir, host=None, h
     5-second points where available (``hardware_points``: list of dicts with ``t``), otherwise the
     per-interval values. Only data that the log or the monitor recorded can be included.
     """
-    from lmstudio_log_parser import LogParser  # Imported here: only needed for this function.
+    from lmstudio_log_parser import LogParser
 
     root = Path(root)
     base = f"{datetime.fromtimestamp(start):%Y-%m-%d_%H%M%S}_{slug(label)}_from-log"

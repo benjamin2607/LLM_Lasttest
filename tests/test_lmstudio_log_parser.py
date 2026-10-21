@@ -339,11 +339,67 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(parser.active(), 1)
         clock.advance(2)
         h = Harness()
+        stamp = self.at(clock.t)[:21]  # Live lines carry the current time.
         for line in [*h.packet("chatcmpl-r"), *h.packet("chatcmpl-r", final=True), h.stream_done()]:
-            parser.feed(line)
+            parser.feed(line.replace("[2026-10-21 15:03:37]", stamp))
         row = parser.live()["recent"][0]
         self.assertAlmostEqual(row["duration_s"], 32.0, places=1)
         self.assertEqual(parser.active(), 0)
+
+
+class TokenAccountingTests(unittest.TestCase):
+    def test_usage_chunk_after_the_final_chunk_updates_tokens_without_a_new_request(self):
+        h = Harness()
+        h.feed(*h.received(), h.running(), h.streaming(), dt=0.5)
+        for _ in range(4):
+            h.feed(*h.packet("chatcmpl-u"), dt=0.2)
+        h.feed(*h.packet("chatcmpl-u", final=True))
+        usage = [f"{ts('INFO', MODEL)} Generated packet: {{", '  "id": "chatcmpl-u",', '  "choices": [],',
+                 '  "usage": {"prompt_tokens": 12, "completion_tokens": 7}', "}"]
+        h.feed(*usage, h.stream_done(), h.running())  # The next entry closes the usage chunk.
+        self.assertEqual(h.parser.totals["started"], 2)  # The usage chunk did not start a request.
+        self.assertEqual(h.parser.totals["completed"], 1)
+        self.assertEqual(h.parser.totals["completion_tokens"], 7)
+        self.assertFalse(completed(h.parser)[0]["tokens_estimated"])
+
+    def test_no_tokens_per_second_for_too_short_generation_times(self):
+        h = Harness()
+        h.feed(h.running(), dt=0.05)  # Start and end read in the same burst.
+        h.feed(*h.prediction(prompt_tokens=10, completion_tokens=300), h.running())
+        self.assertIsNone(completed(h.parser)[0]["tokens_per_s"])
+
+    def test_entries_read_late_get_their_log_time(self):
+        clock = Clock(datetime(2026, 10, 21, 15, 4, 0).timestamp())
+        parser = LogParser(clock=clock)
+        # Both entries are read at 15:04:00 although they were written at 15:03:37 and 15:03:45.
+        parser.feed(f"[2026-10-21 15:03:37][INFO][{MODEL}] Running chat completion on conversation with 1 messages.")
+        for line in Harness.prediction(10, 80):
+            parser.feed(line.replace("15:03:37", "15:03:45"))
+        parser.feed(f"[2026-10-21 15:04:00][INFO][{MODEL}] Running chat completion on conversation with 1 messages.")
+        self.assertAlmostEqual(completed(parser)[0]["duration_s"], 8.0, places=1)
+
+    def test_non_streaming_tokens_are_counted_live_and_not_twice(self):
+        h = Harness()
+        h.feed(h.running(), dt=0.1)
+        for i in range(1, 51):  # 50 tokens over 5 s, one entry per token.
+            h.feed(f"{ts('INFO', MODEL)} Accumulated {i} tokens in response {SECRET}", dt=0.1)
+        self.assertEqual(h.parser.live()["tokens_per_s"], 5.0)  # 50 tokens in the 10 s window.
+        h.feed(*h.prediction(prompt_tokens=10, completion_tokens=50), h.running())
+        self.assertEqual(h.parser.live()["tokens_per_s"], 5.0)  # Completion does not add them again.
+        self.assertEqual(h.parser.totals["completion_tokens"], 50)
+
+    def test_last_entry_is_booked_without_a_following_line(self):
+        h = Harness()
+        h.feed(h.running(), dt=2.0)
+        h.feed(*h.prediction(prompt_tokens=10, completion_tokens=40), dt=3.0)  # Nothing follows.
+        self.assertEqual(h.parser.live()["totals"]["completion_tokens"], 40)
+
+    def test_implausible_engine_counter_jump_is_ignored(self):
+        h = Harness()
+        h.feed(h.engine("launch_slot_", 4, "processing task, is_child = 0"), dt=3.0)
+        h.feed(h.engine("print_timing", 4, "n_gen =    100, tg =  33.00 t/s, tg_3s =  33.00 t/s"), dt=3.0)
+        h.feed(h.engine("print_timing", 4, "n_gen =  90000, tg =  33.00 t/s, tg_3s =  33.00 t/s"))
+        self.assertLess(h.parser.live()["tokens_per_s"], 50)
 
 
 class PrivacyTests(unittest.TestCase):
