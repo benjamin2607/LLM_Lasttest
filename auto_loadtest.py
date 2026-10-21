@@ -53,6 +53,46 @@ def read_locust_stats(path):
     return agg, chat
 
 
+SETUP_HINT = ("Nearly all requests failed at the lowest load. This usually indicates a configuration problem, "
+              "not a capacity limit: check the LLM provider in AnythingLLM. When AnythingLLM runs in Docker, "
+              "LM Studio must be configured as http://host.docker.internal:1234/v1 and "
+              "'Serve on Local Network' must be enabled in LM Studio.")
+
+
+def looks_like_setup_problem(result):
+    chat_total = result["chat_requests"]
+    return result["stage"] == 1 and chat_total > 0 and result["chat_failures"] / chat_total >= 0.9
+
+
+def check_locust():
+    """Exit with a clear message if Locust cannot be run by this Python interpreter."""
+    try:
+        out = subprocess.run([sys.executable, "-m", "locust", "--version"], capture_output=True, text=True, timeout=120)
+        ok = out.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        ok = False
+    if not ok:
+        sys.exit(f"ERROR: Locust cannot be run with this Python interpreter ({sys.executable}).\n"
+                 f"Install it for this interpreter with: \"{sys.executable}\" -m pip install locust")
+
+
+def read_failures(path, limit=5):
+    """Return the most frequent (error, occurrences) pairs from a Locust *_failures.csv file."""
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    rows.sort(key=lambda r: -int(num(r.get("Occurrences")) or 0))
+    return [(r.get("Error", "")[:300], int(num(r.get("Occurrences")) or 0)) for r in rows[:limit]]
+
+
+def log_tail(path, lines=25):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    except OSError:
+        return []
+
+
 def preflight(host):
     """Verify that AnythingLLM is reachable and the API key is valid before starting."""
     key, ws = os.environ.get("ANYTHING_API_KEY"), os.environ.get("WORKSPACE_SLUG")
@@ -114,6 +154,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "locust_exit": proc.returncode, "requests": requests, "failures": failures,
         "fail_rate": round(failures / requests, 4) if requests else None,
         "chat_requests": int(num(chat["Request Count"]) or 0) if chat else 0,
+        "chat_failures": int(num(chat["Failure Count"]) or 0) if chat else 0,
         "chat_rps": round(num(chat["Requests/s"]) or 0, 4) if chat else 0,
         "chat_median_s": seconds("Median Response Time"), "chat_avg_s": seconds("Average Response Time"),
         "chat_p95_s": seconds("95%"), "chat_p99_s": seconds("99%"), "chat_max_s": seconds("Max Response Time"),
@@ -124,9 +165,13 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "lm_completion_tokens": lm.get("completion_tokens"),
     }
 
+    result["top_errors"] = read_failures(Path(f"{prefix}_failures.csv"))
+    # Without statistics Locust did not run at all: a setup problem, not a capacity limit.
+    result["error"] = None if agg is not None else "\n".join(log_tail(f"{prefix}.log"))
+
     reasons = []
     if agg is None:
-        reasons.append("Locust produced no statistics (see .log)")
+        reasons.append("Locust failed to run (see .log)")
     elif result["chat_requests"] == 0:
         reasons.append("no chat request completed")
     if result["fail_rate"] is not None and result["fail_rate"] > args.max_fail_rate:
@@ -143,16 +188,24 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     print(f"  requests {requests}, failures {failures}, chat p95 {result['chat_p95_s']}s, "
           f"{result['chat_rps']} chat req/s, GPU avg {sysm.get('gpu_util_avg')}%, VRAM max {sysm.get('vram_pct_max')}%"
           + (f", {result['lm_gen_tokens_per_s']} tok/s" if watcher else ""))
+    if result["error"] is not None:
+        print("  -> LOCUST ERROR (setup problem, not a capacity limit). Last lines of the Locust log:")
+        print("\n".join("     " + line for line in result["error"].splitlines()))
+        return result
     print("  -> " + ("PASSED" if result["passed"] else "LIMIT REACHED: " + result["reasons"]))
+    for error, count in result["top_errors"][:3]:
+        print(f"     {count}x {error}")
+    if looks_like_setup_problem(result):
+        print(f"     Note: {SETUP_HINT}")
     return result
 
 
 def write_results(out_dir, results, args, last_ok, first_bad, aborted):
     """Write results.csv, results.json and the Markdown report."""
     if results:
-        fields = list(results[0].keys())
+        fields = [k for k in results[0] if k not in ("top_errors", "error")]
         with open(out_dir / "results.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(results)
     (out_dir / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -174,9 +227,14 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
     if aborted:
         lines += ["**The test was aborted manually; results are incomplete.**", ""]
     lines += ["## Result", ""]
-    if last_ok is None and first_bad is not None:
+    failed_run = next((r for r in results if r.get("error") is not None), None)
+    if failed_run is not None:
+        lines += [f"**The run stopped at stage {failed_run['stage']} because Locust failed to run. "
+                  "This is a setup problem, not a capacity limit.**", "",
+                  "Last lines of the Locust log:", "", "```", failed_run["error"], "```", ""]
+    if failed_run is None and last_ok is None and first_bad is not None:
         lines.append(f"- A limit was already exceeded at **{first_bad} Locust users**.")
-    elif last_ok is not None:
+    elif failed_run is None and last_ok is not None:
         lines.append(f"- Highest passing stage: **{last_ok} concurrent Locust users**"
                      + (f" (limit at {first_bad})" if first_bad else " (limit not reached; increase --max-users)"))
     if knee:
@@ -188,6 +246,12 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
                      f"({best['chat_rps'] * 60:.1f}/min) at {best['users']} users.")
         lines.append(f"- Estimated real users (Little's law, {args.student_think_time}s think/read time "
                      f"between questions): about **{est:.0f} concurrently active students**.")
+    first_fail = next((r for r in ordered if not r["passed"] and r.get("top_errors")), None)
+    if first_fail is not None:
+        lines += ["", f"Most frequent errors at {first_fail['users']} users:", ""]
+        lines += [f"- {count}× `{error}`" for error, count in first_fail["top_errors"]]
+        if looks_like_setup_problem(first_fail):
+            lines += ["", f"> {SETUP_HINT}"]
     lines += ["", "## Stages", "",
               "| Users | Requests | Failures % | Chat avg s | Chat p95 s | Chat req/s | GPU avg % | VRAM max % | RAM max % | tok/s | Status |",
               "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
@@ -242,6 +306,7 @@ def main():
     print(f"Planned stages: {levels}  (up to ~{est / 60:.0f} min, excluding --refine)")
     if args.dry_run:
         return
+    check_locust()
     if not args.skip_preflight:
         preflight(args.host)
 
@@ -272,6 +337,8 @@ def main():
             r = run_stage(len(results) + 1, users, args, args.passthrough, out_dir, sampler, watcher)
             results.append(r)
             write_results(out_dir, results, args, last_ok, first_bad, False)
+            if r["error"] is not None:
+                break  # Setup problem: further stages would fail the same way.
             if not r["passed"]:
                 first_bad = users
                 break
