@@ -5,7 +5,7 @@ Privacy-preserving live monitor for LM Studio. Runs entirely on the local machin
 Data sources:
   1. LM Studio server log, followed like ``tail -f`` (daily log rotation is handled)
   2. Local LM Studio REST API (loaded models, optional synthetic probe request)
-  3. GPU and host metrics via nvidia-smi and psutil
+  3. GPU and host metrics (NVIDIA via nvidia-smi, macOS via ioreg; detected automatically) and psutil
 
 Only numeric metrics (request counts, latencies, token counts, hardware load) are
 kept. LM Studio writes prompt and completion text to its log; this monitor
@@ -21,11 +21,13 @@ Example:
     python lmstudio_monitor.py --interval 60 --alert-p95 45
 """
 import argparse
+import ast
 import csv
 import json
 import os
 import re
-import statistics
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -36,21 +38,9 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from live_session import SessionManager, build_from_log, list_sessions
+from lmstudio_log_parser import LogParser, diagnose, rnd
 from system_metrics import SystemSampler
-
-# --- Log patterns (LM Studio 0.3.x). Adjust here if a newer release changes the log format. ---
-TS_RE = re.compile(r"^\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
-LEVEL_RE = re.compile(r"\[(INFO|DEBUG|WARN|WARNING|ERROR)\]")
-# Matches both "Received POST request to /v1/..." and "Received request: POST to /v1/...".
-REQUEST_RE = re.compile(r"Received (?:request: )?(POST|GET) (?:request )?to (\S+)", re.I)
-FIRST_TOKEN_RE = re.compile(r"First token generated", re.I)
-STREAM_DONE_RE = re.compile(r"Finished streaming response", re.I)
-PREDICTION_RE = re.compile(r"Generated prediction", re.I)
-# Only these fields are extracted from JSON bodies; all other content is ignored.
-MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]{1,200})"')
-PROMPT_TOK_RE = re.compile(r'"prompt_tokens"\s*:\s*(\d+)')
-COMPL_TOK_RE = re.compile(r'"completion_tokens"\s*:\s*(\d+)')
-TPS_RE = re.compile(r'"tokens_per_second"\s*:\s*([\d.]+)')
 
 DEFAULT_LOG_DIRS = [
     Path.home() / ".lmstudio" / "server-logs",
@@ -58,258 +48,53 @@ DEFAULT_LOG_DIRS = [
 ]
 
 
-def classify_endpoint(endpoint):
-    """Map an API path to 'embedding', 'generation' or None (not tracked)."""
-    if "embedding" in endpoint:
-        return "embedding"
-    if "completions" in endpoint or "/responses" in endpoint or "/chat" in endpoint:
-        return "generation"
-    return None
-
-
-def pct(values, p):
-    """Nearest-rank percentile; returns None for an empty sequence."""
-    if not values:
-        return None
-    values = sorted(values)
-    k = max(0, min(len(values) - 1, round(p / 100 * len(values)) - 1))
-    return values[k]
-
-
-def rnd(value, digits=2):
-    return round(value, digits) if value is not None else None
-
-
-class LogParser:
-    """
-    Turns LM Studio log lines into request metrics.
-
-    LM Studio does not log a request ID, so concurrent requests are matched
-    start-to-finish in FIFO order. Counters and token totals are exact;
-    per-request latencies are approximations under high concurrency.
-    """
-
-    def __init__(self, use_log_time=False, stale_after=900):
-        self.lock = threading.Lock()
-        self.use_log_time = use_log_time
-        self.stale_after = stale_after
-        self.open = deque()              # In-flight generation requests (FIFO).
-        self.ctx = None                  # JSON body currently being read: "request", "prediction" or None.
-        self.ctx_req = None
-        self.just_streamed = False
-        self.last_finished = None
-        self.last_ts = time.time()
-        self.lines_seen = 0
-        self.last_line_wall = None       # Wall-clock time of the most recent log line.
-        self.recent = deque(maxlen=500)  # Recently completed requests (numeric fields only).
-        self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0,
-                       "prompt_tokens": 0, "completion_tokens": 0}
-        self._new_window()
-
-    def _new_window(self):
-        self.w_start = self.last_ts if self.use_log_time else time.time()
-        self.w = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "stale": 0,
-                  "max_active": len(self.open), "latencies": [], "ttfts": [], "tps": [],
-                  "prompt_tokens": 0, "completion_tokens": 0, "models": {}}
-
-    def _inc(self, key, n=1):
-        """Increment a counter in both the current window and the running totals."""
-        self.w[key] += n
-        self.totals[key] += n
-
-    def _now(self, ts_match):
-        if self.use_log_time and ts_match:
-            try:
-                self.last_ts = datetime.strptime(ts_match.group(1).replace("T", " "),
-                                                 "%Y-%m-%d %H:%M:%S").timestamp()
-            except ValueError:
-                pass
-            return self.last_ts
-        return time.time()
-
-    def feed(self, line):
-        """Process a single log line."""
-        with self.lock:
-            self.lines_seen += 1
-            self.last_line_wall = time.time()
-            ts = TS_RE.match(line)
-            if not ts and not LEVEL_RE.search(line[:60]):
-                self._scan_body(line)  # Continuation line of a multi-line JSON body.
-                return
-            now = self._now(ts)
-            streamed, self.just_streamed = self.just_streamed, False
-            self.ctx = self.ctx_req = None
-
-            rq = REQUEST_RE.search(line)
-            if rq:
-                method, endpoint = rq.groups()
-                kind = classify_endpoint(endpoint) if method.upper() == "POST" else None
-                if kind == "embedding":
-                    self._inc("embeddings")
-                elif kind == "generation":
-                    req = {"start": now, "first": None, "model": None}
-                    self.open.append(req)
-                    self._inc("started")
-                    self.w["max_active"] = max(self.w["max_active"], len(self.open))
-                    self.ctx, self.ctx_req = "request", req
-                    self._scan_body(line)
-                return
-            if FIRST_TOKEN_RE.search(line):
-                for req in self.open:
-                    if req["first"] is None:
-                        req["first"] = now
-                        break
-                return
-            if STREAM_DONE_RE.search(line):
-                self._finish(now)
-                self.just_streamed = True
-                return
-            if PREDICTION_RE.search(line):
-                # Directly after "Finished streaming" this belongs to the same request: do not count twice.
-                req = self.last_finished if streamed else self._finish(now)
-                self.ctx, self.ctx_req = "prediction", req
-                self._scan_body(line)
-                return
-            lvl = LEVEL_RE.search(line[:60])
-            if lvl and lvl.group(1) == "ERROR":
-                self._inc("errors")
-
-    def _finish(self, now):
-        req = self.open.popleft() if self.open else {"start": None, "first": None, "model": None}
-        self._inc("completed")
-        req["end"] = now
-        self.recent.append(req)
-        if req["start"] is not None:
-            self.w["latencies"].append(now - req["start"])
-            if req["first"] is not None:
-                self.w["ttfts"].append(req["first"] - req["start"])
-        self.last_finished = req
-        return req
-
-    def _scan_body(self, line):
-        """Extract the model name and token counts from a JSON body; all other content is discarded."""
-        if self.ctx is None or self.ctx_req is None:
-            return
-        req = self.ctx_req
-        if req.get("model") is None:
-            m = MODEL_RE.search(line)
-            if m:
-                req["model"] = m.group(1)
-        if self.ctx == "prediction":
-            for regex, key in ((PROMPT_TOK_RE, "prompt_tokens"), (COMPL_TOK_RE, "completion_tokens")):
-                m = regex.search(line)
-                if m:
-                    self._inc(key, int(m.group(1)))
-                    req[key] = int(m.group(1))
-            m = TPS_RE.search(line)
-            if m:
-                self.w["tps"].append(float(m.group(1)))
-                req["tps"] = float(m.group(1))
-            self._count_model(req)
-
-    def _count_model(self, req):
-        if req.get("model") and not req.get("counted"):
-            self.w["models"][req["model"]] = self.w["models"].get(req["model"], 0) + 1
-            req["counted"] = True
-
-    def active(self):
-        with self.lock:
-            return len(self.open)
-
-    def latency_points(self, window=1800):
-        """Duration and time-to-first-token of completed requests within ``window`` seconds."""
-        now = time.time()
-        with self.lock:
-            return [{"t": r["end"], "duration": rnd(r["end"] - r["start"]),
-                     "ttft": rnd(r["first"] - r["start"]) if r["first"] is not None else None}
-                    for r in self.recent if r["start"] is not None and now - r["end"] <= window]
-
-    def live(self, tps_window=30, rate_window=60, lat_window=300, recent_n=25):
-        """Real-time snapshot for the dashboard, using sliding windows on wall-clock time."""
-        now = time.time()
-        with self.lock:
-            running = [{"age": round(now - r["start"], 1), "generating": r["first"] is not None,
-                        "model": r.get("model")} for r in self.open if r["start"] is not None]
-            recent = list(self.recent)
-            totals = dict(self.totals)
-            last_line = self.last_line_wall
-
-        def ended(win):
-            return [r for r in recent if now - r["end"] <= win]
-
-        lat = [r["end"] - r["start"] for r in ended(lat_window) if r["start"] is not None]
-        ttft = [r["first"] - r["start"] for r in ended(lat_window)
-                if r["start"] is not None and r["first"] is not None]
-
-        def row(r):
-            dur = r["end"] - r["start"] if r["start"] is not None else None
-            out_tok = r.get("completion_tokens")
-            return {"end": r["end"], "duration_s": rnd(dur),
-                    "ttft_s": rnd(r["first"] - r["start"]) if r["start"] and r["first"] else None,
-                    "prompt_tokens": r.get("prompt_tokens"), "completion_tokens": out_tok,
-                    "tokens_per_s": rnd(r.get("tps") or (out_tok / dur if out_tok and dur else None), 1),
-                    "model": r.get("model")}
-
-        return {
-            "active": len(running), "waiting": sum(not r["generating"] for r in running),
-            "running": sorted(running, key=lambda r: -r["age"]),
-            "tokens_per_s": rnd(sum(r.get("completion_tokens") or 0 for r in ended(tps_window)) / tps_window, 1),
-            "requests_per_min": round(len(ended(rate_window)) * 60 / rate_window, 1),
-            "latency_p95_s": rnd(pct(lat, 95)), "latency_avg_s": rnd(statistics.fmean(lat)) if lat else None,
-            "ttft_p95_s": rnd(pct(ttft, 95)),
-            "recent": [row(r) for r in reversed(recent[-recent_n:])],
-            "totals": totals, "log_age_s": rnd(now - last_line, 0) if last_line else None,
-        }
-
-    def snapshot(self, reset=True):
-        """Aggregate the current window into a flat dict (one CSV row) and optionally start a new window."""
-        with self.lock:
-            now = self.last_ts if self.use_log_time else time.time()
-            while self.open and self.open[0]["start"] is not None \
-                    and now - self.open[0]["start"] > self.stale_after:
-                self.open.popleft()  # E.g. an aborted request that never logged a completion line.
-                self.w["stale"] += 1
-            w, duration = self.w, max(now - self.w_start, 1e-6)
-            lat, ttft = w["latencies"], w["ttfts"]
-            snap = {
-                "requests_started": w["started"], "requests_completed": w["completed"],
-                "embedding_requests": w["embeddings"], "log_errors": w["errors"],
-                "stale_requests": w["stale"], "active_now": len(self.open),
-                "max_active": max(w["max_active"], len(self.open)),
-                "latency_avg_s": rnd(statistics.fmean(lat)) if lat else None,
-                "latency_p95_s": rnd(pct(lat, 95)),
-                "ttft_avg_s": rnd(statistics.fmean(ttft)) if ttft else None,
-                "ttft_p95_s": rnd(pct(ttft, 95)),
-                "prompt_tokens": w["prompt_tokens"], "completion_tokens": w["completion_tokens"],
-                "gen_tokens_per_s_total": rnd(w["completion_tokens"] / duration),
-                "tokens_per_s_per_request_avg": rnd(statistics.fmean(w["tps"])) if w["tps"] else None,
-                "models_used": ";".join(f"{k}:{v}" for k, v in sorted(w["models"].items())),
-            }
-            if reset:
-                self._new_window()
-            return snap
-
-
 class LogFollower(threading.Thread):
     """Continuously follows the newest LM Studio log file and feeds lines to a LogParser."""
 
-    def __init__(self, target, parser, from_start=False, poll=0.5):
+    def __init__(self, target, parser, from_start=False, poll=0.2):
         super().__init__(daemon=True)
         self.target = Path(target)
         self.parser = parser
         self.from_start = from_start
         self.poll = poll
         self.current = None
+        self._fh = None
         self._stop = threading.Event()
 
-    def newest_file(self):
+    def _log_files(self):
         if self.target.is_file():
-            return self.target
-        logs = [p for p in self.target.rglob("*.log") if p.is_file()]
-        return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
+            return [self.target]
+        return sorted((p for p in self.target.rglob("*.log") if p.is_file()), key=lambda p: p.stat().st_mtime)
+
+    def newest_file(self):
+        logs = self._log_files()
+        return logs[-1] if logs else None
+
+    def open_initial(self, replay_window=0, sample=None):
+        """
+        Open the newest log before following it: learn which models are loaded and, with
+        ``replay_window`` > 0, rebuild the last ``replay_window`` seconds from the log
+        (including the previous file when the window reaches back past a log rotation).
+        """
+        logs = self._log_files()
+        if not logs:
+            return
+        newest = logs[-1]
+        fh = open(newest, "r", encoding="utf-8", errors="replace")
+        self._fh, self.current = fh, newest
+        print(f"[monitor] following log: {newest.name}")
+        if self.from_start:
+            return
+        lines = fh.read().splitlines()  # Leaves the file position at the end for following.
+        self.parser.prime_engines(lines)
+        if replay_window > 0:
+            now = time.time()
+            if len(logs) > 1 and logs[-2].stat().st_mtime >= now - replay_window:
+                lines = logs[-2].read_text(encoding="utf-8", errors="replace").splitlines() + lines
+            self.parser.replay(lines, now - replay_window, now, sample)
 
     def run(self):
-        fh, buf, last_check, first = None, "", 0.0, True
+        fh, buf, last_check, first = self._fh, "", 0.0, self._fh is None
         while not self._stop.is_set():
             if fh is None or time.time() - last_check > 5:
                 last_check = time.time()
@@ -321,6 +106,7 @@ class LogFollower(threading.Thread):
                         fh.close()
                     fh = open(newest, "r", encoding="utf-8", errors="replace")
                     if first and not self.from_start:
+                        self.parser.prime_engines(fh)  # Learn loaded models, then follow new lines only.
                         fh.seek(0, os.SEEK_END)
                     first, buf = False, ""
                     self.current = newest
@@ -344,6 +130,14 @@ class LogFollower(threading.Thread):
 
     def stop(self):
         self._stop.set()
+
+
+def csv_header(path):
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return next(csv.reader(f), None)
+    except OSError:
+        return None
 
 
 def find_log_target(explicit=None):
@@ -413,8 +207,17 @@ def probe(base, model, token=None):
 
 
 # --- Real-time recording (one data point per second) ---
+HARDWARE_FIELDS = ("gpu_util", "vram_pct", "vram_used_mb", "vram_total_mb",
+                   "gpu_temp", "gpu_power_w", "ram_pct", "ram_used_gb", "cpu_pct")
+HISTORY_NUMERIC = ("requests_completed", "requests_started", "max_active", "latency_p95_s", "latency_avg_s",
+                   "ttft_p95_s", "gen_tokens_per_s_total", "gpu_util_avg", "vram_pct_max")
+
+
 class LiveRecorder(threading.Thread):
     """Collects log, hardware and API state once per second and notifies dashboard clients."""
+
+    SAVE_EVERY_S = 15
+    HARDWARE_STEP_S = 5  # Resolution of the saved hardware points (keeps the file small for long series).
 
     def __init__(self, parser, sampler, args, follower=None, keep_s=1800):
         super().__init__(daemon=True)
@@ -426,13 +229,115 @@ class LiveRecorder(threading.Thread):
         self.state = {}
         self.models, self.api_ok, self._last_api = [], None, 0.0
         self.started = time.time()
+        self.keep_s = keep_s
+        self.sessions = None  # SessionManager, set by main().
+        self.hardware_file = Path(args.out) / ".live_hardware.json"
+        self.cleared_file = Path(args.out) / ".cleared_at"
+        self.cleared_at = self._load_cleared_at()
+        self._saved_hardware = self._load_hardware()
+        self._last_save = time.time()
+
+    # --- dashboard "Clear" ---
+    def _load_cleared_at(self):
+        try:
+            return float(self.cleared_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0.0
+
+    def clear(self):
+        """
+        Reset everything the dashboard shows and start afresh. Stored CSV data is kept; the time of
+        the reset is remembered so a restart does not restore the cleared values from the log.
+        """
+        now = time.time()
+        self.parser.reset()
+        with self.cond:
+            self.series.clear()
+            self.history.clear()
+            self.started = self.cleared_at = now
+            self._saved_hardware = {}
+        try:
+            self.cleared_file.write_text(str(now), encoding="utf-8")
+            self.hardware_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print("[monitor] dashboard values cleared")
+
+    # --- restoring state after a restart ---
+    def _load_hardware(self):
+        """Hardware points saved by a previous monitor run, keyed by second."""
+        try:
+            points = json.loads(self.hardware_file.read_text(encoding="utf-8")).get("points", [])
+        except (OSError, ValueError):
+            return {}
+        cutoff = max(time.time() - self.keep_s, self.cleared_at)
+        return {int(p["t"]) - int(p["t"]) % self.HARDWARE_STEP_S: p for p in points if p.get("t", 0) >= cutoff}
+
+    def save_hardware(self):
+        """Persist the hardware part of the live series (numbers only) for the next start."""
+        with self.cond:
+            points = [{"t": p["t"], **{k: p.get(k) for k in HARDWARE_FIELDS}} for p in self.series
+                      if int(p["t"]) % self.HARDWARE_STEP_S == 0]
+        try:
+            tmp = self.hardware_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"points": points}), encoding="utf-8")
+            os.replace(tmp, self.hardware_file)
+        except OSError:
+            pass
+
+    def log_files_since(self, start):
+        """LM Studio log files that may contain entries from ``start`` onwards."""
+        if self.follower is None:
+            return []
+        return [p for p in self.follower._log_files() if p.stat().st_mtime >= start]
+
+    def hardware_points(self):
+        """Hardware points currently kept in memory (for sessions built afterwards)."""
+        with self.cond:
+            return [{"t": p["t"], **{k: p.get(k) for k in HARDWARE_FIELDS}} for p in self.series
+                    if p.get("gpu_util") is not None or p.get("ram_pct") is not None]
+
+    def replay_sample(self, second):
+        """Called by the log replay once per second: rebuild one data point of the live series."""
+        live = self.parser.live_point()
+        hw = self._saved_hardware.get(second - second % self.HARDWARE_STEP_S, {})
+        self.series.append({"t": float(second), "active": live["active"], "waiting": live["waiting"],
+                            "tokens_per_s": live["tokens_per_s"], "requests_per_min": live["requests_per_min"],
+                            **{k: hw.get(k) for k in HARDWARE_FIELDS}})
+
+    def load_history(self, out_dir):
+        """Fill the daily view from the CSV rows of the last 24 hours."""
+        cutoff = max(datetime.now().timestamp() - 24 * 3600, self.cleared_at)
+        rows = []
+        for path in sorted(Path(out_dir).glob("lmstudio_metrics_*.csv"))[-2:]:
+            try:
+                with open(path, newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        try:
+                            if datetime.fromisoformat(row["time"]).timestamp() < cutoff:
+                                continue
+                        except (KeyError, ValueError):
+                            continue
+                        for key in HISTORY_NUMERIC:
+                            try:
+                                row[key] = float(row[key]) if row.get(key) not in (None, "") else None
+                            except ValueError:
+                                row[key] = None
+                        rows.append(row)
+            except OSError:
+                continue
+        with self.cond:
+            self.history.extend(rows[-self.history.maxlen:])
 
     def _poll_api(self):
-        if self.args.no_api or time.time() - self._last_api < 10:
+        # Every poll adds a line to the LM Studio log, so poll sparingly; loaded models rarely change.
+        if self.args.no_api or time.time() - self._last_api < 30:
             return
         self._last_api = time.time()
         models = loaded_models(self.args.lmstudio_url, self.args.token)
         self.api_ok, self.models = models is not None, models or []
+        # Lets the parser name the model of app chats when it cannot be derived from the log.
+        self.parser.default_model = self.models[0] if len(self.models) == 1 else None
 
     def alerts(self, live, sysm):
         a, args = [], self.args
@@ -454,10 +359,10 @@ class LiveRecorder(threading.Thread):
             live, sysm = self.parser.live(), dict(self.sampler.latest)
             point = {"t": round(time.time(), 1), "active": live["active"], "waiting": live["waiting"],
                      "tokens_per_s": live["tokens_per_s"], "requests_per_min": live["requests_per_min"],
-                     **{k: sysm.get(k) for k in ("gpu_util", "vram_pct", "vram_used_mb", "vram_total_mb",
-                                                 "gpu_temp", "gpu_power_w", "ram_pct", "ram_used_gb", "cpu_pct")}}
+                     **{k: sysm.get(k) for k in HARDWARE_FIELDS}}
             state = {**live, "system": sysm, "alerts": self.alerts(live, sysm), "models": self.models,
                      "api_ok": self.api_ok, "gpu_available": self.sampler.gpu_available,
+                     **self.sampler.gpu.info(),
                      "log_file": self.follower.current.name if self.follower and self.follower.current else None,
                      "monitor_started": self.started}
             with self.cond:
@@ -465,24 +370,326 @@ class LiveRecorder(threading.Thread):
                 self.state = state
                 self.seq += 1
                 self.cond.notify_all()
+            if self.sessions is not None and self.sessions.current is not None:
+                self.sessions.current.record_hardware(sysm)
+            if time.time() - self._last_save >= self.SAVE_EVERY_S:
+                self._last_save = time.time()
+                self.save_hardware()
             time.sleep(1)
 
     def full(self):
         """Complete state for the initial page load."""
         with self.cond:
             return {"series": list(self.series), "history": list(self.history), "state": self.state,
-                    "latency_points": self.parser.latency_points(),
+                    "latency_points": self.parser.latency_points(window=self.keep_s),
                     "config": {"interval": self.args.interval, "alert_p95": self.args.alert_p95,
                                "alert_vram_pct": self.args.alert_vram_pct,
-                               "alert_gpu_temp": self.args.alert_gpu_temp}}
+                               "alert_gpu_temp": self.args.alert_gpu_temp, "alert_active": self.args.alert_active,
+                               "stall_after": self.parser.stall_after, "keep_s": self.keep_s}}
+
+
+# --- Load test control (dashboard stop button) ---
+class LoadTestControl:
+    """
+    Stops a running auto_loadtest.py run and deletes the AnythingLLM threads it created.
+
+    The load test publishes its state in ``.loadtest_status.json`` and watches for
+    ``.loadtest_stop``; the threads it created are listed in ``.loadtest_threads.json``.
+    Only threads from that list are deleted, so chats of real users are never touched.
+    """
+
+    HEARTBEAT_TIMEOUT_S = 8
+    STOP_WAIT_S = 45
+
+    # Parameters of a custom load test started from the dashboard: (type, min, max) or allowed values.
+    LAUNCH_PARAMS = {
+        "stage_duration": (int, 10, 7200), "spawn_rate": (float, 0.1, 50), "cooldown": (int, 0, 600),
+        "stop_timeout": (int, 0, 600), "max_p95": (float, 1, 3600), "max_fail_rate": (float, 0, 1),
+        "student_think_time": (float, 1, 3600), "wait_min": (float, 0, 600), "wait_max": (float, 0, 600),
+        "request_timeout": (float, 5, 3600), "max_threads": (int, 0, 10000),
+    }
+
+    def __init__(self, project_dir, anythingllm_url, api_key):
+        self.project_dir = project_dir = Path(project_dir)
+        self.process = None
+        self.launch_info = None
+        self.status_file = project_dir / ".loadtest_status.json"
+        self.stop_file = project_dir / ".loadtest_stop"
+        self.registry_file = project_dir / ".loadtest_threads.json"
+        self.url = anythingllm_url.rstrip("/")
+        self.api_key = api_key
+        self.lock = threading.Lock()
+        self.progress = {"phase": "idle"}
+
+    def loadtest(self):
+        try:
+            status = json.loads(self.status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"running": False}
+        running = time.time() - status.get("heartbeat", 0) < self.HEARTBEAT_TIMEOUT_S
+        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users", "workspace", "run_started")}}
+
+    def _run_config(self, run):
+        """Settings of a load test run from its config.json (values as the run recorded them)."""
+        try:
+            cfg = json.loads((self.project_dir / "loadtest_results" / run / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        try:
+            forwarded = ast.literal_eval(cfg.get("passthrough", "[]"))
+        except (ValueError, SyntaxError):
+            forwarded = []
+        opts = {}
+        for i, arg in enumerate(forwarded):
+            if arg.startswith("--") and i + 1 < len(forwarded) and not forwarded[i + 1].startswith("--"):
+                opts[arg[2:].replace("-", "_")] = forwarded[i + 1]
+        cfg["forwarded"] = opts
+        return cfg
+
+    def loadtest_details(self):
+        """Settings of the running load test, otherwise of the most recent one."""
+        lt = self.loadtest()
+        run = lt.get("run") if lt.get("running") else None
+        if run is None:
+            runs = self.list_runs(limit=1)
+            run = runs[0]["run"] if runs else None
+        cfg = self._run_config(run) if run else None
+        return {"running": lt.get("running", False), "run": run, "stage": lt.get("stage"), "users": lt.get("users"),
+                "workspace": lt.get("workspace"), "config": cfg}
+
+    def delete_run(self, run):
+        """
+        Delete a load test result folder from disk. Only plain folder names inside loadtest_results
+        are accepted, and a running load test cannot be deleted. Returns (ok, message).
+        """
+        folder = safe_child(self.project_dir / "loadtest_results", run)
+        if folder is None:
+            return False, "invalid load test name"
+        if not folder.is_dir():
+            return False, "load test not found"
+        lt = self.loadtest()
+        if lt.get("running") and lt.get("run") == run:
+            return False, "a running load test cannot be deleted – stop it first"
+        shutil.rmtree(folder)
+        print(f"[monitor] load test deleted from disk: {run}")
+        return True, "load test deleted"
+
+    def list_runs(self, limit=30):
+        """Completed and running load tests (newest first) with their basic settings and results."""
+        results_dir = self.project_dir / "loadtest_results"
+        if not results_dir.is_dir():
+            return []
+        running = self.loadtest()
+        out = []
+        for folder in sorted((p for p in results_dir.iterdir() if p.is_dir() and (p / "config.json").exists()),
+                             key=lambda p: p.name, reverse=True)[:limit]:
+            cfg = self._run_config(folder.name) or {}
+            try:
+                stages = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stages = []
+            passing = [r for r in stages if r.get("passed")]
+            best = max(passing, key=lambda r: r.get("chat_rps") or 0, default=None)
+            first_fail = next((r for r in sorted(stages, key=lambda r: r["users"]) if not r.get("passed")), None)
+            if running.get("running") and running.get("run") == folder.name:
+                status = "running"
+            elif any(r.get("stopped") for r in stages):
+                status = "stopped"
+            elif any(r.get("error") for r in stages):
+                status = "setup error"
+            elif not stages:
+                status = "no data"
+            else:
+                status = "completed"
+            out.append({
+                "run": folder.name, "status": status,
+                "users": cfg.get("users") if cfg.get("users") not in (None, "", "None")
+                else ",".join(str(r["users"]) for r in sorted(stages, key=lambda r: r["users"])),
+                "mode": cfg.get("forwarded", {}).get("mode", "query"), "stage_duration": cfg.get("stage_duration"),
+                "stages_run": len(stages), "highest_passing": max((r["users"] for r in passing), default=None),
+                "limit_at": first_fail["users"] if first_fail else None,
+                "limit_reason": first_fail.get("reasons") if first_fail else None,
+                "max_per_min": round(best["chat_rps"] * 60, 1) if best and best.get("chat_rps") else None,
+                "p95_at_best": best.get("chat_p95_s") if best else None,
+                "report": (folder / "report.html").exists()})
+        return out
+
+    def threads(self):
+        try:
+            return json.loads(self.registry_file.read_text(encoding="utf-8")).get("threads", [])
+        except (OSError, ValueError):
+            return []
+
+    def state(self):
+        with self.lock:
+            progress = dict(self.progress)
+            launch = dict(self.launch_info) if self.launch_info else None
+        if launch and self.process is not None and self.process.poll() is not None:
+            launch["exit_code"] = self.process.returncode
+            if self.process.returncode:  # Failed early, e.g. preflight: show why.
+                launch["log_tail"] = self._log_tail(launch["log"])
+        return {"loadtest": self.loadtest(), "threads": len(self.threads()),
+                "can_delete": bool(self.api_key), "progress": progress, "launch": launch,
+                "latest_report": self.latest_report(),
+                "defaults": {"host": self.url, "workspace": os.environ.get("WORKSPACE_SLUG", ""),
+                             "api_key_set": bool(self.api_key)}}
+
+    def latest_report(self):
+        results = self.project_dir / "loadtest_results"
+        runs = sorted((p for p in results.glob("*/report.html")), key=lambda p: p.stat().st_mtime) if results.is_dir() else []
+        return runs[-1].parent.name if runs else None
+
+    @staticmethod
+    def _log_tail(path, lines=12):
+        try:
+            return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+        except OSError:
+            return []
+
+    def launch(self, params):
+        """
+        Start auto_loadtest.py with validated parameters from the dashboard. Returns (ok, message).
+        The process is started without a shell; every value is checked against a fixed rule.
+        """
+        if self.loadtest()["running"] or (self.process is not None and self.process.poll() is None):
+            return False, "a load test is already running"
+        users = str(params.get("users", "")).replace(" ", "")
+        if not re.fullmatch(r"\d{1,4}(,\d{1,4}){0,40}", users) or not all(int(u) > 0 for u in users.split(",")):
+            return False, "users must be a comma-separated list of positive numbers, e.g. 1,2,4,8"
+        host = str(params.get("host") or self.url).strip()
+        if not re.fullmatch(r"https?://[\w.\-\[\]:]+(/[\w./\-]*)?", host):
+            return False, "host must be an http(s) URL"
+        workspace = str(params.get("workspace") or os.environ.get("WORKSPACE_SLUG", "")).strip()
+        if not re.fullmatch(r"[\w-]{1,100}", workspace):
+            return False, "workspace slug is missing or invalid"
+        api_key = str(params.get("api_key") or self.api_key or "")
+        if not api_key:
+            return False, "an AnythingLLM API key is required (field or env ANYTHING_API_KEY)"
+        mode = params.get("mode", "query")
+        if mode not in ("query", "chat"):
+            return False, "mode must be query or chat"
+        values = {}
+        for key, (kind, lo, hi) in self.LAUNCH_PARAMS.items():
+            if params.get(key) in (None, ""):
+                continue
+            try:
+                value = kind(params[key])
+            except (TypeError, ValueError):
+                return False, f"{key} must be a number"
+            if not lo <= value <= hi:
+                return False, f"{key} must be between {lo} and {hi}"
+            values[key] = value
+        if values.get("wait_min", 0) > values.get("wait_max", values.get("wait_min", 0)):
+            return False, "wait_min must not exceed wait_max"
+
+        cmd = [sys.executable, str(self.project_dir / "auto_loadtest.py"), "--host", host, "--users", users]
+        for key in ("stage_duration", "spawn_rate", "cooldown", "stop_timeout", "max_p95", "max_fail_rate",
+                    "student_think_time"):
+            if key in values:
+                cmd += [f"--{key.replace('_', '-')}", str(values[key])]
+        if params.get("refine"):
+            cmd.append("--refine")
+        cmd += ["--", "--mode", mode]
+        for key in ("wait_min", "wait_max", "request_timeout", "max_threads"):
+            if key in values:
+                cmd += [f"--{key.replace('_', '-')}", str(values[key])]
+        env = {**os.environ, "ANYTHING_API_KEY": api_key, "WORKSPACE_SLUG": workspace}
+        log_dir = self.project_dir / "loadtest_results"
+        log_dir.mkdir(exist_ok=True)
+        log = log_dir / f"dashboard_{datetime.now():%Y%m%d_%H%M%S}.log"
+        flags = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+        with open(log, "w", encoding="utf-8") as out:
+            self.process = subprocess.Popen(cmd, cwd=self.project_dir, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                            **flags)
+        with self.lock:
+            self.launch_info = {"pid": self.process.pid, "started": time.time(), "log": str(log),
+                                "users": users, "mode": mode, "host": host, "workspace": workspace}
+        printable = [c for c in cmd if c != api_key]
+        print(f"[monitor] load test started from the dashboard: {' '.join(printable[1:])}")
+        return True, f"load test started (log: {log.name})"
+
+    def _set(self, **progress):
+        with self.lock:
+            self.progress = {"at": time.time(), **progress}
+        print(f"[monitor] stop & delete: {progress.get('message', progress.get('phase'))}")
+
+    def start(self):
+        """Run the stop-and-delete sequence in the background; returns False if one is already running."""
+        with self.lock:
+            if self.progress.get("phase") in ("stopping", "deleting"):
+                return False
+            self.progress = {"phase": "stopping", "at": time.time(), "message": "stopping the load test"}
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def _run(self):
+        if self.loadtest()["running"]:
+            self.stop_file.write_text(str(time.time()), encoding="utf-8")
+            deadline = time.time() + self.STOP_WAIT_S
+            while self.loadtest()["running"] and time.time() < deadline:
+                time.sleep(1)
+            if self.loadtest()["running"]:
+                self._set(phase="error", message="the load test did not stop within "
+                                                 f"{self.STOP_WAIT_S} s; no threads were deleted")
+                return
+        try:
+            self.stop_file.unlink()
+        except OSError:
+            pass
+        if not self.api_key:
+            self._set(phase="done", deleted=0, failed=0,
+                      message="load test stopped; set ANYTHING_API_KEY for the monitor to delete threads")
+            return
+        self._set(phase="deleting", message="deleting load-test threads")
+        remaining, deleted = [], 0
+        for entry in self.threads():
+            req = urllib.request.Request(f"{self.url}/api/v1/workspace/{entry['workspace']}/thread/{entry['slug']}",
+                                         method="DELETE", headers={"Authorization": f"Bearer {self.api_key}"})
+            try:
+                with urllib.request.urlopen(req, timeout=15):
+                    deleted += 1
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    deleted += 1  # Already deleted in AnythingLLM.
+                else:
+                    remaining.append(entry)
+            except (urllib.error.URLError, OSError):
+                remaining.append(entry)
+        tmp = self.registry_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"threads": remaining}, indent=1, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, self.registry_file)
+        message = f"deleted {deleted} load-test threads" + (f", {len(remaining)} failed" if remaining else "")
+        self._set(phase="done" if not remaining else "error", deleted=deleted, failed=len(remaining), message=message)
 
 
 # --- Local dashboard server (bound to 127.0.0.1 only) ---
 DASHBOARD_FILE = Path(__file__).resolve().parent / "dashboard.html"
 
 
-def start_dashboard(port, recorder):
+def safe_child(root, name):
+    """Path of folder ``name`` directly inside ``root``, or None if the name could reach anywhere else."""
+    if not re.fullmatch(r"[\w][\w.-]*", name or ""):
+        return None
+    root = Path(root).resolve()
+    child = (root / name).resolve()
+    return child if child.parent == root else None
+
+
+def start_dashboard(port, recorder, control, sessions):
+    # The server only listens on 127.0.0.1. Checking Host and Origin as well defeats DNS rebinding:
+    # a web page whose domain is re-pointed to 127.0.0.1 must not be able to read data or trigger actions.
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed_origins = {f"http://{host}" for host in allowed_hosts}
+
     class Handler(BaseHTTPRequestHandler):
+        def _trusted(self):
+            host = (self.headers.get("Host") or "").lower()
+            origin = (self.headers.get("Origin") or "").lower()
+            if host not in allowed_hosts or (origin and origin not in allowed_origins):
+                self.send_error(403, "Requests are accepted from the local dashboard only")
+                return False
+            return True
+
         def _send(self, body, ctype):
             self.send_response(200)
             self.send_header("Content-Type", ctype)
@@ -491,15 +698,121 @@ def start_dashboard(port, recorder):
             self.wfile.write(body)
 
         def do_GET(self):
+            if not self._trusted():
+                return
             path = self.path.split("?")[0]
             if path in ("/", "/index.html"):
                 self._send(DASHBOARD_FILE.read_bytes(), "text/html; charset=utf-8")
             elif path == "/api/state":
-                self._send(json.dumps(recorder.full()).encode(), "application/json")
+                self._send(json.dumps({**recorder.full(), "control": control.state(),
+                                       "session": sessions.state()}).encode(), "application/json")
+            elif path == "/api/loadtests":
+                self._send(json.dumps(control.list_runs()).encode(), "application/json")
+            elif path == "/api/loadtest/details":
+                self._send(json.dumps(control.loadtest_details()).encode(), "application/json")
+            elif path == "/api/sessions":
+                self._send(json.dumps(list_sessions(sessions.root)).encode(), "application/json")
+            elif path.startswith(("/loadtest/", "/sessions/")) and path.endswith("/report.html") and path.count("/") == 3:
+                # Only report.html of a folder directly inside the results or sessions directory is served.
+                root = control.project_dir / "loadtest_results" if path.startswith("/loadtest/") else sessions.root
+                folder = safe_child(root, path.split("/")[2])
+                report = folder / "report.html" if folder else None
+                if report is not None and report.is_file():
+                    self._send(report.read_bytes(), "text/html; charset=utf-8")
+                else:
+                    self.send_error(404)
             elif path == "/api/stream":
                 self._stream()
             else:
                 self.send_error(404)
+
+        def _json_body(self):
+            try:
+                length = max(0, min(int(self.headers.get("Content-Length") or 0), 64 * 1024))
+            except ValueError:
+                return {}
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return {}
+            return body if isinstance(body, dict) else {}
+
+        def do_POST(self):
+            """
+            Actions of the dashboard. Besides the Host/Origin check, a custom header is required: browsers
+            only send it from the dashboard's own origin (other sites would need a CORS preflight, which
+            this server never grants).
+            """
+            if not self._trusted():
+                return
+            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest", "delete"):
+                self.send_error(403)
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/monitor/clear":
+                recorder.clear()
+                session = sessions.current
+                if session is not None:  # "Clear" ends the running session (with report) and starts a new one.
+                    label = session.meta["label"]
+                    sessions.end()
+                    sessions.start(label, recorder.models)
+                self._send(json.dumps({"cleared": True}).encode(), "application/json")
+                return
+            if path == "/api/session/start":
+                label = str(self._json_body().get("label", ""))[:120]
+                self._send(json.dumps(sessions.start(label or "Live test", recorder.models)).encode(),
+                           "application/json")
+                return
+            if path == "/api/session/end":
+                self._send(json.dumps(sessions.end() or {}).encode(), "application/json")
+                return
+            if path == "/api/session/report":
+                self._send(json.dumps(sessions.report_now() or {}).encode(), "application/json")
+                return
+            if path == "/api/loadtest/delete":
+                ok, message = control.delete_run(str(self._json_body().get("run", "")))
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
+                return
+            if path == "/api/session/delete":
+                ok, message = sessions.delete(str(self._json_body().get("folder", "")))
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
+                return
+            if path == "/api/loadtest/start":
+                ok, message = control.launch(self._json_body())
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
+                return
+            if path == "/api/session/build":
+                body = self._json_body()
+                try:
+                    start = datetime.fromisoformat(str(body.get("start"))).timestamp()
+                    end = datetime.fromisoformat(str(body.get("end"))).timestamp()
+                except ValueError:
+                    self._send(json.dumps({"ok": False, "message": "invalid start or end"}).encode(), "application/json")
+                    return
+                if not start < end <= time.time() + 60:
+                    self._send(json.dumps({"ok": False, "message": "the range must lie in the past and end after it starts"}
+                                          ).encode(), "application/json")
+                    return
+                info = build_from_log(sessions.root, str(body.get("label") or "Past session")[:120], start, end,
+                                      recorder.log_files_since(start), recorder.args.out, sessions.host_info,
+                                      recorder.hardware_points())
+                print(f"[monitor] session built from the log: {info['folder']} ({info['counts']['completed']} requests)")
+                self._send(json.dumps({"ok": True, **info}).encode(), "application/json")
+                return
+            if path == "/api/system/stop":
+                started = control.start()
+                self._send(json.dumps({"started": started}).encode(), "application/json")
+                return
+            if path == "/api/requests/dismiss-stalled":
+                removed, what = recorder.parser.dismiss(stalled_only=True), "stalled requests"
+            elif path.startswith("/api/requests/") and path.endswith("/dismiss") and path.split("/")[3].isdigit():
+                seq = int(path.split("/")[3])
+                removed, what = recorder.parser.dismiss(seq=seq), f"request #{seq}"
+            else:
+                self.send_error(404)
+                return
+            print(f"[monitor] removed {removed} {what} from tracking (dashboard)")
+            self._send(json.dumps({"removed": removed}).encode(), "application/json")
 
         def _stream(self):
             """Server-Sent Events: push the latest data point and state once per second."""
@@ -515,6 +828,8 @@ def start_dashboard(port, recorder):
                         seq = recorder.seq
                         msg = {"point": recorder.series[-1] if recorder.series else None,
                                "state": recorder.state, "history_len": len(recorder.history)}
+                    msg["control"] = control.state()
+                    msg["session"] = sessions.state()
                     self.wfile.write(f"data: {json.dumps(msg)}\n\n".encode())
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -543,6 +858,20 @@ def main():
                     help="Send a synthetic probe request every N seconds (0 = disabled)")
     ap.add_argument("--from-start", action="store_true", help="Parse the log from the beginning instead of new lines only")
     ap.add_argument("--no-api", action="store_true", help="Do not query the LM Studio API")
+    ap.add_argument("--anythingllm-url", default="http://localhost:3001",
+                    help="AnythingLLM URL for deleting load-test threads (API key from env ANYTHING_API_KEY)")
+    ap.add_argument("--project-dir", default=str(Path(__file__).resolve().parent),
+                    help="Folder of auto_loadtest.py (status, stop and thread registry files)")
+    ap.add_argument("--session", metavar="LABEL",
+                    help="Start a recording session for a live test right away (or use the dashboard)")
+    ap.add_argument("--keep-hours", type=float, default=4,
+                    help="Hours of per-second data kept for the dashboard (time range \"Max\")")
+    ap.add_argument("--stall-minutes", type=float, default=5,
+                    help="Mark a running request as stalled after N minutes without any log activity")
+    ap.add_argument("--replay-minutes", type=int, default=30,
+                    help="Rebuild the dashboard from the last N minutes of the log on start (0 = off)")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="Print which LM Studio log entry types are recognised (no content) and exit")
     ap.add_argument("--gpu-index", type=int, default=0)
     ap.add_argument("--alert-vram-pct", type=float, default=95.0)
     ap.add_argument("--alert-gpu-temp", type=float, default=85.0)
@@ -552,28 +881,61 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)  # Flush every line, also when redirected to a file.
 
     target = find_log_target(args.log)
+    if args.diagnose:
+        newest = LogFollower(target, None).newest_file() if target and target.exists() else None
+        if newest is None:
+            sys.exit("[monitor] No LM Studio log file found. Pass it with --log PATH.")
+        print("\n".join(diagnose(newest)))
+        return
     if target is None or not target.exists():
         print("[monitor] WARNING: LM Studio log directory not found. Pass it with --log PATH. "
               "Only GPU and API metrics will be collected.")
         target = None
 
-    parser = LogParser(use_log_time=args.from_start)
+    parser = LogParser(use_log_time=args.from_start, stall_after=args.stall_minutes * 60)
     follower = LogFollower(target, parser, from_start=args.from_start) if target else None
-    if follower:
-        follower.start()
     sampler = SystemSampler(interval=1.0, gpu_index=args.gpu_index)
-    sampler.start()
-    if not sampler.gpu_available:
-        print("[monitor] Note: nvidia-smi not found, GPU metrics are unavailable.")
-    recorder = LiveRecorder(parser, sampler, args, follower)
-    recorder.start()
-
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    recorder = LiveRecorder(parser, sampler, args, follower, keep_s=int(args.keep_hours * 3600))
+    recorder.load_history(out_dir)
+    # Sessions are set up before the log replay, so requests made while the monitor was not
+    # running are added to a resumed session.
+    sessions = SessionManager(out_dir, sampler.gpu.info())
+    recorder.sessions = sessions
+    parser.on_request_done = lambda req, status: sessions.current and sessions.current.record_request(req, status)
+    if args.session:
+        if sessions.current:
+            print(f"[monitor] continuing the active session \"{sessions.current.meta['label']}\" "
+                  "(end it in the dashboard to start a new one)")
+        else:
+            sessions.start(args.session)
+    if follower:
+        # Restore the recent past so the dashboard is filled right after a restart.
+        t0 = time.time()
+        replay_window = 0 if args.from_start else args.replay_minutes * 60
+        if sessions.current is not None and not args.from_start:
+            # "Max" covers the whole running session, so rebuild it completely (within the kept range).
+            replay_window = max(replay_window, time.time() - sessions.current.meta["started"])
+        replay_window = min(replay_window, recorder.keep_s)
+        replay_window = max(0, min(replay_window, time.time() - recorder.cleared_at))  # Not before a "Clear".
+        follower.open_initial(replay_window=replay_window, sample=recorder.replay_sample)
+        if replay_window:
+            print(f"[monitor] restored the last {replay_window / 60:.0f} min from the log "
+                  f"({len(parser.recent)} completed requests, {time.time() - t0:.1f}s)")
+        follower.start()
+    sampler.start()
+    gpu = sampler.gpu.info()
+    if sampler.gpu_available:
+        print(f"[monitor] GPU detected: {gpu['gpu_name'] or 'unknown'} ({gpu['gpu_backend']})")
+    else:
+        print("[monitor] Note: no supported GPU metrics source found, GPU fields stay empty.")
+    recorder.start()
 
     if args.dashboard_port:
         try:
-            start_dashboard(args.dashboard_port, recorder)
+            control = LoadTestControl(args.project_dir, args.anythingllm_url, os.environ.get("ANYTHING_API_KEY"))
+            start_dashboard(args.dashboard_port, recorder, control, sessions)
         except OSError as exc:
             sys.exit(f"[monitor] ERROR: cannot bind dashboard to 127.0.0.1:{args.dashboard_port} ({exc.strerror}). "
                      "Is another monitor instance running? Choose a different port with --dashboard-port.")
@@ -601,23 +963,33 @@ def main():
             row["alerts"] = "WARNING: " + ", ".join(alerts) if alerts else ""
             with recorder.cond:
                 recorder.history.append(row)
+            if sessions.current is not None:
+                sessions.current.record_interval(row)
 
             csv_path = out_dir / f"lmstudio_metrics_{now:%Y-%m-%d}.csv"
             new_file = not csv_path.exists()
+            header = list(row.keys()) if new_file else csv_header(csv_path) or list(row.keys())
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(row.keys()), extrasaction="ignore")
+                # An existing file keeps its columns, so rows stay aligned after an update adds metrics.
+                writer = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
                 if new_file:
                     writer.writeheader()
                 writer.writerow(row)
 
             dash = lambda v: "-" if v is None else v
+            mem_label = "GPU mem" if gpu["unified_memory"] else "VRAM"
             print(f"{now:%H:%M:%S}  active {row['active_now']:>2} (max {row['max_active']:>2})  "
                   f"done {row['requests_completed']:>3}  p95 {dash(row['latency_p95_s']):>6}s  "
                   f"tok/s {dash(row['gen_tokens_per_s_total']):>6}  GPU {dash(row['gpu_util_avg']):>5}%  "
-                  f"VRAM {dash(row['vram_pct_max']):>5}%  RAM {dash(row['ram_pct_max']):>5}%  {row['alerts']}")
+                  f"{mem_label} {dash(row['vram_pct_max']):>5}%  RAM {dash(row['ram_pct_max']):>5}%  {row['alerts']}")
     except KeyboardInterrupt:
         print("\n[monitor] stopped.")
     finally:
+        recorder.save_hardware()
+        if sessions.current is not None:
+            sessions.report_now()  # Report so far; the session stays active and resumes on the next start.
+            print(f"[monitor] session \"{sessions.current.meta['label']}\" stays active; "
+                  f"report so far: {sessions.current.folder / 'report.html'}")
         sampler.stop()
         if follower:
             follower.stop()

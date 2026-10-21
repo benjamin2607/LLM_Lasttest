@@ -17,18 +17,25 @@ Example:
 """
 import argparse
 import csv
+import html
 import json
 import math
 import os
+import re
+import signal
+import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from live_session import busy_periods, busy_stats
 from lmstudio_monitor import LMStudioWatcher, find_log_target
+from report_charts import TILE_CSS, count_tile, html_page, line_chart, markdown_to_html, stat_tile, tiles, time_chart
 from system_metrics import SystemSampler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,15 +49,112 @@ def num(value):
         return None
 
 
+REFUSAL_TYPES = ("REFUSAL", "REJECTED")  # Entry types reported by main.py next to the HTTP requests.
+
+
 def read_locust_stats(path):
-    """Return the 'Aggregated' row and the chat endpoint row from a Locust *_stats.csv file."""
+    """
+    Parse a Locust *_stats.csv file. Returns (totals, chat row, refusal counts), where totals
+    sums the HTTP requests only (refusal entries are excluded) and refusal counts maps
+    e.g. "REJECTED http-503" or "REFUSAL no-context" to the number of occurrences.
+    """
     if not path.exists():
-        return None, None
+        return None, None, {}
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    agg = next((r for r in rows if r.get("Name") == "Aggregated"), None)
-    chat = next((r for r in rows if r.get("Name", "").startswith("/thread/chat")), None)
-    return agg, chat
+    http_rows = [r for r in rows if r.get("Name") != "Aggregated" and r.get("Type") not in REFUSAL_TYPES]
+    totals = {"Request Count": sum(int(num(r["Request Count"]) or 0) for r in http_rows),
+              "Failure Count": sum(int(num(r["Failure Count"]) or 0) for r in http_rows)}
+    chat = next((r for r in http_rows if r.get("Name", "").startswith("/thread/chat")), None)
+    refusals = {f"{r['Type']} {r['Name']}": int(num(r["Request Count"]) or 0)
+                for r in rows if r.get("Type") in REFUSAL_TYPES}
+    return totals, chat, refusals
+
+
+PERCENTILE_COLUMNS = ("50%", "66%", "75%", "80%", "90%", "95%", "98%", "99%", "99.9%", "100%")
+
+
+def chat_percentiles(chat):
+    """Response time percentiles of the chat requests (seconds) from a Locust stats row."""
+    if not chat:
+        return None
+    values = {col: num(chat.get(col)) for col in PERCENTILE_COLUMNS}
+    return {col: round(v / 1000, 2) for col, v in values.items() if v is not None} or None
+
+
+def read_history(path):
+    """Per-second history of the chat requests from Locust (users, responses/s, median and p95 in seconds)."""
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.DictReader(f) if r.get("Name", "").startswith("/thread/chat")]
+    out = []
+    for r in rows:
+        t = num(r.get("Timestamp"))
+        if t is None:
+            continue
+        ms = lambda key: round(num(r.get(key)) / 1000, 2) if num(r.get(key)) is not None else None  # noqa: E731
+        out.append({"t": t, "users": num(r.get("User Count")), "rps": num(r.get("Requests/s")),
+                    "median": ms("50%"), "p95": ms("95%")})
+    return out
+
+
+def read_refusal_examples(path):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def color(text, code):
+    """Wrap text in an ANSI color if the console supports it."""
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+if USE_COLOR and os.name == "nt":
+    os.system("")  # Enables ANSI escape sequences in the Windows console.
+
+
+SETUP_HINT = ("Nearly all requests failed at the lowest load. This usually indicates a configuration problem, "
+              "not a capacity limit: check the LLM provider in AnythingLLM. When AnythingLLM runs in Docker, "
+              "LM Studio must be configured as http://host.docker.internal:1234/v1 and "
+              "'Serve on Local Network' must be enabled in LM Studio.")
+
+
+def looks_like_setup_problem(result):
+    chat_total = result["chat_requests"]
+    return result["stage"] == 1 and chat_total > 0 and result["chat_failures"] / chat_total >= 0.9
+
+
+def check_locust():
+    """Exit with a clear message if Locust cannot be run by this Python interpreter."""
+    try:
+        out = subprocess.run([sys.executable, "-m", "locust", "--version"], capture_output=True, text=True, timeout=120)
+        ok = out.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        ok = False
+    if not ok:
+        sys.exit(f"ERROR: Locust cannot be run with this Python interpreter ({sys.executable}).\n"
+                 f"Install it for this interpreter with: \"{sys.executable}\" -m pip install locust")
+
+
+def read_failures(path, limit=5):
+    """Return the most frequent (error, occurrences) pairs from a Locust *_failures.csv file."""
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    rows.sort(key=lambda r: -int(num(r.get("Occurrences")) or 0))
+    return [(r.get("Error", "")[:300], int(num(r.get("Occurrences")) or 0)) for r in rows[:limit]]
+
+
+def log_tail(path, lines=25):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    except OSError:
+        return []
 
 
 def preflight(host):
@@ -81,6 +185,108 @@ def build_levels(args):
     return levels
 
 
+# --- Control by the live monitor's dashboard ---
+STATUS_FILE = BASE_DIR / ".loadtest_status.json"  # Written while a run is active (heartbeat, stage).
+STOP_FILE = BASE_DIR / ".loadtest_stop"            # Created by the dashboard's stop button.
+
+
+def write_status(**fields):
+    """Publish the run's state for the dashboard; written atomically."""
+    try:
+        tmp = STATUS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"pid": os.getpid(), "heartbeat": time.time(), **fields}), encoding="utf-8")
+        os.replace(tmp, STATUS_FILE)
+    except OSError:
+        pass
+
+
+def clear_status():
+    for path in (STATUS_FILE, STATUS_FILE.with_suffix(".tmp")):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def stop_requested():
+    return STOP_FILE.exists()
+
+
+class StatusPublisher(threading.Thread):
+    """Keeps the status file fresh (every 2 s) for as long as the run is active."""
+
+    def __init__(self, run):
+        super().__init__(daemon=True)
+        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time(),
+                       "workspace": os.environ.get("WORKSPACE_SLUG"), "run_started": time.time()}
+        self._stop = threading.Event()
+
+    def update(self, **fields):
+        self.fields.update(fields)
+        write_status(**self.fields)
+
+    def run(self):
+        while not self._stop.is_set():
+            write_status(**self.fields)
+            self._stop.wait(2)
+
+    def close(self):
+        self._stop.set()
+        clear_status()
+
+
+STATUS = None  # StatusPublisher of the current run.
+
+
+def pause(seconds):
+    """Sleep between stages; returns True as soon as a stop is requested from the dashboard."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if stop_requested():
+            return True
+        time.sleep(min(1.0, max(0.0, end - time.time())))
+    return stop_requested()
+
+
+def popen_flags():
+    # A separate process group lets us send Ctrl+Break to Locust on Windows without hitting ourselves.
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+
+
+def stop_locust(proc, grace=15):
+    """Ask Locust to stop (it then writes its statistics); kill it if it does not exit in time."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        proc.wait(timeout=grace)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        proc.kill()
+        proc.wait()
+
+
+def token_stats(requests, span=None):
+    """
+    Average, median, p95 and maximum of the input and output tokens per request (from the LM Studio
+    log), plus the share of the stage with a request in flight and the throughput during that time.
+    """
+    out = {}
+    if span and requests:
+        periods = busy_periods(((r["start"], r["end"]) for r in requests), span)
+        busy = busy_stats(periods, span)
+        out_tokens = sum(r.get("tokens_out") or 0 for r in requests)
+        out.update({"busy_share": busy["busy_share"],
+                    "tokens_per_s_busy": round(out_tokens / busy["busy_s"], 1) if busy["busy_s"] >= 1 else None})
+    for key in ("tokens_in", "tokens_out", "ttft", "tps"):
+        values = sorted(r[key] for r in requests if r.get(key) is not None)
+        if not values:
+            continue
+        out.update({f"{key}_mean": round(sum(values) / len(values), 2), f"{key}_median": round(statistics.median(values), 2),
+                    f"{key}_p95": round(values[max(0, min(len(values) - 1, round(0.95 * len(values)) - 1))], 2),
+                    f"{key}_max": round(values[-1], 2), f"{key}_n": len(values)})
+    return out
+
+
 def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     """Run one Locust stage with ``users`` concurrent users and evaluate it against the limits."""
     prefix = out_dir / f"stage_{idx:02d}_u{users:03d}"
@@ -89,19 +295,38 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
            "--host", args.host, "-u", str(users), "-r", str(args.spawn_rate),
            "-t", f"{ramp + args.stage_duration}s", "--reset-stats",
            "--stop-timeout", str(args.stop_timeout), "--only-summary",
-           "--csv", str(prefix), "--html", f"{prefix}.html", *passthrough]
+           "--csv", str(prefix), "--csv-full-history", "--html", f"{prefix}.html",
+           "--refusal-log", f"{prefix}_refusals.jsonl",
+           "--run-id", f"{out_dir.name}-s{idx:02d}",  # Thread names identify run and stage.
+           *passthrough]
     print(f"\n=== Stage {idx}: {users} users  (ramp-up {ramp}s + {args.stage_duration}s measurement) ===")
 
     sampler.summary(reset=True)
     if watcher:
         watcher.snapshot(reset=True)
     t0 = time.time()
+    stopped = None
+    STATUS.update(stage=idx, users=users, stage_started=t0)
     with open(f"{prefix}.log", "w", encoding="utf-8") as logf:
-        proc = subprocess.run(cmd, cwd=args.locustfile.parent, stdout=logf, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, cwd=args.locustfile.parent, stdout=logf, stderr=subprocess.STDOUT,
+                                **popen_flags())
+        try:
+            while proc.poll() is None:
+                if stop_requested():
+                    stopped = "stopped from the dashboard"
+                    print(color("  !!! STOPPED FROM THE DASHBOARD – stopping Locust now", "1;37;41"))
+                    stop_locust(proc)
+                    break
+                time.sleep(1)
+        except KeyboardInterrupt:
+            stop_locust(proc)
+            raise
+    hardware_timeline = sampler.samples_since(t0)
     sysm = sampler.summary(reset=True)
     lm = watcher.snapshot(reset=True) if watcher else {}
+    tokens = token_stats(watcher.parser.completed_since(t0), (t0, time.time())) if watcher else {}
 
-    agg, chat = read_locust_stats(Path(f"{prefix}_stats.csv"))
+    agg, chat, refusals = read_locust_stats(Path(f"{prefix}_stats.csv"))
     requests = int(num(agg["Request Count"]) or 0) if agg else 0
     failures = int(num(agg["Failure Count"]) or 0) if agg else 0
 
@@ -114,6 +339,9 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "locust_exit": proc.returncode, "requests": requests, "failures": failures,
         "fail_rate": round(failures / requests, 4) if requests else None,
         "chat_requests": int(num(chat["Request Count"]) or 0) if chat else 0,
+        "chat_failures": int(num(chat["Failure Count"]) or 0) if chat else 0,
+        "rejected": sum(n for k, n in refusals.items() if k.startswith("REJECTED")),
+        "refused_no_context": refusals.get("REFUSAL no-context", 0),
         "chat_rps": round(num(chat["Requests/s"]) or 0, 4) if chat else 0,
         "chat_median_s": seconds("Median Response Time"), "chat_avg_s": seconds("Average Response Time"),
         "chat_p95_s": seconds("95%"), "chat_p99_s": seconds("99%"), "chat_max_s": seconds("Max Response Time"),
@@ -121,12 +349,26 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "lm_gen_tokens_per_s": lm.get("gen_tokens_per_s_total"),
         "lm_tokens_per_s_per_request": lm.get("tokens_per_s_per_request_avg"),
         "lm_ttft_p95_s": lm.get("ttft_p95_s"), "lm_max_active": lm.get("max_active"),
-        "lm_completion_tokens": lm.get("completion_tokens"),
+        "lm_completion_tokens": lm.get("completion_tokens"), "lm_prompt_tokens": lm.get("prompt_tokens"),
+        "models": lm.get("models_used") or None,
+        "chat_percentiles": chat_percentiles(chat),
+        "timeline": read_history(Path(f"{prefix}_stats_history.csv")),
+        "hardware_timeline": hardware_timeline,
+        **tokens,
     }
 
-    reasons = []
-    if agg is None:
-        reasons.append("Locust produced no statistics (see .log)")
+    result["refusal_rate"] = (round((result["rejected"] + result["refused_no_context"]) / result["chat_requests"], 4)
+                              if result["chat_requests"] else None)
+    result["refusal_breakdown"] = refusals
+    result["refusal_examples"] = read_refusal_examples(f"{prefix}_refusals.jsonl")
+    result["top_errors"] = read_failures(Path(f"{prefix}_failures.csv"))
+    result["stopped"] = stopped
+    # Without statistics Locust did not run at all: a setup problem, not a capacity limit.
+    result["error"] = None if agg is not None or stopped else "\n".join(log_tail(f"{prefix}.log"))
+
+    reasons = [stopped] if stopped else []
+    if agg is None and not stopped:
+        reasons.append("Locust failed to run (see .log)")
     elif result["chat_requests"] == 0:
         reasons.append("no chat request completed")
     if result["fail_rate"] is not None and result["fail_rate"] > args.max_fail_rate:
@@ -143,16 +385,33 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     print(f"  requests {requests}, failures {failures}, chat p95 {result['chat_p95_s']}s, "
           f"{result['chat_rps']} chat req/s, GPU avg {sysm.get('gpu_util_avg')}%, VRAM max {sysm.get('vram_pct_max')}%"
           + (f", {result['lm_gen_tokens_per_s']} tok/s" if watcher else ""))
-    print("  -> " + ("PASSED" if result["passed"] else "LIMIT REACHED: " + result["reasons"]))
+    if result["error"] is not None:
+        print("  -> LOCUST ERROR (setup problem, not a capacity limit). Last lines of the Locust log:")
+        print("\n".join("     " + line for line in result["error"].splitlines()))
+        return result
+    if refusals:
+        rate = result["refusal_rate"] or 0
+        detail = ", ".join(f"{n}x {k}" for k, n in sorted(refusals.items(), key=lambda kv: -kv[1]))
+        line = f"  !! REFUSALS: {rate:.1%} of chat requests ({detail})"
+        print(color(line, "1;31" if rate >= args.refusal_warn_rate else "1;33"))
+    print("  -> " + ("PASSED" if result["passed"] else "STOPPED" if stopped else "LIMIT REACHED: " + result["reasons"]))
+    for error, count in result["top_errors"][:3]:
+        print(f"     {count}x {error}")
+    if looks_like_setup_problem(result):
+        print(f"     Note: {SETUP_HINT}")
     return result
 
 
-def write_results(out_dir, results, args, last_ok, first_bad, aborted):
+def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop=False):
     """Write results.csv, results.json and the Markdown report."""
     if results:
-        fields = list(results[0].keys())
+        # Union of all keys in stage order: later stages can have fields the first one lacks (e.g. token
+        # statistics when no request completed in stage 1). Nested data stays in results.json only.
+        nested = ("top_errors", "error", "refusal_breakdown", "refusal_examples", "chat_percentiles", "timeline",
+                  "hardware_timeline")
+        fields = list(dict.fromkeys(k for r in results for k in r if k not in nested))
         with open(out_dir / "results.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", restval="")
             writer.writeheader()
             writer.writerows(results)
     (out_dir / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -173,10 +432,22 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
              f"VRAM ≤ {args.max_vram_pct}%, GPU ≤ {args.max_gpu_temp}°C", ""]
     if aborted:
         lines += ["**The test was aborted manually; results are incomplete.**", ""]
+    if user_stop and not any(r.get("stopped") for r in results):
+        lines += ["**The test was stopped from the dashboard between stages; later stages were not run.**", ""]
     lines += ["## Result", ""]
-    if last_ok is None and first_bad is not None:
+    stopped = next((r for r in results if r.get("stopped")), None)
+    if stopped is not None:
+        lines += [f"### ⛔ Stopped from the dashboard at {stopped['users']} users (stage {stopped['stage']})", "",
+                  "Locust was stopped immediately; no further stages were run. Results of this stage cover "
+                  "only the time until the stop.", ""]
+    failed_run = next((r for r in results if r.get("error") is not None), None)
+    if failed_run is not None:
+        lines += [f"**The run stopped at stage {failed_run['stage']} because Locust failed to run. "
+                  "This is a setup problem, not a capacity limit.**", "",
+                  "Last lines of the Locust log:", "", "```", failed_run["error"], "```", ""]
+    if failed_run is None and last_ok is None and first_bad is not None:
         lines.append(f"- A limit was already exceeded at **{first_bad} Locust users**.")
-    elif last_ok is not None:
+    elif failed_run is None and last_ok is not None:
         lines.append(f"- Highest passing stage: **{last_ok} concurrent Locust users**"
                      + (f" (limit at {first_bad})" if first_bad else " (limit not reached; increase --max-users)"))
     if knee:
@@ -188,22 +459,295 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
                      f"({best['chat_rps'] * 60:.1f}/min) at {best['users']} users.")
         lines.append(f"- Estimated real users (Little's law, {args.student_think_time}s think/read time "
                      f"between questions): about **{est:.0f} concurrently active students**.")
+    first_fail = next((r for r in ordered if not r["passed"] and r.get("top_errors")), None)
+    if first_fail is not None:
+        lines += ["", f"Most frequent errors at {first_fail['users']} users:", ""]
+        lines += [f"- {count}× `{error}`" for error, count in first_fail["top_errors"]]
+        if looks_like_setup_problem(first_fail):
+            lines += ["", f"> {SETUP_HINT}"]
+    refusal_stages = [r for r in ordered if r.get("refusal_breakdown")]
+    if refusal_stages:
+        lines += ["", "## ⚠ Refusals", "",
+                  "Requests that were answered with a refusal or rejected by the server, per stage. "
+                  "Technical rejections also count as failures; \"no relevant documents\" refusals count as answered.", "",
+                  "| Users | Chat requests | Rejected (technical) | No relevant documents | Refusal rate |",
+                  "|---:|---:|---:|---:|---:|"]
+        for r in ordered:
+            rate = "-" if r.get("refusal_rate") is None else f"**{r['refusal_rate'] * 100:.1f} %**" \
+                if r["refusal_rate"] >= args.refusal_warn_rate else f"{r['refusal_rate'] * 100:.1f} %"
+            lines.append(f"| {r['users']} | {r['chat_requests']} | {r['rejected']} | {r['refused_no_context']} | {rate} |")
+        rates = [r["refusal_rate"] or 0 for r in ordered]
+        if len(rates) > 1 and rates[-1] > rates[0] + 0.05:
+            lines += ["", f"Refusals increase with load: {rates[0]:.0%} at {ordered[0]['users']} users, "
+                          f"{rates[-1]:.0%} at {ordered[-1]['users']} users."]
+        totals = {}
+        for r in ordered:
+            for key, n in r["refusal_breakdown"].items():
+                totals[key] = totals.get(key, 0) + n
+        lines += ["", "By reason: " + ", ".join(f"`{k}` {n}×" for k, n in sorted(totals.items(), key=lambda kv: -kv[1]))]
+        examples, seen = [], {}
+        for r in ordered:
+            for ex in r.get("refusal_examples", []):
+                if seen.get(ex["category"], 0) < 3:
+                    seen[ex["category"]] = seen.get(ex["category"], 0) + 1
+                    examples.append((r["users"], ex))
+        if examples:
+            lines += ["", "Examples (prompt from prompts.json → start of the response):", ""]
+            for users, ex in examples:
+                response = " ".join(ex["response"].split()).replace("|", "\\|") or "(empty)"
+                thread = f", thread `{ex['thread']}`" if ex.get("thread") else ""
+                lines.append(f"- `{ex['category']}` at {users} users{thread}: „{ex['prompt']}“ → {response}")
+
+    charts_at = len(lines)  # The charts section is inserted here (before the stage table).
     lines += ["", "## Stages", "",
-              "| Users | Requests | Failures % | Chat avg s | Chat p95 s | Chat req/s | GPU avg % | VRAM max % | RAM max % | tok/s | Status |",
-              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+              "| Users | Requests | Failures % | Refusals % | Chat avg s | Chat p95 s | Chat req/s | GPU avg % | VRAM max % | RAM max % | tok/s | Status |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
 
     def cell(v):
         return "-" if v is None else v
 
     for r in ordered:
         fail = "-" if r["fail_rate"] is None else f"{r['fail_rate'] * 100:.1f}"
-        lines.append(f"| {r['users']} | {r['requests']} | {fail} | {cell(r['chat_avg_s'])} | {cell(r['chat_p95_s'])} | "
+        refused = "-" if r.get("refusal_rate") is None else f"{r['refusal_rate'] * 100:.1f}"
+        lines.append(f"| {r['users']} | {r['requests']} | {fail} | {refused} | {cell(r['chat_avg_s'])} | {cell(r['chat_p95_s'])} | "
                      f"{r['chat_rps']} | {cell(r['gpu_util_avg'])} | {cell(r['vram_pct_max'])} | {cell(r['ram_pct_max'])} | "
                      f"{cell(r['lm_gen_tokens_per_s'])} | {'OK' if r['passed'] else r['reasons']} |")
     lines += ["", "Note: Locust users only wait for the configured think time (--wait-min/--wait-max). "
               "Real students send requests less frequently, hence the Little's law estimate above.",
               "Per-stage details: `stage_XX_uYYY.html` (Locust report) and `.log`."]
-    (out_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    charts = build_charts(ordered, args)
+    chart_dir = out_dir / "charts"
+    chart_dir.mkdir(exist_ok=True)
+    md_charts = ["", "## Charts", ""]
+    for name, title, standalone, _ in charts:
+        (chart_dir / f"{name}.svg").write_text(standalone, encoding="utf-8")
+        md_charts.append(f"![{title}](charts/{name}.svg)")
+    md = lines[:charts_at] + (md_charts if charts else []) + lines[charts_at:]
+    (out_dir / "report.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    # report.html is a single self-contained file in the same layout as the live session reports.
+    summary = {"last_ok": last_ok, "first_bad": first_bad, "knee": knee, "best": best, "aborted": aborted,
+               "user_stop": user_stop}
+    (out_dir / "report.html").write_text(html_report(out_dir, ordered, results, args, summary, lines, charts),
+                                         encoding="utf-8")
+
+
+def passthrough_value(args, flag):
+    """Value of ``flag`` among the arguments forwarded to main.py, or None."""
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def html_report(out_dir, ordered, results, args, summary, lines, charts):
+    """Load test report with key figure tiles, statistics tiles, charts and the detailed sections."""
+    last_ok, first_bad, knee, best = summary["last_ok"], summary["first_bad"], summary["knee"], summary["best"]
+    stopped = next((r for r in results if r.get("stopped")), None)
+    failed = next((r for r in results if r.get("error") is not None), None)
+    chat_total = sum(r["chat_requests"] for r in ordered)
+    fail_total = sum(r["chat_failures"] for r in ordered)
+    refused = sum(r["rejected"] + r["refused_no_context"] for r in ordered)
+    # Statistics refer to the operating point that matters in practice: the stage with the highest
+    # stable throughput (otherwise the highest passing stage, otherwise the last stage run).
+    ref = best or next((r for r in reversed(ordered) if r["passed"]), None) or (ordered[-1] if ordered else None)
+
+    if last_ok is not None:
+        limit_note = f"limit at {first_bad} users" if first_bad else "limit not reached – increase the users"
+    else:
+        limit_note = "a limit was exceeded at the first stage" if first_bad else "no stage passed"
+    not_answered = {"failed": fail_total, "rejected": sum(r["rejected"] for r in ordered),
+                    "no relevant documents": sum(r["refused_no_context"] for r in ordered)}
+
+    # --- Result: the capacity of the system ---
+    result_tiles = [
+        count_tile("Highest passing stage", f"{last_ok} users" if last_ok is not None else "–", limit_note),
+        count_tile("Throughput saturation", f"{knee} users" if knee else "not reached",
+                   "more users only add waiting time" if knee else "throughput still grows with users"),
+        count_tile("Max stable throughput", f"{best['chat_rps'] * 60:.1f}/min" if best else "–",
+                   f"{best['chat_rps']:.2f} responses/s at {best['users']} users" if best else ""),
+        count_tile("Estimated students", f"≈ {best['chat_rps'] * (args.student_think_time + (best['chat_avg_s'] or 0)):.0f}"
+                   if best else "–", f"Little's law, {args.student_think_time:g} s between questions"),
+    ]
+
+    at = f" at {ref['users']} users" if ref else ""
+
+    def pick(prefix_or_keys, n=None):
+        """Statistics of the reference stage: either a key prefix (prefix_mean, …) or explicit keys."""
+        keys = ({"mean": f"{prefix_or_keys}_mean", "median": f"{prefix_or_keys}_median", "p95": f"{prefix_or_keys}_p95",
+                 "max": f"{prefix_or_keys}_max"} if isinstance(prefix_or_keys, str) else prefix_or_keys)
+        stats = {k: ref.get(v) for k, v in keys.items()} if ref else {}
+        stats["n"] = n
+        return stats if any(stats.get(k) is not None for k in ("mean", "median", "p95", "max")) else None
+
+    def stat(label, stats, unit):
+        return stat_tile(label + at, stats, unit, note=None if stats.get("n") is not None else "") if stats else ""
+
+    # --- Requests ---
+    request_tiles = [
+        count_tile("Chat requests", f"{chat_total:,}", f"over {len(ordered)} stages"),
+        count_tile("Not answered", f"{sum(not_answered.values()):,}",
+                   ", ".join(f"{n} {k}" for k, n in not_answered.items() if n) or "none"),
+        count_tile("Refusals", f"{refused / chat_total:.1%}" if chat_total else "–",
+                   f"{refused} of {chat_total} (rejected or no relevant documents)" if chat_total else ""),
+    ]
+    if ref and ref.get("lm_max_active") is not None:
+        request_tiles.append(count_tile("Peak concurrency in LM Studio", f"{ref['lm_max_active']:g}",
+                                        f"parallel requests{at}"))
+    if ref and ref.get("busy_share") is not None:
+        request_tiles.append(count_tile("Busy time", f"{ref['busy_share'] * 100:.0f} %",
+                                        f"share of the stage with a request in flight{at}"))
+    if ref and ref.get("models"):
+        names = [m.rsplit(":", 1)[0] for m in ref["models"].split(";")]
+        request_tiles.append(count_tile("Models", str(len(names)), ", ".join(names) + at))
+
+    # --- Response times ---
+    response_tiles = [
+        stat("Response time", pick({"mean": "chat_avg_s", "median": "chat_median_s", "p95": "chat_p95_s",
+                                    "max": "chat_max_s"}, ref["chat_requests"] if ref else None), " s"),
+        stat("First token (LM Studio)", pick("ttft", ref.get("ttft_n") if ref else None), " s"),
+    ]
+
+    # --- Tokens ---
+    token_tiles = []
+    if ref and ref.get("tokens_per_s_busy") is not None:
+        token_tiles.append(count_tile("Throughput while busy", f"{ref['tokens_per_s_busy']:g} tokens/s",
+                                      f"overall {ref.get('lm_gen_tokens_per_s') or '–'} tokens/s{at}"))
+    elif ref and ref.get("lm_gen_tokens_per_s") is not None:
+        token_tiles.append(count_tile("Generated tokens/s", f"{ref['lm_gen_tokens_per_s']:g}", at.strip()))
+    if any(r.get("lm_completion_tokens") for r in ordered):
+        token_tiles.append(count_tile("Generated tokens", f"{sum(r.get('lm_completion_tokens') or 0 for r in ordered):,}",
+                                      f"{sum(r.get('lm_prompt_tokens') or 0 for r in ordered):,} prompt tokens, all stages"))
+    token_tiles += [stat("Tokens in per request", pick("tokens_in", ref.get("tokens_in_n") if ref else None), ""),
+                    stat("Tokens out per request", pick("tokens_out", ref.get("tokens_out_n") if ref else None), ""),
+                    stat("Tokens/s per request", pick("tps", ref.get("tps_n") if ref else None), "")]
+
+    # --- Hardware ---
+    hardware_tiles = [
+        stat("GPU utilisation", pick({"mean": "gpu_util_avg", "median": "gpu_util_median", "p95": "gpu_util_p95",
+                                      "max": "gpu_util_max"}), " %"),
+        stat("GPU memory", pick({"mean": "vram_pct_avg", "median": "vram_pct_median", "p95": "vram_pct_p95",
+                                 "max": "vram_pct_max"}), " %"),
+        stat("System memory", pick({"mean": "ram_pct_avg", "median": "ram_pct_median", "p95": "ram_pct_p95",
+                                    "max": "ram_pct_max"}), " %"),
+        stat("GPU temperature", pick({"mean": "gpu_temp_avg", "median": "gpu_temp_median", "p95": "gpu_temp_p95",
+                                      "max": "gpu_temp_max"}), " °C"),
+    ]
+
+    banners = []
+    if stopped:
+        banners.append(f"Stopped from the dashboard at {stopped['users']} users (stage {stopped['stage']}); "
+                       "no further stages were run.")
+    elif summary["user_stop"]:
+        banners.append("Stopped from the dashboard between stages; later stages were not run.")
+    if summary["aborted"]:
+        banners.append("The test was aborted manually; results are incomplete.")
+    if failed:
+        banners.append(f"Locust failed to run at stage {failed['stage']} – a setup problem, not a capacity limit.")
+    errors = next((r for r in ordered if not r["passed"] and r.get("top_errors")), None)
+
+    gpu = getattr(args, "gpu_name", None)
+    started = datetime.strptime(out_dir.name, "%Y%m%d_%H%M%S") if re.fullmatch(r"\d{8}_\d{6}", out_dir.name) else None
+    body = [f"<h1>Load test {html.escape(out_dir.name)}</h1>",
+            "<p class='meta'>" + " · ".join(html.escape(x) for x in filter(None, [
+                started.strftime("%Y-%m-%d %H:%M") if started else None, args.host,
+                f"mode {passthrough_value(args.passthrough, '--mode') or 'query'}", f"{args.stage_duration} s per stage",
+                gpu])) + "</p>"]
+    body += [f"<div class='banner'>{html.escape(b)}</div>" for b in banners]
+    if failed:
+        body.append(f"<pre>{html.escape(failed['error'])}</pre>")
+
+    def section(title, items, note=None):
+        items = [i for i in items if i]
+        if items:
+            body.append(f"<h2>{html.escape(title)}</h2>" + (f"<p class='meta'>{html.escape(note)}</p>" if note else "")
+                        + tiles(items))
+
+    reference_note = (f"Statistics refer to the stage with the highest stable throughput ({ref['users']} users)."
+                      if ref and ref is best else
+                      f"Statistics refer to stage {ref['stage']} ({ref['users']} users)." if ref else None)
+    section("Result", result_tiles)
+    section("Requests", request_tiles)
+    section("Response times", response_tiles, reference_note)
+    section("Tokens", token_tiles, "Token figures come from the LM Studio log." if token_tiles else None)
+    section("Hardware", hardware_tiles)
+    if errors:
+        body.append(f"<h2>Most frequent errors at {errors['users']} users</h2><ul>"
+                    + "".join(f"<li>{n}× <code>{html.escape(e)}</code></li>" for e, n in errors["top_errors"]) + "</ul>")
+        if looks_like_setup_problem(errors):
+            body.append(f"<blockquote>{html.escape(SETUP_HINT)}</blockquote>")
+    if charts:
+        body.append("<h2>Charts by load</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for *_, svg in charts)
+                    + "</div>")
+    over_time = time_charts(ordered, ref)
+    if over_time:
+        body.append("<h2>Charts over time</h2><div class='charts'>" + "".join(f"<figure>{svg}</figure>" for svg in over_time)
+                    + "</div>")
+    # Detailed sections from the Markdown report (refusals, stage table, notes); the result summary is in the tiles.
+    rest = next((i for i, line in enumerate(lines) if line.startswith("## ") and not line.startswith("## Result")), len(lines))
+    body.append(markdown_to_html("\n".join(lines[rest:])))
+    return html_page(f"Load test {out_dir.name}", TILE_CSS + "\n".join(body))
+
+
+def time_charts(ordered, ref):
+    """Charts over the whole run: users and responses/s, response times, hardware; percentiles of the reference stage."""
+    # Stages in run order; a gap point between stages keeps the pause from being drawn as a line.
+    runs = sorted(ordered, key=lambda r: r["stage"])
+    timeline, hardware = [], []
+    for r in runs:
+        if timeline and r.get("timeline"):
+            timeline.append({"t": timeline[-1]["t"] + 1, "users": None, "rps": None, "median": None, "p95": None})
+        timeline += r.get("timeline") or []
+        if hardware and r.get("hardware_timeline"):
+            hardware.append({"ts": hardware[-1]["ts"] + 1})
+        hardware += r.get("hardware_timeline") or []
+    charts = []
+    if timeline:
+        t = [p["t"] for p in timeline]
+        charts.append(time_chart("Simulated users over time", t, [("users", [p["users"] for p in timeline])]))
+        charts.append(time_chart("Chat responses per second over time", t, [("responses/s", [p["rps"] for p in timeline])],
+                                 unit="/s"))
+        charts.append(time_chart("Chat response time over time", t, [("median", [p["median"] for p in timeline]),
+                                                                     ("p95", [p["p95"] for p in timeline])], unit=" s"))
+    if hardware and any(p.get("gpu_util") is not None for p in hardware):
+        charts.append(time_chart("GPU utilisation and memory over time", [p["ts"] for p in hardware],
+                                 [("GPU utilisation", [p.get("gpu_util") for p in hardware]),
+                                  ("GPU memory", [p.get("vram_pct") for p in hardware])], unit=" %", y_max=100))
+    if ref and ref.get("chat_percentiles"):
+        pct = ref["chat_percentiles"]
+        charts.append(line_chart(f"Response time percentiles at {ref['users']} users", list(pct.keys()),
+                                 [("response time", list(pct.values()))], unit=" s", x_title="share of requests faster than",
+                                 standalone=False))
+    return charts
+
+
+def build_charts(ordered, args):
+    """Charts over the stages: (file name, title, standalone SVG, SVG for inline use)."""
+    if not ordered:
+        return []
+    labels = [r["users"] for r in ordered]
+    col = lambda key, factor=1: [None if r.get(key) is None else r[key] * factor for r in ordered]  # noqa: E731
+    specs = [
+        ("response_time", "Response time per chat request", [("average", col("chat_avg_s")), ("p95", col("chat_p95_s"))],
+         " s", None, (args.max_p95, "p95 limit")),
+        ("throughput", "Throughput: chat responses per second", [("responses/s", col("chat_rps"))], "/s", None, None),
+        ("tokens", "Generated tokens per second (LM Studio)", [("tokens/s", col("lm_gen_tokens_per_s"))], "", None, None),
+        ("failures", "Failure and refusal rate", [("failures", col("fail_rate", 100)), ("refusals", col("refusal_rate", 100))],
+         " %", None, (args.max_fail_rate * 100, "failure limit")),
+        ("gpu", "GPU utilisation and memory", [("GPU utilisation (avg)", col("gpu_util_avg")),
+                                               ("GPU memory (max)", col("vram_pct_max"))], " %", 100, None),
+        ("system_memory", "System memory (max)", [("system memory", col("ram_pct_max"))], " %", 100, None),
+    ]
+    charts = []
+    for name, title, series, unit, y_max, limit in specs:
+        series = [(label, vals) for label, vals in series if any(v is not None for v in vals)]
+        if not series:
+            continue  # E.g. no GPU metrics or no LM Studio log on this machine.
+        kwargs = dict(unit=unit, x_title="concurrent users", y_max=y_max, limit=limit)
+        charts.append((name, title, line_chart(title, labels, series, **kwargs),
+                       line_chart(title, labels, series, standalone=False, **kwargs)))
+    return charts
 
 
 def main():
@@ -224,6 +768,8 @@ def main():
     ap.add_argument("--max-p95", type=float, default=120.0, help="Maximum p95 chat response time in seconds")
     ap.add_argument("--max-vram-pct", type=float, default=98.0)
     ap.add_argument("--max-gpu-temp", type=float, default=88.0)
+    ap.add_argument("--refusal-warn-rate", type=float, default=0.10,
+                    help="Refusal rate from which refusals are highlighted in red (they never fail a stage)")
     ap.add_argument("--refine", action="store_true",
                     help="Bisect between the last passing and the first failing stage to find the exact limit")
     ap.add_argument("--student-think-time", type=float, default=90.0,
@@ -242,6 +788,7 @@ def main():
     print(f"Planned stages: {levels}  (up to ~{est / 60:.0f} min, excluding --refine)")
     if args.dry_run:
         return
+    check_locust()
     if not args.skip_preflight:
         preflight(args.host)
 
@@ -254,8 +801,17 @@ def main():
 
     sampler = SystemSampler()
     sampler.start()
+    args.gpu_name = sampler.gpu.info().get("gpu_name")
+    global STATUS
+    if stop_requested():
+        STOP_FILE.unlink()  # A stop request from an earlier run must not end this one.
+    STATUS = StatusPublisher(out_dir.name)
+    STATUS.start()
+    print("Stop at any time with the \"Stop & delete threads\" button in the live monitor's dashboard.")
     if not sampler.gpu_available:
-        print("Note: nvidia-smi not found, GPU limits will not be checked.")
+        print("Note: no supported GPU metrics source found, GPU limits will not be checked.")
+    elif sampler.gpu.backend == "apple":
+        print("Note: GPU temperature is not available on macOS without sudo, the temperature limit is skipped.")
     watcher = None
     if args.lmstudio_log != "off":
         target = find_log_target(None if args.lmstudio_log == "auto" else args.lmstudio_log)
@@ -264,25 +820,37 @@ def main():
         else:
             print("Note: LM Studio log not found, no tokens/s metrics (use --lmstudio-log PATH).")
 
-    results, last_ok, first_bad, aborted = [], None, None, False
+    results, last_ok, first_bad, aborted, user_stop = [], None, None, False, False
     try:
         for users in levels:
             r = run_stage(len(results) + 1, users, args, args.passthrough, out_dir, sampler, watcher)
             results.append(r)
             write_results(out_dir, results, args, last_ok, first_bad, False)
+            if r["error"] is not None:
+                break  # Setup problem: further stages would fail the same way.
+            if r["stopped"]:
+                user_stop = True
+                break  # Stopped from the dashboard: no further stages, no refinement.
             if not r["passed"]:
                 first_bad = users
                 break
             last_ok = users
-            time.sleep(args.cooldown)
+            if pause(args.cooldown):
+                user_stop = True
+                break
 
-        if args.refine and first_bad is not None:
+        if args.refine and first_bad is not None and not user_stop:
             lo, hi = (last_ok or 0), first_bad
             while hi - lo > 1:
-                time.sleep(args.cooldown)
+                if pause(args.cooldown):
+                    user_stop = True
+                    break
                 mid = (lo + hi) // 2
                 r = run_stage(len(results) + 1, mid, args, args.passthrough, out_dir, sampler, watcher)
                 results.append(r)
+                if r["stopped"]:
+                    user_stop = True
+                    break
                 lo, hi = (mid, hi) if r["passed"] else (lo, mid)
                 write_results(out_dir, results, args, lo or None, hi, False)
             last_ok, first_bad = (lo or None), hi
@@ -290,10 +858,11 @@ def main():
         aborted = True
         print("\nAborted, writing partial results ...")
     finally:
+        STATUS.close()
         sampler.stop()
         if watcher:
             watcher.stop()
-        write_results(out_dir, results, args, last_ok, first_bad, aborted)
+        write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop)
         print(f"\nReport: {out_dir / 'report.md'}")
 
 

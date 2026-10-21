@@ -1,17 +1,17 @@
 # Manual Locust run
 
-## Campus workstation
+Requires `ANYTHING_API_KEY` and `WORKSPACE_SLUG` (see [PARAMETERS.md](PARAMETERS.md#1-environment-variables)).
+
 ```bash
 python -m locust -f main.py --host http://localhost:3001
 ```
 
-### Options
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `--wait-min` | float | 5.0 | Minimum think time in seconds |
-| `--wait-max` | float | 15.0 | Maximum think time in seconds |
-| `--mode` | `query` \| `chat` | `query` | `query` = answer from workspace documents only (RAG), `chat` = regular chat |
-| `--request-timeout` | float | 300.0 | Timeout per request in seconds |
-| `--messages-per-thread` | int | 5 | Start a new thread after this many messages (0 = never) |
+With the Locust web UI (http://localhost:8089) you choose the number of users and start the test
+yourself. Options for the simulated users are passed on the same command line, e.g.:
 
-For automated capacity testing see `auto_loadtest.py` in the README.
+```bash
+python -m locust -f main.py --host http://localhost:3001 --mode chat --wait-min 10 --wait-max 30
+```
+
+All options of `main.py` are described in [PARAMETERS.md](PARAMETERS.md#3-simulated-users--mainpy).
+For automated capacity testing use `auto_loadtest.py` (see the README).
