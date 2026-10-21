@@ -65,6 +65,30 @@ many *real* students the system can serve, using Little's law with
 
 Tip: run once with `--mode query` and once with `--mode chat`; for overnight runs, choose a generous `--users` list.
 
+### Threads
+
+Every question is asked in its own AnythingLLM thread (`--messages-per-thread 1`), so
+requests share no chat history and run in parallel. Threads are named traceably as
+`Loadtest <run>-s<stage> u<user> #<seq>`, e.g. `Loadtest 20261021-160853-s02 u003 #0007`
+(stage 2, simulated user 3, seventh question), and deleted as soon as their answer has been
+received and recorded. Pass `-- --keep-threads` to keep them for inspection in AnythingLLM.
+The thread identifier also appears in the refusal examples of the report.
+
+### Refusals
+
+Refusals are counted separately and highlighted in the console (yellow, red from
+`--refusal-warn-rate`, default 10 %) and in a dedicated "⚠ Refusals" section of the report
+(per stage, trend under load, examples with prompt, thread and start of the response):
+
+| Category | Detection | Counts as |
+|---|---|---|
+| `REJECTED http-<status>` / `timeout` / `connection-error` | HTTP status ≠ 200 or no response | failure |
+| `REJECTED error-response` | `error` field in the AnythingLLM response | failure |
+| `REFUSAL no-context` | Query mode: AnythingLLM's refusal response with no sources (no relevant documents found) | answered |
+
+If the workspace uses a custom query refusal response, pass it with `-- --refusal-text "..."`.
+Refusals never fail a stage on their own.
+
 ## 2. Live monitoring in production
 
 ```bash
@@ -117,7 +141,8 @@ Accuracy:
   Completion tokens come from the engine's final timing entry or are extrapolated from its
   progress reports (≈). Several loaded models are told apart by their engine process.
 - A request that LM Studio announces but never starts (for example, rejected while a model
-  loads on demand) is dropped after 120 s.
+  loads on demand) is dropped after 120 s and shown as "rejected" in the dashboard. The monitor
+  does not analyse response content, so refusals in the answers of real users are not evaluated.
 
 ### Troubleshooting
 

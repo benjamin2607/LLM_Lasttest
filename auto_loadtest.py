@@ -42,15 +42,44 @@ def num(value):
         return None
 
 
+REFUSAL_TYPES = ("REFUSAL", "REJECTED")  # Entry types reported by main.py next to the HTTP requests.
+
+
 def read_locust_stats(path):
-    """Return the 'Aggregated' row and the chat endpoint row from a Locust *_stats.csv file."""
+    """
+    Parse a Locust *_stats.csv file. Returns (totals, chat row, refusal counts), where totals
+    sums the HTTP requests only (refusal entries are excluded) and refusal counts maps
+    e.g. "REJECTED http-503" or "REFUSAL no-context" to the number of occurrences.
+    """
     if not path.exists():
-        return None, None
+        return None, None, {}
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    agg = next((r for r in rows if r.get("Name") == "Aggregated"), None)
-    chat = next((r for r in rows if r.get("Name", "").startswith("/thread/chat")), None)
-    return agg, chat
+    http_rows = [r for r in rows if r.get("Name") != "Aggregated" and r.get("Type") not in REFUSAL_TYPES]
+    totals = {"Request Count": sum(int(num(r["Request Count"]) or 0) for r in http_rows),
+              "Failure Count": sum(int(num(r["Failure Count"]) or 0) for r in http_rows)}
+    chat = next((r for r in http_rows if r.get("Name", "").startswith("/thread/chat")), None)
+    refusals = {f"{r['Type']} {r['Name']}": int(num(r["Request Count"]) or 0)
+                for r in rows if r.get("Type") in REFUSAL_TYPES}
+    return totals, chat, refusals
+
+
+def read_refusal_examples(path):
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def color(text, code):
+    """Wrap text in an ANSI color if the console supports it."""
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+if USE_COLOR and os.name == "nt":
+    os.system("")  # Enables ANSI escape sequences in the Windows console.
 
 
 SETUP_HINT = ("Nearly all requests failed at the lowest load. This usually indicates a configuration problem, "
@@ -129,7 +158,10 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
            "--host", args.host, "-u", str(users), "-r", str(args.spawn_rate),
            "-t", f"{ramp + args.stage_duration}s", "--reset-stats",
            "--stop-timeout", str(args.stop_timeout), "--only-summary",
-           "--csv", str(prefix), "--html", f"{prefix}.html", *passthrough]
+           "--csv", str(prefix), "--html", f"{prefix}.html",
+           "--refusal-log", f"{prefix}_refusals.jsonl",
+           "--run-id", f"{out_dir.name}-s{idx:02d}",  # Thread names identify run and stage.
+           *passthrough]
     print(f"\n=== Stage {idx}: {users} users  (ramp-up {ramp}s + {args.stage_duration}s measurement) ===")
 
     sampler.summary(reset=True)
@@ -141,7 +173,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     sysm = sampler.summary(reset=True)
     lm = watcher.snapshot(reset=True) if watcher else {}
 
-    agg, chat = read_locust_stats(Path(f"{prefix}_stats.csv"))
+    agg, chat, refusals = read_locust_stats(Path(f"{prefix}_stats.csv"))
     requests = int(num(agg["Request Count"]) or 0) if agg else 0
     failures = int(num(agg["Failure Count"]) or 0) if agg else 0
 
@@ -155,6 +187,8 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "fail_rate": round(failures / requests, 4) if requests else None,
         "chat_requests": int(num(chat["Request Count"]) or 0) if chat else 0,
         "chat_failures": int(num(chat["Failure Count"]) or 0) if chat else 0,
+        "rejected": sum(n for k, n in refusals.items() if k.startswith("REJECTED")),
+        "refused_no_context": refusals.get("REFUSAL no-context", 0),
         "chat_rps": round(num(chat["Requests/s"]) or 0, 4) if chat else 0,
         "chat_median_s": seconds("Median Response Time"), "chat_avg_s": seconds("Average Response Time"),
         "chat_p95_s": seconds("95%"), "chat_p99_s": seconds("99%"), "chat_max_s": seconds("Max Response Time"),
@@ -165,6 +199,10 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "lm_completion_tokens": lm.get("completion_tokens"),
     }
 
+    result["refusal_rate"] = (round((result["rejected"] + result["refused_no_context"]) / result["chat_requests"], 4)
+                              if result["chat_requests"] else None)
+    result["refusal_breakdown"] = refusals
+    result["refusal_examples"] = read_refusal_examples(f"{prefix}_refusals.jsonl")
     result["top_errors"] = read_failures(Path(f"{prefix}_failures.csv"))
     # Without statistics Locust did not run at all: a setup problem, not a capacity limit.
     result["error"] = None if agg is not None else "\n".join(log_tail(f"{prefix}.log"))
@@ -192,6 +230,11 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         print("  -> LOCUST ERROR (setup problem, not a capacity limit). Last lines of the Locust log:")
         print("\n".join("     " + line for line in result["error"].splitlines()))
         return result
+    if refusals:
+        rate = result["refusal_rate"] or 0
+        detail = ", ".join(f"{n}x {k}" for k, n in sorted(refusals.items(), key=lambda kv: -kv[1]))
+        line = f"  !! REFUSALS: {rate:.1%} of chat requests ({detail})"
+        print(color(line, "1;31" if rate >= args.refusal_warn_rate else "1;33"))
     print("  -> " + ("PASSED" if result["passed"] else "LIMIT REACHED: " + result["reasons"]))
     for error, count in result["top_errors"][:3]:
         print(f"     {count}x {error}")
@@ -203,7 +246,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
 def write_results(out_dir, results, args, last_ok, first_bad, aborted):
     """Write results.csv, results.json and the Markdown report."""
     if results:
-        fields = [k for k in results[0] if k not in ("top_errors", "error")]
+        fields = [k for k in results[0] if k not in ("top_errors", "error", "refusal_breakdown", "refusal_examples")]
         with open(out_dir / "results.csv", "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
@@ -252,16 +295,50 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
         lines += [f"- {count}× `{error}`" for error, count in first_fail["top_errors"]]
         if looks_like_setup_problem(first_fail):
             lines += ["", f"> {SETUP_HINT}"]
+    refusal_stages = [r for r in ordered if r.get("refusal_breakdown")]
+    if refusal_stages:
+        lines += ["", "## ⚠ Refusals", "",
+                  "Requests that were answered with a refusal or rejected by the server, per stage. "
+                  "Technical rejections also count as failures; \"no relevant documents\" refusals count as answered.", "",
+                  "| Users | Chat requests | Rejected (technical) | No relevant documents | Refusal rate |",
+                  "|---:|---:|---:|---:|---:|"]
+        for r in ordered:
+            rate = "-" if r.get("refusal_rate") is None else f"**{r['refusal_rate'] * 100:.1f} %**" \
+                if r["refusal_rate"] >= args.refusal_warn_rate else f"{r['refusal_rate'] * 100:.1f} %"
+            lines.append(f"| {r['users']} | {r['chat_requests']} | {r['rejected']} | {r['refused_no_context']} | {rate} |")
+        rates = [r["refusal_rate"] or 0 for r in ordered]
+        if len(rates) > 1 and rates[-1] > rates[0] + 0.05:
+            lines += ["", f"Refusals increase with load: {rates[0]:.0%} at {ordered[0]['users']} users, "
+                          f"{rates[-1]:.0%} at {ordered[-1]['users']} users."]
+        totals = {}
+        for r in ordered:
+            for key, n in r["refusal_breakdown"].items():
+                totals[key] = totals.get(key, 0) + n
+        lines += ["", "By reason: " + ", ".join(f"`{k}` {n}×" for k, n in sorted(totals.items(), key=lambda kv: -kv[1]))]
+        examples, seen = [], {}
+        for r in ordered:
+            for ex in r.get("refusal_examples", []):
+                if seen.get(ex["category"], 0) < 3:
+                    seen[ex["category"]] = seen.get(ex["category"], 0) + 1
+                    examples.append((r["users"], ex))
+        if examples:
+            lines += ["", "Examples (prompt from prompts.json → start of the response):", ""]
+            for users, ex in examples:
+                response = " ".join(ex["response"].split()).replace("|", "\\|") or "(empty)"
+                thread = f", thread `{ex['thread']}`" if ex.get("thread") else ""
+                lines.append(f"- `{ex['category']}` at {users} users{thread}: „{ex['prompt']}“ → {response}")
+
     lines += ["", "## Stages", "",
-              "| Users | Requests | Failures % | Chat avg s | Chat p95 s | Chat req/s | GPU avg % | VRAM max % | RAM max % | tok/s | Status |",
-              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+              "| Users | Requests | Failures % | Refusals % | Chat avg s | Chat p95 s | Chat req/s | GPU avg % | VRAM max % | RAM max % | tok/s | Status |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
 
     def cell(v):
         return "-" if v is None else v
 
     for r in ordered:
         fail = "-" if r["fail_rate"] is None else f"{r['fail_rate'] * 100:.1f}"
-        lines.append(f"| {r['users']} | {r['requests']} | {fail} | {cell(r['chat_avg_s'])} | {cell(r['chat_p95_s'])} | "
+        refused = "-" if r.get("refusal_rate") is None else f"{r['refusal_rate'] * 100:.1f}"
+        lines.append(f"| {r['users']} | {r['requests']} | {fail} | {refused} | {cell(r['chat_avg_s'])} | {cell(r['chat_p95_s'])} | "
                      f"{r['chat_rps']} | {cell(r['gpu_util_avg'])} | {cell(r['vram_pct_max'])} | {cell(r['ram_pct_max'])} | "
                      f"{cell(r['lm_gen_tokens_per_s'])} | {'OK' if r['passed'] else r['reasons']} |")
     lines += ["", "Note: Locust users only wait for the configured think time (--wait-min/--wait-max). "
@@ -288,6 +365,8 @@ def main():
     ap.add_argument("--max-p95", type=float, default=120.0, help="Maximum p95 chat response time in seconds")
     ap.add_argument("--max-vram-pct", type=float, default=98.0)
     ap.add_argument("--max-gpu-temp", type=float, default=88.0)
+    ap.add_argument("--refusal-warn-rate", type=float, default=0.10,
+                    help="Refusal rate from which refusals are highlighted in red (they never fail a stage)")
     ap.add_argument("--refine", action="store_true",
                     help="Bisect between the last passing and the first failing stage to find the exact limit")
     ap.add_argument("--student-think-time", type=float, default=90.0,

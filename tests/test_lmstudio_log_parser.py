@@ -176,6 +176,7 @@ class ApiEdgeCaseTests(unittest.TestCase):
         h.clock.advance(h.parser.dispatch_timeout)
         self.assertEqual(h.parser.live()["active"], 0)
         self.assertEqual(h.parser.snapshot()["stale_requests"], 1)
+        self.assertEqual(h.parser.totals["rejected"], 1)
 
 
 class NonStreamingApiTests(unittest.TestCase):

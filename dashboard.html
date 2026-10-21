@@ -385,7 +385,10 @@ function render() {
   $("kP95Sub").innerHTML = (s.latency_avg_s != null ? `Ø ${fmt(s.latency_avg_s, 1)} s · ` : "") + "last 5 min " + (p95st && p95st !== "good" ? statusHtml(p95st) : "");
   $("kTtft").innerHTML = s.ttft_p95_s != null ? `${fmt(s.ttft_p95_s, 1)}<small>s</small>` : "–";
   $("kTotal").textContent = fmt(tot.completed);
-  $("kTotalSub").textContent = `${fmt(tot.completion_tokens)} tokens generated · ${fmt(tot.errors)} errors` + (s.monitor_started ? ` · since ${new Date(s.monitor_started * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}` : "");
+  // Rejected requests (announced but never started by LM Studio) are highlighted with an icon and label.
+  const rejected = tot.rejected || 0;
+  $("kTotalSub").innerHTML = (rejected ? `<span class="status" style="color:var(--text)"><span style="color:var(--critical)">⚠</span>${fmt(rejected)} rejected</span> · ` : "")
+    + `${fmt(tot.completion_tokens)} tokens generated · ${fmt(tot.errors)} errors` + (s.monitor_started ? ` · since ${new Date(s.monitor_started * 1000).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}` : "");
 
   setChip("chipApi", s.api_ok === true ? "good" : s.api_ok === false ? "bad" : "", s.api_ok === true ? "LM Studio online" : s.api_ok === false ? "LM Studio offline" : "API not queried");
   const la = s.log_age_s;

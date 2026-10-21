@@ -138,7 +138,7 @@ class LogParser:
         self.signals = Counter()          # Recognised entry types (for diagnostics; no content).
         self.token_events = deque(maxlen=200_000)  # (time, tokens) as tokens are generated.
         self.recent = deque(maxlen=500)   # Completed requests (numeric fields only).
-        self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0,
+        self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "rejected": 0,
                        "prompt_tokens": 0, "completion_tokens": 0}
         self._seq = 0
         self._new_window()
@@ -542,6 +542,8 @@ class LogParser:
             return never_started and now - r["start"] > self.dispatch_timeout
 
         for req in [r for r in self.open if expired(r)]:
+            if now - req["start"] <= self.stale_after:
+                self.totals["rejected"] += 1  # Never dispatched: rejected by LM Studio.
             self.open.remove(req)  # E.g. an aborted request that never logged a completion entry.
             if req in self.api_pending:
                 self.api_pending.remove(req)
