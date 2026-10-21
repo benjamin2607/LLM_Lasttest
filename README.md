@@ -10,7 +10,7 @@ Everything runs locally; no data leaves the machine.
 2. `python lmstudio_monitor.py` – opens the live dashboard at `http://127.0.0.1:8765`
 3. Set `ANYTHING_API_KEY` and `WORKSPACE_SLUG`, then `python auto_loadtest.py --users 1,2,4,8,16` – or start a load test from the dashboard
 
-All options with descriptions and guideline values: **[PARAMETERS.md](PARAMETERS.md)**.
+Step-by-step guide for the first run: **[QUICKSTART.md](QUICKSTART.md)**. All options with descriptions and guideline values: **[PARAMETERS.md](PARAMETERS.md)**.
 
 | File | Purpose |
 |---|---|
@@ -24,6 +24,7 @@ All options with descriptions and guideline values: **[PARAMETERS.md](PARAMETERS
 | `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
 | `prompts.json` | Questions sent by the simulated users |
 | `tests/` | Unit tests for the log parser and the live sessions |
+| `QUICKSTART.md` | Step-by-step guide: install, monitor, first load test, live session |
 | `PARAMETERS.md` | Reference of all options and environment variables with guideline values |
 
 No additional packages are required beyond `locust` (which ships `psutil`) and
