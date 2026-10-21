@@ -138,7 +138,7 @@ class LogParser:
         self.signals = Counter()          # Recognised entry types (for diagnostics; no content).
         self.token_events = deque(maxlen=200_000)  # (time, tokens) as tokens are generated.
         self.recent = deque(maxlen=500)   # Completed requests (numeric fields only).
-        self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "rejected": 0,
+        self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "rejected": 0, "failed": 0,
                        "prompt_tokens": 0, "completion_tokens": 0}
         self._seq = 0
         self._new_window()
@@ -146,7 +146,7 @@ class LogParser:
     # ------------------------------------------------------------------ helpers
     def _new_window(self):
         self.w_start = self.last_ts if self.use_log_time else self.clock()
-        self.w = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "stale": 0,
+        self.w = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "stale": 0, "failed": 0,
                   "max_active": len(self.open), "latencies": [], "ttfts": [], "tps": [],
                   "prompt_tokens": 0, "completion_tokens": 0, "models": {}}
 
@@ -270,6 +270,27 @@ class LogParser:
         if lvl and lvl.group(1) == "ERROR":
             self.signals["errors"] += 1
             self._inc("errors")
+            tag = model_tag(line.replace("[ERROR]", "[INFO]", 1))
+            if tag:
+                self._abort_oldest(tag)
+
+    def _abort_oldest(self, model):
+        """
+        An ERROR entry tagged with a model (e.g. "Model unloaded by user or API request") ends one
+        of its requests without an answer: close the oldest open one as failed. Failed requests do
+        not count as completed and are excluded from latency statistics.
+        """
+        req = next((r for r in self.open if r.get("model") == model), None)
+        if req is None:
+            return
+        self.open.remove(req)
+        if req in self.api_pending:
+            self.api_pending.remove(req)
+        self.by_task.pop(req.get("task"), None)
+        self.by_cid.pop(req.get("cid"), None)
+        req["failed"] = True
+        self.w["failed"] += 1
+        self.totals["failed"] += 1
 
     def _pop_api_pending(self, prefer_streamed):
         """
@@ -551,6 +572,53 @@ class LogParser:
             self.by_cid.pop(req.get("cid"), None)
             self.w["stale"] += 1
 
+    def replay(self, lines, since, until, sample=None):
+        """
+        Rebuild the recent state from earlier log lines, e.g. after the monitor restarts.
+
+        Entries from ``since`` (epoch seconds) onwards are processed in log time. ``sample``
+        is called once per second from ``since`` to ``until`` with that second, while the
+        parser's clock is set to it, so the caller can record a data point via :meth:`live`.
+        Afterwards the parser continues in wall-clock time; the totals and the aggregation
+        window start fresh, so CSV rows and "since start" counters cover new data only.
+        """
+        live_clock, cursor = self.clock, int(since)
+        self.use_log_time, self.clock = True, (lambda: self._replay_now)
+        self._replay_now = float(cursor)
+
+        def advance(to):
+            nonlocal cursor
+            while cursor < to:
+                self._replay_now = float(cursor)
+                if sample is not None:
+                    sample(cursor)
+                cursor += 1
+
+        started = False
+        for line in lines:
+            ts = TS_RE.match(line)
+            if ts:
+                try:
+                    t = datetime.strptime(ts.group(1).replace("T", " "), "%Y-%m-%d %H:%M:%S").timestamp()
+                except ValueError:
+                    t = None
+                if t is not None:
+                    if t < since:
+                        started = False
+                        continue
+                    started = True
+                    advance(int(t))
+                    self._replay_now = t
+            if started:
+                self.feed(line)
+        advance(int(until) + 1)
+
+        self.clock, self.use_log_time = live_clock, False
+        with self.lock:
+            self.last_line_wall = None
+            self.totals = {k: 0 for k in self.totals}
+            self._new_window()
+
     def prime_engines(self, lines):
         """
         Learn which model each running engine process serves from earlier "loading model" entries,
@@ -643,7 +711,7 @@ class LogParser:
             snap = {
                 "requests_started": w["started"], "requests_completed": w["completed"],
                 "embedding_requests": w["embeddings"], "log_errors": w["errors"],
-                "stale_requests": w["stale"], "active_now": len(self.open),
+                "stale_requests": w["stale"], "failed_requests": w["failed"], "active_now": len(self.open),
                 "max_active": max(w["max_active"], len(self.open)),
                 "latency_avg_s": rnd(statistics.fmean(lat)) if lat else None,
                 "latency_p95_s": rnd(pct(lat, 95)),

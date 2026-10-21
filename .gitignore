@@ -5,3 +5,6 @@ __pycache__/
 loadtest_results/
 lasttest_results/
 monitoring/
+.loadtest_threads.json
+.loadtest_threads.tmp
+docker-diagnose.txt

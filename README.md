@@ -70,9 +70,14 @@ Tip: run once with `--mode query` and once with `--mode chat`; for overnight run
 Every question is asked in its own AnythingLLM thread (`--messages-per-thread 1`), so
 requests share no chat history and run in parallel. Threads are named traceably as
 `Loadtest <run>-s<stage> u<user> #<seq>`, e.g. `Loadtest 20261021-160853-s02 u003 #0007`
-(stage 2, simulated user 3, seventh question), and deleted as soon as their answer has been
-received and recorded. Pass `-- --keep-threads` to keep them for inspection in AnythingLLM.
-The thread identifier also appears in the refusal examples of the report.
+(stage 2, simulated user 3, seventh question). The thread identifier also appears in the
+refusal examples of the report.
+
+Threads are kept so the chats can be inspected in AnythingLLM, but at most 30 per workspace
+(`-- --max-threads N`, `0` = keep all). Beyond the limit, the oldest finished load-test threads
+are deleted first (FIFO). The load test records the threads it created in
+`.loadtest_threads.json`, so the limit holds across stages and runs; threads it did not
+create are never deleted, and neither are threads that are still waiting for an answer.
 
 ### Refusals
 
@@ -115,6 +120,13 @@ monitor writes one line per interval to stdout and to
 - `--probe-interval 300` sends a fixed synthetic request every 5 minutes and measures user-perceived response time (it counts as one request in the log).
 - `--from-start` parses an existing log file from the beginning (useful for CSV output; the live view is meaningful for new lines only).
 
+**After a restart** the dashboard is filled right away: the monitor rebuilds the last 30 minutes
+(the longest selectable range, `--replay-minutes`) from the LM Studio log, including periods
+when the monitor was not running, and reloads the daily view from the CSV files. GPU and host
+values are not in the log; the monitor saves them every 15 s to `monitoring/.live_hardware.json`
+(numbers only) and restores them, so they are available for the time the monitor was running.
+"Requests since start" counts new requests only.
+
 ### What the monitor can see
 
 The monitor reads the LM Studio server log. What LM Studio writes there depends on
@@ -141,7 +153,9 @@ Accuracy:
   Completion tokens come from the engine's final timing entry or are extrapolated from its
   progress reports (≈). Several loaded models are told apart by their engine process.
 - A request that LM Studio announces but never starts (for example, rejected while a model
-  loads on demand) is dropped after 120 s and shown as "rejected" in the dashboard. The monitor
+  loads on demand) is dropped after 120 s and shown as "rejected" in the dashboard. A request
+  ended by an ERROR entry for its model (e.g. the model was unloaded) is closed as failed and
+  excluded from response times. The monitor
   does not analyse response content, so refusals in the answers of real users are not evaluated.
 
 ### Troubleshooting

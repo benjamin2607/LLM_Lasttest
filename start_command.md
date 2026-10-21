@@ -14,7 +14,8 @@ python -m locust -f main.py --host http://localhost:3001
 | `--request-timeout` | float | 300.0 | Timeout per request in seconds |
 | `--messages-per-thread` | int | 1 | Questions per thread before a new one is started (1 = new thread per question, 0 = never) |
 | `--run-id` | str | start time | Identifier included in every thread name |
-| `--keep-threads` | flag | off | Do not delete threads after use |
+| `--max-threads` | int | 30 | Load-test threads kept per workspace; the oldest are deleted first (0 = keep all) |
+| `--thread-registry` | path | `.loadtest_threads.json` | File that records the threads created by the load test |
 | `--refusal-text` | str | AnythingLLM default | Query mode refusal response configured in the workspace |
 | `--refusal-log` | path | – | JSON Lines file for refusal examples |
 

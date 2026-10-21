@@ -53,16 +53,43 @@ class LogFollower(threading.Thread):
         self.from_start = from_start
         self.poll = poll
         self.current = None
+        self._fh = None
         self._stop = threading.Event()
 
-    def newest_file(self):
+    def _log_files(self):
         if self.target.is_file():
-            return self.target
-        logs = [p for p in self.target.rglob("*.log") if p.is_file()]
-        return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
+            return [self.target]
+        return sorted((p for p in self.target.rglob("*.log") if p.is_file()), key=lambda p: p.stat().st_mtime)
+
+    def newest_file(self):
+        logs = self._log_files()
+        return logs[-1] if logs else None
+
+    def open_initial(self, replay_window=0, sample=None):
+        """
+        Open the newest log before following it: learn which models are loaded and, with
+        ``replay_window`` > 0, rebuild the last ``replay_window`` seconds from the log
+        (including the previous file when the window reaches back past a log rotation).
+        """
+        logs = self._log_files()
+        if not logs:
+            return
+        newest = logs[-1]
+        fh = open(newest, "r", encoding="utf-8", errors="replace")
+        self._fh, self.current = fh, newest
+        print(f"[monitor] following log: {newest.name}")
+        if self.from_start:
+            return
+        lines = fh.read().splitlines()  # Leaves the file position at the end for following.
+        self.parser.prime_engines(lines)
+        if replay_window > 0:
+            now = time.time()
+            if len(logs) > 1 and logs[-2].stat().st_mtime >= now - replay_window:
+                lines = logs[-2].read_text(encoding="utf-8", errors="replace").splitlines() + lines
+            self.parser.replay(lines, now - replay_window, now, sample)
 
     def run(self):
-        fh, buf, last_check, first = None, "", 0.0, True
+        fh, buf, last_check, first = self._fh, "", 0.0, self._fh is None
         while not self._stop.is_set():
             if fh is None or time.time() - last_check > 5:
                 last_check = time.time()
@@ -167,8 +194,16 @@ def probe(base, model, token=None):
 
 
 # --- Real-time recording (one data point per second) ---
+HARDWARE_FIELDS = ("gpu_util", "vram_pct", "vram_used_mb", "vram_total_mb",
+                   "gpu_temp", "gpu_power_w", "ram_pct", "ram_used_gb", "cpu_pct")
+HISTORY_NUMERIC = ("requests_completed", "requests_started", "max_active", "latency_p95_s", "latency_avg_s",
+                   "ttft_p95_s", "gen_tokens_per_s_total", "gpu_util_avg", "vram_pct_max")
+
+
 class LiveRecorder(threading.Thread):
     """Collects log, hardware and API state once per second and notifies dashboard clients."""
+
+    SAVE_EVERY_S = 15
 
     def __init__(self, parser, sampler, args, follower=None, keep_s=1800):
         super().__init__(daemon=True)
@@ -180,6 +215,63 @@ class LiveRecorder(threading.Thread):
         self.state = {}
         self.models, self.api_ok, self._last_api = [], None, 0.0
         self.started = time.time()
+        self.keep_s = keep_s
+        self.hardware_file = Path(args.out) / ".live_hardware.json"
+        self._saved_hardware = self._load_hardware()
+        self._last_save = time.time()
+
+    # --- restoring state after a restart ---
+    def _load_hardware(self):
+        """Hardware points saved by a previous monitor run, keyed by second."""
+        try:
+            points = json.loads(self.hardware_file.read_text(encoding="utf-8")).get("points", [])
+        except (OSError, ValueError):
+            return {}
+        cutoff = time.time() - self.keep_s
+        return {int(p["t"]): p for p in points if p.get("t", 0) >= cutoff}
+
+    def save_hardware(self):
+        """Persist the hardware part of the live series (numbers only) for the next start."""
+        with self.cond:
+            points = [{"t": p["t"], **{k: p.get(k) for k in HARDWARE_FIELDS}} for p in self.series]
+        try:
+            tmp = self.hardware_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"points": points}), encoding="utf-8")
+            os.replace(tmp, self.hardware_file)
+        except OSError:
+            pass
+
+    def replay_sample(self, second):
+        """Called by the log replay once per second: rebuild one data point of the live series."""
+        live = self.parser.live()
+        hw = self._saved_hardware.get(second, {})
+        self.series.append({"t": float(second), "active": live["active"], "waiting": live["waiting"],
+                            "tokens_per_s": live["tokens_per_s"], "requests_per_min": live["requests_per_min"],
+                            **{k: hw.get(k) for k in HARDWARE_FIELDS}})
+
+    def load_history(self, out_dir):
+        """Fill the daily view from the CSV rows of the last 24 hours."""
+        cutoff = datetime.now().timestamp() - 24 * 3600
+        rows = []
+        for path in sorted(Path(out_dir).glob("lmstudio_metrics_*.csv"))[-2:]:
+            try:
+                with open(path, newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        try:
+                            if datetime.fromisoformat(row["time"]).timestamp() < cutoff:
+                                continue
+                        except (KeyError, ValueError):
+                            continue
+                        for key in HISTORY_NUMERIC:
+                            try:
+                                row[key] = float(row[key]) if row.get(key) not in (None, "") else None
+                            except ValueError:
+                                row[key] = None
+                        rows.append(row)
+            except OSError:
+                continue
+        with self.cond:
+            self.history.extend(rows[-self.history.maxlen:])
 
     def _poll_api(self):
         # Every poll adds a line to the LM Studio log, so poll sparingly; loaded models rarely change.
@@ -211,8 +303,7 @@ class LiveRecorder(threading.Thread):
             live, sysm = self.parser.live(), dict(self.sampler.latest)
             point = {"t": round(time.time(), 1), "active": live["active"], "waiting": live["waiting"],
                      "tokens_per_s": live["tokens_per_s"], "requests_per_min": live["requests_per_min"],
-                     **{k: sysm.get(k) for k in ("gpu_util", "vram_pct", "vram_used_mb", "vram_total_mb",
-                                                 "gpu_temp", "gpu_power_w", "ram_pct", "ram_used_gb", "cpu_pct")}}
+                     **{k: sysm.get(k) for k in HARDWARE_FIELDS}}
             state = {**live, "system": sysm, "alerts": self.alerts(live, sysm), "models": self.models,
                      "api_ok": self.api_ok, "gpu_available": self.sampler.gpu_available,
                      **self.sampler.gpu.info(),
@@ -223,6 +314,9 @@ class LiveRecorder(threading.Thread):
                 self.state = state
                 self.seq += 1
                 self.cond.notify_all()
+            if time.time() - self._last_save >= self.SAVE_EVERY_S:
+                self._last_save = time.time()
+                self.save_hardware()
             time.sleep(1)
 
     def full(self):
@@ -301,6 +395,8 @@ def main():
                     help="Send a synthetic probe request every N seconds (0 = disabled)")
     ap.add_argument("--from-start", action="store_true", help="Parse the log from the beginning instead of new lines only")
     ap.add_argument("--no-api", action="store_true", help="Do not query the LM Studio API")
+    ap.add_argument("--replay-minutes", type=int, default=30,
+                    help="Rebuild the dashboard from the last N minutes of the log on start (0 = off)")
     ap.add_argument("--diagnose", action="store_true",
                     help="Print which LM Studio log entry types are recognised (no content) and exit")
     ap.add_argument("--gpu-index", type=int, default=0)
@@ -325,20 +421,27 @@ def main():
 
     parser = LogParser(use_log_time=args.from_start)
     follower = LogFollower(target, parser, from_start=args.from_start) if target else None
-    if follower:
-        follower.start()
     sampler = SystemSampler(interval=1.0, gpu_index=args.gpu_index)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    recorder = LiveRecorder(parser, sampler, args, follower)
+    recorder.load_history(out_dir)
+    if follower:
+        # Restore the recent past so the dashboard is filled right after a restart.
+        t0 = time.time()
+        replay_window = 0 if args.from_start else args.replay_minutes * 60
+        follower.open_initial(replay_window=replay_window, sample=recorder.replay_sample)
+        if replay_window:
+            print(f"[monitor] restored the last {args.replay_minutes} min from the log "
+                  f"({len(parser.recent)} completed requests, {time.time() - t0:.1f}s)")
+        follower.start()
     sampler.start()
     gpu = sampler.gpu.info()
     if sampler.gpu_available:
         print(f"[monitor] GPU detected: {gpu['gpu_name'] or 'unknown'} ({gpu['gpu_backend']})")
     else:
         print("[monitor] Note: no supported GPU metrics source found, GPU fields stay empty.")
-    recorder = LiveRecorder(parser, sampler, args, follower)
     recorder.start()
-
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.dashboard_port:
         try:
@@ -388,6 +491,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[monitor] stopped.")
     finally:
+        recorder.save_hardware()
         sampler.stop()
         if follower:
             follower.stop()

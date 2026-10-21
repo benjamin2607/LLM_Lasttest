@@ -8,6 +8,7 @@ message content is replaced by placeholders. Run with:
 """
 import json
 import sys
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -169,6 +170,16 @@ class ApiEdgeCaseTests(unittest.TestCase):
         self.assertEqual(h.parser.totals["started"], 2)
         self.assertEqual(h.parser.active(), 2)
 
+    def test_model_unloaded_aborts_open_requests(self):
+        h = Harness()
+        h.feed(*h.received(), *h.received(), h.running(), h.streaming(), h.running(), h.streaming(), dt=5.0)
+        error = f"{ts('ERROR', MODEL)} Model unloaded by user or API request.. Error Data: n/a, Additional Data: n/a"
+        h.feed(error, error)
+        self.assertEqual(h.parser.active(), 0)
+        self.assertEqual(h.parser.totals["failed"], 2)
+        self.assertEqual(h.parser.totals["completed"], 0)
+        self.assertEqual(h.parser.live()["latency_p95_s"], None)
+
     def test_request_rejected_without_log_entry_expires(self):
         h = Harness()
         h.feed(*h.received(stream=False), dt=1.0)
@@ -258,6 +269,47 @@ class EngineOnlyTests(unittest.TestCase):
         h.feed(h.engine("launch_slot_", 0, "processing task, is_child = 0"), dt=1.0)
         h.feed(h.engine("release", 0, "stop processing: n_tokens = 10"))
         self.assertEqual(completed(h.parser)[0]["model"], "Model-Q4_K_M")  # File name only, no path.
+
+
+class ReplayTests(unittest.TestCase):
+    @staticmethod
+    def at(epoch, level="INFO", tag=MODEL):
+        return "[" + datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S") + f"][{level}][{tag}]"
+
+    def test_restores_requests_within_window_only(self):
+        now = float(int(time.time()))
+        lines = []
+        for start in (now - 3000, now - 600, now - 120):  # The first one is older than the window.
+            lines += [f"{self.at(start)} Running chat completion on conversation with 1 messages.",
+                      *(line.replace("[2026-10-21 15:03:37]", self.at(start + 4)[:21]) for line in Harness.prediction(10, 50)),
+                      f"{self.at(start + 4)} Model generated tool calls: []"]
+        parser = LogParser()
+        samples = []
+        parser.replay(lines, since=now - 1800, until=now, sample=lambda second: samples.append(parser.live()))
+
+        rows = parser.live()["recent"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["completion_tokens"] for r in rows], [50, 50])
+        self.assertAlmostEqual(rows[0]["duration_s"], 4.0, places=1)
+        self.assertEqual(len(samples), 1801)  # One data point per second of the window.
+        self.assertEqual(max(s["active"] for s in samples), 1)
+        self.assertEqual(parser.totals["completed"], 0)  # Totals restart with live data.
+        self.assertFalse(parser.use_log_time)
+
+    def test_request_running_at_restart_continues_live(self):
+        now = float(int(time.time()))
+        clock = Clock(now)
+        parser = LogParser(clock=clock)
+        parser.replay([f"{self.at(now - 30)} Running chat completion on conversation with 1 messages.",
+                       f"{self.at(now - 30)} Streaming response..."], since=now - 1800, until=now)
+        self.assertEqual(parser.active(), 1)
+        clock.advance(2)
+        h = Harness()
+        for line in [*h.packet("chatcmpl-r"), *h.packet("chatcmpl-r", final=True), h.stream_done()]:
+            parser.feed(line)
+        row = parser.live()["recent"][0]
+        self.assertAlmostEqual(row["duration_s"], 32.0, places=1)
+        self.assertEqual(parser.active(), 0)
 
 
 class PrivacyTests(unittest.TestCase):
