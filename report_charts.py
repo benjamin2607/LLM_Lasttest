@@ -196,6 +196,10 @@ def time_chart(title, times, series, unit="", y_max=None, width=640, height=280,
                 if len(segment) > 1:
                     out.append(f'<polyline class="{cls}" stroke-width="2" stroke-linejoin="round" '
                                f'points="{" ".join(segment)}"/>')
+                elif len(segment) == 1 and dense:
+                    # A single value between gaps has no line to draw: show it as a point.
+                    cx, cy = segment[0].split(",")
+                    out.append(f'<circle class="{cls}-dot" cx="{cx}" cy="{cy}" r="3"/>')
                 segment = []
                 continue
             segment.append(f"{x(t):.1f},{y(v):.1f}")
@@ -243,7 +247,8 @@ TILE_CSS = """<style>
 .meta { color: var(--text-2); margin-top: -6px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 16px 0; }
 .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
-.tile .label { color: var(--text-2); font-size: 12px; } .tile .big { font-size: 24px; font-weight: 650; margin-top: 2px; }
+.tile .label { color: var(--text); font-size: 13px; font-weight: 700; letter-spacing: -.005em; }
+.tile .big { font-size: 24px; font-weight: 650; margin-top: 4px; }
 .tile .sub { color: var(--text-3); font-size: 12px; }
 .tile table.stats { width: 100%; margin-top: 6px; font-size: 14px; }
 .tile table.stats th, .tile table.stats td { border: 0; padding: 2px 0; }

@@ -21,6 +21,7 @@ Example:
     python lmstudio_monitor.py --interval 60 --alert-p95 45
 """
 import argparse
+import ast
 import csv
 import json
 import os
@@ -425,7 +426,75 @@ class LoadTestControl:
         except (OSError, ValueError):
             return {"running": False}
         running = time.time() - status.get("heartbeat", 0) < self.HEARTBEAT_TIMEOUT_S
-        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users")}}
+        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users", "workspace", "run_started")}}
+
+    def _run_config(self, run):
+        """Settings of a load test run from its config.json (values as the run recorded them)."""
+        try:
+            cfg = json.loads((self.project_dir / "loadtest_results" / run / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        try:
+            forwarded = ast.literal_eval(cfg.get("passthrough", "[]"))
+        except (ValueError, SyntaxError):
+            forwarded = []
+        opts = {}
+        for i, arg in enumerate(forwarded):
+            if arg.startswith("--") and i + 1 < len(forwarded) and not forwarded[i + 1].startswith("--"):
+                opts[arg[2:].replace("-", "_")] = forwarded[i + 1]
+        cfg["forwarded"] = opts
+        return cfg
+
+    def loadtest_details(self):
+        """Settings of the running load test, otherwise of the most recent one."""
+        lt = self.loadtest()
+        run = lt.get("run") if lt.get("running") else None
+        if run is None:
+            runs = self.list_runs(limit=1)
+            run = runs[0]["run"] if runs else None
+        cfg = self._run_config(run) if run else None
+        return {"running": lt.get("running", False), "run": run, "stage": lt.get("stage"), "users": lt.get("users"),
+                "workspace": lt.get("workspace"), "config": cfg}
+
+    def list_runs(self, limit=30):
+        """Completed and running load tests (newest first) with their basic settings and results."""
+        results_dir = self.project_dir / "loadtest_results"
+        if not results_dir.is_dir():
+            return []
+        running = self.loadtest()
+        out = []
+        for folder in sorted((p for p in results_dir.iterdir() if p.is_dir() and (p / "config.json").exists()),
+                             key=lambda p: p.name, reverse=True)[:limit]:
+            cfg = self._run_config(folder.name) or {}
+            try:
+                stages = json.loads((folder / "results.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                stages = []
+            passing = [r for r in stages if r.get("passed")]
+            best = max(passing, key=lambda r: r.get("chat_rps") or 0, default=None)
+            first_fail = next((r for r in sorted(stages, key=lambda r: r["users"]) if not r.get("passed")), None)
+            if running.get("running") and running.get("run") == folder.name:
+                status = "running"
+            elif any(r.get("stopped") for r in stages):
+                status = "stopped"
+            elif any(r.get("error") for r in stages):
+                status = "setup error"
+            elif not stages:
+                status = "no data"
+            else:
+                status = "completed"
+            out.append({
+                "run": folder.name, "status": status,
+                "users": cfg.get("users") if cfg.get("users") not in (None, "", "None")
+                else ",".join(str(r["users"]) for r in sorted(stages, key=lambda r: r["users"])),
+                "mode": cfg.get("forwarded", {}).get("mode", "query"), "stage_duration": cfg.get("stage_duration"),
+                "stages_run": len(stages), "highest_passing": max((r["users"] for r in passing), default=None),
+                "limit_at": first_fail["users"] if first_fail else None,
+                "limit_reason": first_fail.get("reasons") if first_fail else None,
+                "max_per_min": round(best["chat_rps"] * 60, 1) if best and best.get("chat_rps") else None,
+                "p95_at_best": best.get("chat_p95_s") if best else None,
+                "report": (folder / "report.html").exists()})
+        return out
 
     def threads(self):
         try:
@@ -595,6 +664,10 @@ def start_dashboard(port, recorder, control, sessions):
             elif path == "/api/state":
                 self._send(json.dumps({**recorder.full(), "control": control.state(),
                                        "session": sessions.state()}).encode(), "application/json")
+            elif path == "/api/loadtests":
+                self._send(json.dumps(control.list_runs()).encode(), "application/json")
+            elif path == "/api/loadtest/details":
+                self._send(json.dumps(control.loadtest_details()).encode(), "application/json")
             elif path == "/api/sessions":
                 self._send(json.dumps(list_sessions(sessions.root)).encode(), "application/json")
             elif path.startswith("/loadtest/") and path.endswith("/report.html"):

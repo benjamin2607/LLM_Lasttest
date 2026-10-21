@@ -741,6 +741,8 @@ class LogParser:
                     self._replay_now = t
             if started:
                 self.feed(line)
+        with self.lock:
+            self._close_ctx()  # The last entry of the range has no following line that would complete it.
         advance(int(until) + 1)
 
         self.clock, self.use_log_time = live_clock, False
@@ -812,12 +814,21 @@ class LogParser:
                 "tokens_per_s": rnd(chunks / stream_window + done_tokens / tps_window, 1),
                 "requests_per_min": round(done_rate * 60 / rate_window, 1)}
 
+    def completed_since(self, since):
+        """Numeric fields of the requests completed since ``since`` (epoch seconds)."""
+        with self.lock:
+            return [{"start": r["start"], "end": r["end"], "duration": r["end"] - r["start"], "tokens_in": r.get("prompt_tokens"),
+                     "tokens_out": r.get("completion_tokens"), "tps": tokens_per_second(r)}
+                    for r in self.recent if r["end"] >= since]
+
     def latency_points(self, window=1800):
         """Duration and time-to-first-token of completed requests within ``window`` seconds."""
         now = self.clock()
         with self.lock:
             return [{"t": r["end"], "duration": rnd(r["end"] - r["start"]),
-                     "ttft": rnd(max(0.0, r["first"] - r["start"])) if r["first"] is not None else None}
+                     "ttft": rnd(max(0.0, r["first"] - r["start"])) if r["first"] is not None else None,
+                     "tokens_in": r.get("prompt_tokens"), "tokens_out": r.get("completion_tokens"),
+                     "tps": rnd(tokens_per_second(r), 1)}
                     for r in self.recent if now - r["end"] <= window]
 
     def live(self, tps_window=30, stream_window=10, rate_window=60, lat_window=300, recent_n=25):

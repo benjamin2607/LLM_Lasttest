@@ -50,6 +50,23 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
   padding: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.18); min-width: 240px; }
 .status-panel.show { display: flex; }
 .status-panel .chip { border: 0; background: none; padding: 2px 0; font-size: 13px; color: var(--text); }
+.chip-btn { cursor: pointer; font: inherit; font-size: 12px; }
+.chip-btn:hover, .chip-btn[aria-expanded="true"] { background: var(--surface-2); color: var(--text); }
+.lt-panel { min-width: 340px; max-width: min(460px, calc(100vw - 32px)); align-items: stretch; gap: 0; }
+.lt-panel h3 { margin: 0 0 6px; font-size: 14px; }
+.lt-panel .lt-sub { color: var(--text-2); font-size: 12px; margin-bottom: 8px; }
+.lt-panel dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0; font-size: 13px; }
+.lt-panel dt { color: var(--text-2); } .lt-panel dd { margin: 0; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; word-break: break-all; }
+.lt-panel details { margin-top: 10px; border-top: 1px solid var(--grid); padding-top: 8px; }
+.lt-panel summary { cursor: pointer; color: var(--text-2); font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.lt-panel dl.adv dd { font-weight: 500; color: var(--text-2); }
+.subhead { font-size: 13px; font-weight: 700; color: var(--text); margin: 16px 0 6px; }
+.editor { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+.editor .editor-title { font-size: 13px; font-weight: 700; margin-bottom: 2px; }
+.editor .form-grid { margin-top: 8px; }
+.listing { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 4px; }
+.status-tag { font-size: 11px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; color: var(--text-2); white-space: nowrap; }
+.status-tag.running { border-color: var(--warning); color: var(--text); } .status-tag.stopped, .status-tag.error { border-color: var(--critical); color: var(--text); }
 .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border);
   border-radius: 999px; padding: 3px 10px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex: none; }
@@ -77,6 +94,14 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .kpi .range-avg { border-top: 1px solid var(--grid); margin-top: 8px; padding-top: 6px; font-size: 12px;
   color: var(--text-2); font-variant-numeric: tabular-nums; min-height: 18px; }
 .kpi .range-avg b { color: var(--text); font-weight: 600; }
+.perreq { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.perreq .card h2 { color: var(--text); font-weight: 700; }
+.perreq .card .range { color: var(--text-3); font-size: 12px; font-weight: 400; margin-left: 4px; }
+.perreq table { margin-top: 8px; font-size: 13px; }
+.perreq th, .perreq td { border: 0; padding: 2px 0; position: static; background: none; }
+.perreq th { text-align: left !important; color: var(--text-2); font-weight: 500; }
+.perreq td { text-align: right !important; font-weight: 650; }
+.perreq .n { color: var(--text-3); font-size: 12px; margin-top: 4px; }
 .status { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; }
 
 .hw { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -204,7 +229,10 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
           <span class="chip" id="chipGpu"><span class="dot"></span><span>GPU –</span></span>
         </div>
       </div>
-      <span class="chip" id="chipLoad"><span class="dot"></span><span>load test idle</span></span>
+      <div class="status-menu">
+        <button class="chip chip-btn" id="chipLoad" aria-expanded="false" aria-controls="ltPanel" title="Settings of the load test"><span class="dot"></span><span>load test idle</span></button>
+        <div class="status-panel lt-panel" id="ltPanel" role="dialog" aria-label="Load test settings"></div>
+      </div>
     </div>
     <div class="spacer"></div>
     <button class="btn-clear" id="clearAll" title="Reset all values shown in the dashboard and start afresh (stored CSV data is kept)">↺ Clear</button>
@@ -235,6 +263,8 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
   </section>
 
   <section class="hw" id="hw"></section>
+
+  <section class="perreq" id="perReq" aria-label="Statistics per request in the selected time range"></section>
 
   <section class="grid2">
     <div class="card">
@@ -319,21 +349,34 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       </form>
     </details>
     <pre id="ltLog" hidden></pre>
+    <div class="listing">
+      <div class="subhead">Previous load tests</div>
+      <div class="tablewrap" style="max-height:none"><table>
+        <thead><tr><th>Date</th><th>Stages (users)</th><th>Mode</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th></tr></thead>
+        <tbody id="ltList"></tbody>
+      </table></div>
+    </div>
   </section>
 
   <section class="card tool" style="margin-bottom:12px">
     <h2>Sessions</h2>
+    <div class="editor">
+    <div class="editor-title">Create a report for a past time range</div>
     <form id="rangeForm" class="form-grid" autocomplete="off">
-      <label class="wide">Report for a past time range – name<input name="label" value="Past session" required maxlength="120"></label>
+      <label class="wide">Name<input name="label" value="Past session" required maxlength="120"></label>
       <label>From<input name="start" type="datetime-local" required></label>
       <label>To<input name="end" type="datetime-local" required></label>
       <div class="form-foot"><span class="text">Requests come from the LM Studio log; per-minute and hardware values from the monitor's CSV files (when it was running).</span>
         <button type="submit" class="btn-clear">Create report</button></div>
     </form>
-    <div class="tablewrap" style="max-height:none"><table>
-      <thead><tr><th>Name</th><th>Period</th><th>Requests</th><th>Report</th></tr></thead>
-      <tbody id="sessionList"></tbody>
-    </table></div>
+    </div>
+    <div class="listing">
+      <div class="subhead">Recorded sessions</div>
+      <div class="tablewrap" style="max-height:none"><table>
+        <thead><tr><th>Name</th><th>Period</th><th>Requests</th><th>Report</th></tr></thead>
+        <tbody id="sessionList"></tbody>
+      </table></div>
+    </div>
   </section>
 
   <div class="toast" id="toast" role="status"></div>
@@ -478,18 +521,29 @@ function describe(values) {
   const mid = Math.floor(v.length / 2), median = v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
   const sd = Math.sqrt(v.reduce((a, x) => a + (x - mean) ** 2, 0) / v.length);
   const p95 = v[Math.max(0, Math.min(v.length - 1, Math.round(0.95 * v.length) - 1))];
-  return { n: v.length, mean, median, sd, p95 };
+  return { n: v.length, mean, median, sd, p95, max: v[v.length - 1] };
 }
 function inRange(points) { const [x0, x1] = liveRange(); return points.filter(p => p.t >= x0 && p.t <= x1); }
 function rangeStats() {
   const [x0, x1] = liveRange(), minutes = Math.max((x1 - x0) / 60, 1 / 60);
   const pts = inRange(series), done = inRange([...latPoints.values()]);
+  // "Busy": seconds with at least one request in flight (waiting for the first token included).
+  const busy = pts.filter(p => p.active > 0), busyMinutes = busy.length / 60;
   return {
     minutes,
+    busyShare: pts.length ? busy.length / pts.length : 0,
+    activeBusy: describe(busy.map(p => p.active)),
+    tpsBusy: describe(busy.map(p => p.tokens_per_s)),
+    gpuBusy: describe(busy.map(p => p.gpu_util)),
+    gpuAll: describe(pts.map(p => p.gpu_util)),
+    rpmBusy: busyMinutes >= 1 / 60 ? done.length / busyMinutes : null,
     active: describe(pts.map(p => p.active)),
     tps: describe(pts.map(p => p.tokens_per_s)),
     lat: describe(done.map(p => p.duration)),
     ttft: describe(done.map(p => p.ttft)),
+    tokIn: describe(done.map(p => p.tokens_in)),
+    tokOut: describe(done.map(p => p.tokens_out)),
+    reqTps: describe(done.map(p => p.tps)),
     rpm: done.length / minutes,
   };
 }
@@ -542,7 +596,9 @@ function renderHw() {
   const s = state.system || {}, gpu = state.gpu_available;
   const vramGb = s.vram_used_mb != null ? s.vram_used_mb / 1024 : null, vramTot = s.vram_total_mb != null ? s.vram_total_mb / 1024 : null;
   const items = [
-    { label: "GPU utilisation", v: s.gpu_util, unit: "%", max: 100, st: null, sub: gpu ? "" : "no GPU metrics available" },
+    { label: "GPU utilisation", v: s.gpu_util, unit: "%", max: 100, st: null,
+      sub: !gpu ? "no GPU metrics available" : lastRange && lastRange.gpuBusy
+        ? `Ø busy ${fmt(lastRange.gpuBusy.mean, 0)} % · overall ${fmt(lastRange.gpuAll.mean, 0)} %` : "" },
     { label: memLabel(), v: s.vram_pct, unit: "%", max: 100, mark: config.alert_vram_pct,
       st: statusOf(s.vram_pct, config.alert_vram_pct - 10, config.alert_vram_pct),
       sub: vramGb != null ? `${fmt(vramGb, 1)} / ${fmt(vramTot, 0)} GB ${state.unified_memory ? "of GPU memory limit" : "used"}` : "" },
@@ -606,18 +662,35 @@ function renderRunning() {
   rows.forEach(el => el.remove());
 }
 
+function renderPerRequest(st) {
+  const range = rangeMin === "max" ? `since ${hhmm(liveRange()[0])}` : `last ${rangeMin} min`;
+  const card = (title, d, unit, digits) => `<div class="card"><h2>${title}<span class="range">${range}</span></h2>
+    <table>${[["Ø", "mean"], ["Median", "median"], ["p95", "p95"], ["Max", "max"]].map(([n, k]) =>
+      `<tr><th>${n}</th><td>${d ? fmt(d[k], digits) + unit : "–"}</td></tr>`).join("")}</table>
+    <div class="n">${d ? `n = ${d.n} requests` : "no completed requests"}</div></div>`;
+  $("perReq").innerHTML = card("Response time", st.lat, " s", 1) + card("First token", st.ttft, " s", 1)
+    + card("Tokens in", st.tokIn, "", 0) + card("Tokens out", st.tokOut, "", 0) + card("Tokens/s per request", st.reqTps, "", 1);
+}
+
+let lastRange = null;  // Statistics of the selected range, also used by the hardware tiles.
 function renderRangeStats() {
-  const st = rangeStats(), label = rangeLabel(st);
+  const st = lastRange = rangeStats(), label = rangeLabel(st);
+  renderPerRequest(st);
   const sec = v => v == null ? "–" : `${fmt(v, 1)} s`;
-  $("aActive").innerHTML = st.active ? `${label}: <b>${fmt(st.active.mean, 1)}</b> active` : "";
-  $("aRpm").innerHTML = `${label}: <b>${fmt(st.rpm, 1)}</b> / min`;
-  $("aTps").innerHTML = st.tps ? `${label}: <b>${fmt(st.tps.mean, 1)}</b> tokens/s` : "";
+  // Averages while busy show the performance; overall averages include idle time (usage).
+  const busyPct = `busy ${fmt(st.busyShare * 100, 0)} % of the time`;
+  $("aActive").innerHTML = st.activeBusy ? `${label} while busy: <b>${fmt(st.activeBusy.mean, 1)}</b> · ${busyPct}`
+    : `${label}: idle the whole time`;
+  $("aRpm").innerHTML = st.rpmBusy != null ? `${label} while busy: <b>${fmt(st.rpmBusy, 1)}</b> / min · overall ${fmt(st.rpm, 1)}`
+    : `${label}: <b>${fmt(st.rpm, 1)}</b> / min`;
+  $("aTps").innerHTML = st.tpsBusy ? `${label} while busy: <b>${fmt(st.tpsBusy.mean, 1)}</b> · overall ${fmt(st.tps ? st.tps.mean : 0, 1)}`
+    : `${label}: <b>0</b> tokens/s`;
   $("aP95").innerHTML = st.lat ? `${label}: <b>${sec(st.lat.mean)}</b> · p95 ${sec(st.lat.p95)}` : `${label}: no completed requests`;
   $("aTtft").innerHTML = st.ttft ? `${label}: <b>${sec(st.ttft.mean)}</b> · p95 ${sec(st.ttft.p95)}` : `${label}: –`;
   const line = (d, unit, digits) => d
     ? `Ø <b>${fmt(d.mean, digits)}</b>${unit} · median <b>${fmt(d.median, digits)}</b>${unit} · σ <b>${fmt(d.sd, digits)}</b>${unit}`
     : "";
-  $("sTps").innerHTML = line(st.tps, "", 1);
+  $("sTps").innerHTML = st.tpsBusy ? `while busy: ${line(st.tpsBusy, "", 1)} · ${busyPct}` : "";
   $("sLat").innerHTML = st.lat ? `${line(st.lat, " s", 1)} · n ${st.lat.n}` : "";
 }
 
@@ -754,6 +827,60 @@ $("ltForm").addEventListener("submit", async e => {
   } catch (err) { toast("Could not reach the monitor"); }
 });
 
+// ---------- Load test settings (popover on the load test chip) and history ----------
+function dl(rows, cls) {
+  const shown = rows.filter(([, v]) => v !== undefined && v !== null && v !== "" && v !== "None");
+  return `<dl class="${cls || ""}">${shown.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>`;
+}
+async function openLoadTestPanel() {
+  const panel = $("ltPanel");
+  try {
+    const d = await (await fetch("api/loadtest/details", { cache: "no-store" })).json(), c = d.config || {}, f = c.forwarded || {};
+    if (!d.run) { panel.innerHTML = `<h3>No load test yet</h3><div class="lt-sub">Start one in the Load test card at the bottom.</div>`; return; }
+    const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v;
+    const started = /^\d{8}_\d{6}$/.test(d.run) ? `${d.run.slice(6, 8)}.${d.run.slice(4, 6)}. ${d.run.slice(9, 11)}:${d.run.slice(11, 13)}` : d.run;
+    panel.innerHTML = `<h3>${d.running ? `Running – stage ${d.stage || 0} with ${d.users || 0} users` : "Last load test"}</h3>
+      <div class="lt-sub">Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
+      + dl([["Started", started], ["Workspace", d.workspace], ["Stages (users)", c.users], ["Measurement per stage", c.stage_duration && `${c.stage_duration} s`],
+            ["Mode", f.mode || "query"], ["Think time", f.wait_min && `${f.wait_min}–${f.wait_max} s`],
+            ["Limit: p95 response time", c.max_p95 && `${c.max_p95} s`], ["Limit: failure rate", c.max_fail_rate && `${(+c.max_fail_rate * 100).toFixed(1)} %`],
+            ["Find exact limit", yes(c.refine)], ["Threads kept", f.max_threads || "30"]])
+      + `<details><summary>Advanced</summary>` + dl([
+            ["AnythingLLM URL", c.host], ["New users per second", c.spawn_rate], ["Pause between stages", c.cooldown && `${c.cooldown} s`],
+            ["Grace for running requests", c.stop_timeout && `${c.stop_timeout} s`], ["Request timeout", f.request_timeout && `${f.request_timeout} s`],
+            ["Student think time (estimate)", c.student_think_time && `${c.student_think_time} s`], ["Refusal highlight from", c.refusal_warn_rate && `${(+c.refusal_warn_rate * 100).toFixed(0)} %`],
+            ["Limit: GPU memory", c.max_vram_pct && `${c.max_vram_pct} %`], ["Limit: GPU temperature", c.max_gpu_temp && `${c.max_gpu_temp} °C`],
+            ["LM Studio log", c.lmstudio_log], ["Locust file", c.locustfile], ["Results folder", c.out],
+            ["Other options for main.py", Object.entries(f).filter(([k]) => !["mode", "wait_min", "wait_max", "request_timeout", "max_threads"].includes(k)).map(([k, v]) => `--${k.replace(/_/g, "-")} ${v}`).join(" ")]],
+          "adv") + `</details>`;
+  } catch (e) { panel.innerHTML = `<div class="lt-sub">Could not load the settings.</div>`; }
+}
+$("chipLoad").addEventListener("click", e => {
+  e.stopPropagation();
+  const open = $("ltPanel").classList.toggle("show");
+  $("chipLoad").setAttribute("aria-expanded", open);
+  if (open) openLoadTestPanel();
+});
+document.addEventListener("click", e => {
+  if (!e.target.closest("#ltPanel") && !e.target.closest("#chipLoad")) { $("ltPanel").classList.remove("show"); $("chipLoad").setAttribute("aria-expanded", false); }
+});
+async function loadLoadTests() {
+  try {
+    const list = await (await fetch("api/loadtests", { cache: "no-store" })).json();
+    $("ltList").innerHTML = list.length ? list.map(x => {
+      const date = /^\d{8}_\d{6}$/.test(x.run) ? `${x.run.slice(6, 8)}.${x.run.slice(4, 6)}.${x.run.slice(0, 4)} ${x.run.slice(9, 11)}:${x.run.slice(11, 13)}` : x.run;
+      const result = x.highest_passing != null ? `passed up to ${x.highest_passing} users` + (x.limit_at ? ` · limit at ${x.limit_at}` : "")
+        : x.limit_at ? `limit at ${x.limit_at} users` : "–";
+      const tag = x.status === "setup error" ? "error" : x.status;
+      return `<tr><td>${date}</td><td>${escapeHtml(x.users || "–")}</td><td>${escapeHtml(x.mode)}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
+        <td title="${escapeHtml(x.limit_reason || "")}">${result}</td><td>${x.max_per_min != null ? fmt(x.max_per_min, 1) + " /min" : "–"}</td>
+        <td>${x.p95_at_best != null ? fmt(x.p95_at_best, 1) + " s" : "–"}</td><td><span class="status-tag ${tag}">${escapeHtml(x.status)}</span></td>
+        <td>${x.report ? `<a href="loadtest/${encodeURIComponent(x.run)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td></tr>`;
+    }).join("") : `<tr><td colspan="9" class="empty">No load tests yet</td></tr>`;
+  } catch (e) {}
+}
+loadLoadTests(); setInterval(loadLoadTests, 20000);
+
 // ---------- Sessions: list and reports for a past time range ----------
 const localInput = t => { const d = new Date(t * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
 (function initRangeForm() {
@@ -824,7 +951,8 @@ function renderRecent() {
     return `<tr class="${fresh && seenRecent.size > rows.length ? "fresh" : ""}"><td>${hhmmss(r.end)}</td><td>${fmt(r.duration_s, 1)} s</td><td>${r.ttft_s != null ? fmt(r.ttft_s, 1) + " s" : "–"}</td>
       <td>${fmt(r.prompt_tokens)}</td><td title="${r.tokens_estimated ? "estimated" : ""}">${r.tokens_estimated && r.completion_tokens != null ? "≈ " : ""}${fmt(r.completion_tokens)}</td><td>${fmt(r.tokens_per_s, 1)}</td><td class="model">${escapeHtml(r.model || "–")}</td><td>${r.source === "app" ? "LM Studio app" : "API"}</td></tr>`;
   }).join("") : `<tr><td colspan="8" class="empty">No completed requests since start</td></tr>`;
-  for (const r of rows) if (r.duration_s != null) latPoints.set(r.end + "|" + r.duration_s, { t: r.end, duration: r.duration_s, ttft: r.ttft_s });
+  for (const r of rows) if (r.duration_s != null) latPoints.set(r.end + "|" + r.duration_s, { t: r.end, duration: r.duration_s, ttft: r.ttft_s,
+    tokens_in: r.prompt_tokens, tokens_out: r.completion_tokens, tps: r.tokens_per_s });
   const cutoff = Date.now() / 1000 - (config.keep_s || 1800);
   for (const [k, p] of latPoints) if (p.t < cutoff) latPoints.delete(k);
 }
@@ -870,7 +998,7 @@ function render() {
   const hl = history[history.length - 1];
   $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;
 
-  renderHw(); renderRunning(); renderRecent(); renderRangeStats(); renderControl(); renderSession(); renderLoadTestTools();
+  renderRecent(); renderRangeStats(); renderHw(); renderRunning(); renderControl(); renderSession(); renderLoadTestTools();
   charts.forEach(c => c.draw()); histChart.draw();
 }
 

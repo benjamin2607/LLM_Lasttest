@@ -23,6 +23,7 @@ import math
 import os
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -32,6 +33,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from live_session import busy_periods, busy_stats
 from lmstudio_monitor import LMStudioWatcher, find_log_target
 from report_charts import TILE_CSS, count_tile, html_page, line_chart, markdown_to_html, stat_tile, tiles
 from system_metrics import SystemSampler
@@ -187,7 +189,8 @@ class StatusPublisher(threading.Thread):
 
     def __init__(self, run):
         super().__init__(daemon=True)
-        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time()}
+        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time(),
+                       "workspace": os.environ.get("WORKSPACE_SLUG"), "run_started": time.time()}
         self._stop = threading.Event()
 
     def update(self, **fields):
@@ -234,6 +237,28 @@ def stop_locust(proc, grace=15):
         proc.wait()
 
 
+def token_stats(requests, span=None):
+    """
+    Average, median, p95 and maximum of the input and output tokens per request (from the LM Studio
+    log), plus the share of the stage with a request in flight and the throughput during that time.
+    """
+    out = {}
+    if span and requests:
+        periods = busy_periods(((r["start"], r["end"]) for r in requests), span)
+        busy = busy_stats(periods, span)
+        out_tokens = sum(r.get("tokens_out") or 0 for r in requests)
+        out.update({"busy_share": busy["busy_share"],
+                    "tokens_per_s_busy": round(out_tokens / busy["busy_s"], 1) if busy["busy_s"] >= 1 else None})
+    for key in ("tokens_in", "tokens_out"):
+        values = sorted(r[key] for r in requests if r.get(key) is not None)
+        if not values:
+            continue
+        out.update({f"{key}_mean": round(sum(values) / len(values), 1), f"{key}_median": statistics.median(values),
+                    f"{key}_p95": values[max(0, min(len(values) - 1, round(0.95 * len(values)) - 1))],
+                    f"{key}_max": values[-1], f"{key}_n": len(values)})
+    return out
+
+
 def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     """Run one Locust stage with ``users`` concurrent users and evaluate it against the limits."""
     prefix = out_dir / f"stage_{idx:02d}_u{users:03d}"
@@ -270,6 +295,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
             raise
     sysm = sampler.summary(reset=True)
     lm = watcher.snapshot(reset=True) if watcher else {}
+    tokens = token_stats(watcher.parser.completed_since(t0), (t0, time.time())) if watcher else {}
 
     agg, chat, refusals = read_locust_stats(Path(f"{prefix}_stats.csv"))
     requests = int(num(agg["Request Count"]) or 0) if agg else 0
@@ -295,6 +321,7 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
         "lm_tokens_per_s_per_request": lm.get("tokens_per_s_per_request_avg"),
         "lm_ttft_p95_s": lm.get("ttft_p95_s"), "lm_max_active": lm.get("max_active"),
         "lm_completion_tokens": lm.get("completion_tokens"),
+        **tokens,
     }
 
     result["refusal_rate"] = (round((result["rejected"] + result["refused_no_context"]) / result["chat_requests"], 4)
@@ -505,7 +532,12 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
         count_tile("Refusals", f"{refused / chat_total:.1%}" if chat_total else "–",
                    f"{refused} of {chat_total} (rejected or no relevant documents)" if chat_total else ""),
     ]
-    if ref and ref.get("lm_gen_tokens_per_s") is not None:
+    if ref and ref.get("tokens_per_s_busy") is not None:
+        count.append(count_tile("Throughput while busy", f"{ref['tokens_per_s_busy']:g} tokens/s",
+                                f"at {ref['users']} users · overall {ref.get('lm_gen_tokens_per_s') or '–'} tokens/s"))
+        count.append(count_tile("Busy time", f"{ref['busy_share'] * 100:.0f} %",
+                                f"share of the stage with a request in flight, at {ref['users']} users"))
+    elif ref and ref.get("lm_gen_tokens_per_s") is not None:
         count.append(count_tile("Generated tokens/s", f"{ref['lm_gen_tokens_per_s']:g}", f"at {ref['users']} users"))
 
     stat = []
@@ -516,6 +548,10 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
         for label, stats, unit in (
                 ("Response time" + at, pick("chat_avg_s", "chat_median_s", "chat_p95_s", "chat_max_s",
                                             ref["chat_requests"]), " s"),
+                ("Tokens in per request" + at, pick("tokens_in_mean", "tokens_in_median", "tokens_in_p95", "tokens_in_max",
+                                                    ref.get("tokens_in_n")), ""),
+                ("Tokens out per request" + at, pick("tokens_out_mean", "tokens_out_median", "tokens_out_p95",
+                                                     "tokens_out_max", ref.get("tokens_out_n")), ""),
                 ("GPU utilisation" + at, pick("gpu_util_avg", "gpu_util_median", "gpu_util_p95", "gpu_util_max"), " %"),
                 ("GPU memory" + at, pick("vram_pct_avg", "vram_pct_median", "vram_pct_p95", "vram_pct_max"), " %"),
                 ("System memory" + at, pick("ram_pct_avg", "ram_pct_median", "ram_pct_p95", "ram_pct_max"), " %"),

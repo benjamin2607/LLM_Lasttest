@@ -17,6 +17,7 @@ user identifiers. The report can be regenerated from the CSV files at any time:
     python live_session.py --report monitoring/sessions/<folder>
 """
 import argparse
+import bisect
 import csv
 import html
 import json
@@ -375,6 +376,45 @@ def _per_minute(rows, value_key=None, agg="count", span=None):
     return minutes, out
 
 
+def busy_periods(intervals, span=None):
+    """
+    Merge request intervals (start, end) into periods with at least one request in flight, clipped
+    to ``span``. "Busy" includes waiting for the first token, as users experience it.
+    """
+    clipped = []
+    for start, end in intervals:
+        if start is None or end is None:
+            continue
+        if span:
+            start, end = max(start, span[0]), min(end, span[1])
+        if end >= start:
+            clipped.append((start, end))
+    merged = []
+    for start, end in sorted(clipped):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def busy_stats(periods, span):
+    """Busy seconds, share of the span, and the longest idle gap."""
+    total = max(span[1] - span[0], 1e-9)
+    busy = sum(end - start for start, end in periods)
+    edges = [span[0]] + [x for p in periods for x in p] + [span[1]]
+    gaps = [edges[i + 1] - edges[i] for i in range(0, len(edges) - 1, 2)]
+    return {"busy_s": round(busy, 1), "total_s": round(total, 1), "busy_share": round(busy / total, 4),
+            "longest_idle_s": round(max(gaps, default=total), 1)}
+
+
+def in_periods(t, periods, starts=None):
+    """Whether time ``t`` lies in one of the (sorted, merged) periods."""
+    starts = starts if starts is not None else [p[0] for p in periods]
+    i = bisect.bisect_right(starts, t) - 1
+    return i >= 0 and t <= periods[i][1]
+
+
 def summarise(folder):
     """Key figures of a session, computed from its CSV files."""
     folder = Path(folder)
@@ -402,14 +442,47 @@ def summarise(folder):
         "time_to_first_token_s": _describe([_num(r["ttft_s"]) for r in done]),
         "tokens": {"prompt": int(sum(_num(r["prompt_tokens"]) or 0 for r in done)),
                    "completion": int(sum(_num(r["completion_tokens"]) or 0 for r in done)),
-                   "per_request_tokens_per_s": _describe([_num(r["tokens_per_s"]) for r in done])},
+                   "per_request_tokens_per_s": _describe([_num(r["tokens_per_s"]) for r in done]),
+                   "in_per_request": _describe([_num(r["prompt_tokens"]) for r in done]),
+                   "out_per_request": _describe([_num(r["completion_tokens"]) for r in done])},
         "peak_concurrency": max((_num(i.get("max_active")) or 0 for i in intervals), default=0),
+        **_busy_summary(meta, requests, done, hardware, end),
         "busiest_minute": {"time": iso(busiest[1]), "requests": busiest[0]} if busiest else None,
         "hardware": {"gpu_util_pct": hw("gpu_util"), "vram_pct": hw("vram_pct"), "ram_pct": hw("ram_pct"),
                      "gpu_temp_c": hw("gpu_temp")},
         "models": {m: {"requests": len(rs), **_describe([_num(r["duration_s"]) for r in rs])}
                    for m, rs in models.items()},
     }
+
+
+def _busy_summary(meta, requests, done, hardware, end):
+    """Figures that refer only to the time with at least one request in flight."""
+    span = (meta["started"], end)
+    periods = busy_periods(((_epoch(r.get("start")), _epoch(r.get("end"))) for r in requests), span)
+    busy = busy_stats(periods, span)
+    busy_s = busy["busy_s"]
+    out_tokens = sum(_num(r["completion_tokens"]) or 0 for r in done)
+    starts = [p[0] for p in periods]
+    gpu_busy = [_num(h.get("gpu_util")) for h in hardware
+                if _epoch(h.get("time")) is not None and periods and in_periods(_epoch(h["time"]), periods, starts)]
+    return {
+        "busy": busy,
+        "while_busy": {
+            "tokens_per_s": round(out_tokens / busy_s, 1) if busy_s >= 1 else None,
+            "responses_per_min": round(len(done) / (busy_s / 60), 1) if busy_s >= 1 else None,
+            "gpu_util_pct": _describe(gpu_busy),
+        },
+        "overall": {"tokens_per_s": round(out_tokens / busy["total_s"], 1) if busy["total_s"] >= 1 else None},
+    }
+
+
+def span_text(seconds):
+    """Human-readable duration: seconds below a minute, minutes below two hours, hours above."""
+    if seconds < 60:
+        return f"{seconds:.0f} s"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def write_report(folder):
@@ -432,14 +505,28 @@ def write_report(folder):
         ("Not answered", fmt_num(sum(s["requests"].get(k, 0) for k in ("failed", "rejected", "stale", "dismissed"))),
          ", ".join(f"{s['requests'][k]} {k}" for k in ("failed", "rejected", "stale", "dismissed")
                    if s["requests"].get(k)) or "none"),
+        ("Busy time", f"{s['busy']['busy_share'] * 100:.0f} %",
+         f"{span_text(s['busy']['busy_s'])} of {span_text(s['busy']['total_s'])} with requests · "
+         f"longest idle {span_text(s['busy']['longest_idle_s'])}"),
+        ("Throughput while busy", f"{fmt_num(s['while_busy']['tokens_per_s'])} tokens/s"
+         if s["while_busy"]["tokens_per_s"] is not None else "–",
+         f"{fmt_num(s['while_busy']['responses_per_min'])} responses/min while busy · overall "
+         f"{fmt_num(s['overall']['tokens_per_s'])} tokens/s" if s["while_busy"]["tokens_per_s"] is not None else ""),
         ("Peak concurrency", fmt_num(s["peak_concurrency"]), "parallel requests (max per interval)"),
         ("Busiest minute", fmt_num(s["busiest_minute"]["requests"]) if s["busiest_minute"] else "–",
          f"requests at {s['busiest_minute']['time'][11:16]}" if s["busiest_minute"] else ""),
         ("Generated tokens", fmt_num(s["tokens"]["completion"]), f"{fmt_num(s['tokens']['prompt'])} prompt tokens"),
     ]
+    # GPU utilisation only means something while requests run; the overall average is given as a note.
+    gpu_busy = s["while_busy"]["gpu_util_pct"]
+    gpu_tile = (("GPU utilisation while busy", gpu_busy, " %",
+                 f"overall Ø {fmt_num(hwd['gpu_util_pct'].get('mean'))} % · n = {gpu_busy.get('n')}")
+                if gpu_busy else ("GPU utilisation", hwd["gpu_util_pct"], " %"))
     stat_tiles = [("Response time", rt, " s"), ("First token", tt, " s"),
+                  ("Tokens in per request", s["tokens"]["in_per_request"], ""),
+                  ("Tokens out per request", s["tokens"]["out_per_request"], ""),
                   ("Tokens/s per request", s["tokens"]["per_request_tokens_per_s"], ""),
-                  ("GPU utilisation", hwd["gpu_util_pct"], " %"), ("GPU memory", hwd["vram_pct"], " %"),
+                  gpu_tile, ("GPU memory", hwd["vram_pct"], " %"),
                   ("System memory", hwd["ram_pct"], " %"), ("GPU temperature", hwd["gpu_temp_c"], " °C")]
 
     meta = json.loads((folder / "session.json").read_text(encoding="utf-8"))
@@ -451,20 +538,25 @@ def write_report(folder):
         m_med, v_med = _per_minute(done, "duration_s", "median", span=span)
         _, v_p95 = _per_minute(done, "duration_s", "p95", span=span)
         charts.append(time_chart("Response time per minute", m_med, [("median", v_med), ("p95", v_p95)], unit=" s"))
-    it = [(_epoch(i.get("time")), i) for i in intervals]
-    it = [(t, i) for t, i in it if t is not None]
-    if it:
-        charts.append(time_chart("Concurrent requests (max per interval)", [t for t, _ in it],
-                                 [("parallel", [_num(i.get("max_active")) for _, i in it])]))
-        charts.append(time_chart("Generated tokens per second", [t for t, _ in it],
-                                 [("tokens/s", [_num(i.get("gen_tokens_per_s_total")) for _, i in it])]))
-    hw_min, gpu = _per_minute(hardware, "gpu_util", "mean")
-    _, vram = _per_minute(hardware, "vram_pct", "max")
-    _, ram = _per_minute(hardware, "ram_pct", "max")
-    if hw_min and any(x is not None for x in gpu + vram):
+    # Per-minute series over the whole session; minutes without data count as 0 (e.g. while the
+    # monitor was not running). Response times are the exception: an idle minute has no response time.
+    def zero(values):
+        return [0 if v is None else v for v in values]
+
+    if intervals:
+        m_iv, active = _per_minute(intervals, "max_active", "max", span=span)
+        _, tps = _per_minute(intervals, "gen_tokens_per_s_total", "mean", span=span)
+        charts.append(time_chart("Concurrent requests (max per minute)", m_iv, [("parallel", zero(active))]))
+        charts.append(time_chart("Generated tokens per second", m_iv, [("tokens/s", zero(tps))]))
+    hw_min, gpu = _per_minute(hardware, "gpu_util", "mean", span=span)
+    _, vram = _per_minute(hardware, "vram_pct", "max", span=span)
+    _, ram = _per_minute(hardware, "ram_pct", "max", span=span)
+    has_gpu, has_ram = any(x is not None for x in gpu + vram), any(x is not None for x in ram)
+    gpu, vram, ram = zero(gpu), zero(vram), zero(ram)
+    if hardware and has_gpu:
         charts.append(time_chart("GPU utilisation and memory", hw_min,
                                  [("GPU utilisation (avg)", gpu), ("GPU memory (max)", vram)], unit=" %", y_max=100))
-    if hw_min and any(x is not None for x in ram):
+    if hardware and has_ram:
         charts.append(time_chart("System memory (max)", hw_min, [("system memory", ram)], unit=" %", y_max=100))
     durations = [_num(r["duration_s"]) for r in done if _num(r["duration_s"]) is not None]
     if durations:

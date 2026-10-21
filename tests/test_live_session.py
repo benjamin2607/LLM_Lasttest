@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datetime import datetime  # noqa: E402
 
-from live_session import SessionManager, build_from_log, list_sessions, summarise  # noqa: E402
+from live_session import (SessionManager, build_from_log, busy_periods, busy_stats, list_sessions,  # noqa: E402
+                          summarise)
 
 
 def request(end, duration=4.0, ttft=1.0, tokens=120, model="google/gemma-4-e4b"):
@@ -135,12 +136,41 @@ class SessionTests(unittest.TestCase):
         info = build_from_log(metrics / "sessions", "Seminar afterwards", base, base + 1800, [log], metrics)
         folder = metrics / "sessions" / info["folder"]
         self.assertEqual(len(rows(folder, "requests.csv")), 3)
+        # The last request of a range is complete even though no further line follows within the range.
+        info = build_from_log(metrics / "sessions", "Up to the last", base, base + 1210, [log], metrics)
+        self.assertEqual(info["counts"]["completed"], 3)
         self.assertEqual(len(rows(folder, "intervals.csv")), 2)
         self.assertEqual(rows(folder, "hardware.csv")[0]["gpu_util"], "70")
         self.assertTrue((folder / "report.html").is_file())
         listed = list_sessions(metrics / "sessions")
         self.assertEqual(listed[0]["completed"], 3)
         self.assertTrue(listed[0]["retroactive"])
+
+    def test_busy_periods_merge_overlaps_and_clip_to_the_span(self):
+        periods = busy_periods([(5, 15), (0, 10), (30, 40), (55, 80)], span=(0, 60))
+        self.assertEqual(periods, [[0, 15], [30, 40], [55, 60]])
+        stats = busy_stats(periods, (0, 60))
+        self.assertEqual(stats["busy_s"], 30)
+        self.assertEqual(stats["busy_share"], 0.5)
+        self.assertEqual(stats["longest_idle_s"], 15)  # 15..30 and 40..55
+
+    def test_figures_while_busy_ignore_idle_time(self):
+        manager = SessionManager(self.out)
+        manager.start("Busy")
+        session = manager.current
+        now = time.time()
+        # Two requests of 10 s with 300 tokens each, then a long idle period.
+        session.record_request(request(now + 10, duration=10.0, tokens=300), "completed")
+        session.record_request(request(now + 20, duration=10.0, tokens=300), "completed")
+        session.record_hardware({"gpu_util": 90}, now=now + 5)    # busy
+        session.record_hardware({"gpu_util": 0}, now=now + 300)   # idle
+        session.meta["ended"] = now + 600
+        session.save_meta()
+        s = summarise(session.folder)
+        self.assertAlmostEqual(s["busy"]["busy_s"], 20, delta=2)
+        self.assertAlmostEqual(s["while_busy"]["tokens_per_s"], 30, delta=3)  # 600 tokens / 20 s
+        self.assertLess(s["overall"]["tokens_per_s"], 2)                       # 600 tokens / 600 s
+        self.assertEqual(s["while_busy"]["gpu_util_pct"]["mean"], 90)
 
     def test_summary_of_empty_session(self):
         manager = SessionManager(self.out)
