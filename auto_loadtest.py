@@ -20,6 +20,7 @@ import csv
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -150,6 +151,56 @@ def build_levels(args):
     return levels
 
 
+class EmergencyWatchdog:
+    """
+    Checks the hardware once per second while a stage runs. It trips when a reading stays at or
+    above its emergency limit for ``--stop-after`` seconds, so the stage can be stopped at once
+    instead of being evaluated only when it ends.
+    """
+
+    def __init__(self, sampler, args):
+        self.sampler = sampler
+        self.hold = args.stop_after
+        self.limits = [(key, label, unit, limit) for key, label, unit, limit in (
+            ("vram_pct", "VRAM", "%", args.stop_vram_pct),
+            ("ram_pct", "System memory", "%", args.stop_ram_pct),
+            ("gpu_temp", "GPU temperature", "°C", args.stop_gpu_temp)) if limit > 0]
+        self.above_since = {}
+
+    def describe(self):
+        return ", ".join(f"{label} ≥ {limit:g}{unit}" for _, label, unit, limit in self.limits) or "disabled"
+
+    def check(self, now):
+        """Return the reason for an emergency stop, or None."""
+        latest = self.sampler.latest
+        for key, label, unit, limit in self.limits:
+            value = latest.get(key)
+            if value is None or value < limit:
+                self.above_since.pop(key, None)
+                continue
+            since = self.above_since.setdefault(key, now)
+            if now - since >= self.hold:
+                return f"{label} {value:g}{unit} ≥ {limit:g}{unit} for {self.hold:g} s"
+        return None
+
+
+def popen_flags():
+    # A separate process group lets us send Ctrl+Break to Locust on Windows without hitting ourselves.
+    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {}
+
+
+def stop_locust(proc, grace=15):
+    """Ask Locust to stop (it then writes its statistics); kill it if it does not exit in time."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+        proc.wait(timeout=grace)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        proc.kill()
+        proc.wait()
+
+
 def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     """Run one Locust stage with ``users`` concurrent users and evaluate it against the limits."""
     prefix = out_dir / f"stage_{idx:02d}_u{users:03d}"
@@ -168,8 +219,21 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     if watcher:
         watcher.snapshot(reset=True)
     t0 = time.time()
+    dog, emergency = EmergencyWatchdog(sampler, args), None
     with open(f"{prefix}.log", "w", encoding="utf-8") as logf:
-        proc = subprocess.run(cmd, cwd=args.locustfile.parent, stdout=logf, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, cwd=args.locustfile.parent, stdout=logf, stderr=subprocess.STDOUT,
+                                **popen_flags())
+        try:
+            while proc.poll() is None:
+                emergency = dog.check(time.time())
+                if emergency:
+                    print(color(f"  !!! EMERGENCY STOP: {emergency} – stopping Locust now", "1;37;41"))
+                    stop_locust(proc)
+                    break
+                time.sleep(1)
+        except KeyboardInterrupt:
+            stop_locust(proc)
+            raise
     sysm = sampler.summary(reset=True)
     lm = watcher.snapshot(reset=True) if watcher else {}
 
@@ -204,11 +268,12 @@ def run_stage(idx, users, args, passthrough, out_dir, sampler, watcher):
     result["refusal_breakdown"] = refusals
     result["refusal_examples"] = read_refusal_examples(f"{prefix}_refusals.jsonl")
     result["top_errors"] = read_failures(Path(f"{prefix}_failures.csv"))
+    result["emergency"] = emergency
     # Without statistics Locust did not run at all: a setup problem, not a capacity limit.
-    result["error"] = None if agg is not None else "\n".join(log_tail(f"{prefix}.log"))
+    result["error"] = None if agg is not None or emergency else "\n".join(log_tail(f"{prefix}.log"))
 
-    reasons = []
-    if agg is None:
+    reasons = [f"EMERGENCY STOP: {emergency}"] if emergency else []
+    if agg is None and not emergency:
         reasons.append("Locust failed to run (see .log)")
     elif result["chat_requests"] == 0:
         reasons.append("no chat request completed")
@@ -270,6 +335,11 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted):
     if aborted:
         lines += ["**The test was aborted manually; results are incomplete.**", ""]
     lines += ["## Result", ""]
+    stopped = next((r for r in results if r.get("emergency")), None)
+    if stopped is not None:
+        lines += [f"### ⛔ Emergency stop at {stopped['users']} users (stage {stopped['stage']})", "",
+                  f"**{stopped['emergency']}.** Locust was stopped immediately; no further stages were run. "
+                  "The highest stage that passed before is the safe operating limit.", ""]
     failed_run = next((r for r in results if r.get("error") is not None), None)
     if failed_run is not None:
         lines += [f"**The run stopped at stage {failed_run['stage']} because Locust failed to run. "
@@ -365,6 +435,14 @@ def main():
     ap.add_argument("--max-p95", type=float, default=120.0, help="Maximum p95 chat response time in seconds")
     ap.add_argument("--max-vram-pct", type=float, default=98.0)
     ap.add_argument("--max-gpu-temp", type=float, default=88.0)
+    ap.add_argument("--stop-vram-pct", type=float, default=99.0,
+                    help="Emergency stop when VRAM stays at or above this value during a stage (0 = off)")
+    ap.add_argument("--stop-ram-pct", type=float, default=99.0,
+                    help="Emergency stop when system memory stays at or above this value (0 = off)")
+    ap.add_argument("--stop-gpu-temp", type=float, default=90.0,
+                    help="Emergency stop when the GPU temperature stays at or above this value (0 = off)")
+    ap.add_argument("--stop-after", type=float, default=10.0,
+                    help="Seconds a reading must stay above its emergency limit before the stop")
     ap.add_argument("--refusal-warn-rate", type=float, default=0.10,
                     help="Refusal rate from which refusals are highlighted in red (they never fail a stage)")
     ap.add_argument("--refine", action="store_true",
@@ -396,8 +474,9 @@ def main():
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Results: {out_dir}")
 
-    sampler = SystemSampler()
+    sampler = SystemSampler(interval=1.0)
     sampler.start()
+    print(f"Emergency stop: {EmergencyWatchdog(sampler, args).describe()} for {args.stop_after:g} s")
     if not sampler.gpu_available:
         print("Note: no supported GPU metrics source found, GPU limits will not be checked.")
     elif sampler.gpu.backend == "apple":
@@ -418,6 +497,8 @@ def main():
             write_results(out_dir, results, args, last_ok, first_bad, False)
             if r["error"] is not None:
                 break  # Setup problem: further stages would fail the same way.
+            if r["emergency"]:
+                break  # Hardware at its limit: no further stages, no refinement.
             if not r["passed"]:
                 first_bad = users
                 break

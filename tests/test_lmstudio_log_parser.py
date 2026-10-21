@@ -190,6 +190,40 @@ class ApiEdgeCaseTests(unittest.TestCase):
         self.assertEqual(h.parser.totals["rejected"], 1)
 
 
+class StallTests(unittest.TestCase):
+    def test_request_without_activity_is_marked_stalled_and_can_be_dismissed(self):
+        h = Harness()
+        h.feed(*h.received(), h.running(), h.streaming(), dt=h.parser.stall_after + 1)
+        h.feed(*h.received(), h.running(), h.streaming())
+        running = h.parser.live()["running"]
+        self.assertEqual([r["stalled"] for r in running], [True, False])
+        self.assertEqual(h.parser.dismiss(stalled_only=True), 1)
+        self.assertEqual(h.parser.active(), 1)
+        self.assertEqual(h.parser.dismiss(seq=running[1]["id"]), 1)
+        self.assertEqual(h.parser.active(), 0)
+        self.assertEqual(h.parser.totals["dismissed"], 2)
+        self.assertEqual(h.parser.totals["completed"], 0)
+
+    def test_hung_entry_does_not_capture_a_new_stream(self):
+        h = Harness()
+        h.feed(h.running(), h.streaming(), dt=h.parser.stall_after + 1)  # Completion never logged.
+        h.feed(h.running(), h.streaming(), dt=0.5)
+        h.feed(*h.packet("chatcmpl-new"), dt=0.1)
+        running = h.parser.live()["running"]
+        self.assertEqual([(r["stalled"], r["generating"]) for r in running], [(True, False), (False, True)])
+        h.feed(*h.packet("chatcmpl-new", final=True), h.stream_done())
+        self.assertAlmostEqual(completed(h.parser)[0]["duration_s"], 0.6, places=1)
+
+    def test_long_generation_with_activity_is_not_expired(self):
+        h = Harness()
+        h.feed(*h.received(), h.running(), h.streaming(), dt=1)
+        for _ in range(20):  # 20 minutes of steady output.
+            h.feed(*h.packet("chatcmpl-long"), dt=60)
+        running = h.parser.live()["running"]
+        self.assertEqual(len(running), 1)
+        self.assertFalse(running[0]["stalled"])
+
+
 class NonStreamingApiTests(unittest.TestCase):
     def test_usage_block_without_verbose_logging(self):
         h = Harness()

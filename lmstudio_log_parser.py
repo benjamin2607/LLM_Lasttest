@@ -44,6 +44,7 @@ NON_MODEL_TAGS = ("Plugin(", "LM STUDIO", "LMSAuthenticator", "Client=")
 REQUEST_RE = re.compile(r"Received (?:request: )?(POST|GET) (?:request )?to (\S+)", re.I)
 RUNNING_RE = re.compile(r"Running (?:chat )?completion on conversation", re.I)
 STREAMING_RE = re.compile(r"\] Streaming response\.\.\.", re.I)
+PROMPT_PROGRESS_RE = re.compile(r"\] Prompt processing progress:", re.I)
 STREAM_FLAG_RE = re.compile(r'"stream"\s*:\s*(true|false)')
 FIRST_TOKEN_RE = re.compile(r"First token generated", re.I)
 STREAM_DONE_RE = re.compile(r"Finished streaming response", re.I)
@@ -114,11 +115,12 @@ class LogParser:
       * API completions without an ID (non-streaming) are matched in arrival order.
     """
 
-    def __init__(self, use_log_time=False, stale_after=900, dispatch_timeout=120, clock=time.time):
+    def __init__(self, use_log_time=False, stale_after=900, dispatch_timeout=120, stall_after=300, clock=time.time):
         self.lock = threading.Lock()
         self.use_log_time = use_log_time
-        self.stale_after = stale_after            # Max. lifetime of an in-flight request without completion.
+        self.stale_after = stale_after            # Inactivity after which an in-flight request is given up.
         self.dispatch_timeout = dispatch_timeout  # Max. wait for "Running chat completion" after "Received request".
+        self.stall_after = stall_after            # Without any log activity for this long, a request is "stalled".
         self.clock = clock
         self.default_model = None         # Set by the caller when exactly one model is loaded.
         self.open = []                    # In-flight requests, oldest first.
@@ -139,6 +141,7 @@ class LogParser:
         self.token_events = deque(maxlen=200_000)  # (time, tokens) as tokens are generated.
         self.recent = deque(maxlen=500)   # Completed requests (numeric fields only).
         self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0, "rejected": 0, "failed": 0,
+                       "dismissed": 0,
                        "prompt_tokens": 0, "completion_tokens": 0}
         self._seq = 0
         self._new_window()
@@ -169,7 +172,7 @@ class LogParser:
     def _new_request(self, now, source, model=None):
         self._seq += 1
         req = {"seq": self._seq, "start": now, "first": None, "end": None, "model": model,
-               "sources": {source}, "api": source == "api"}
+               "sources": {source}, "api": source == "api", "active_at": now}
         self.open.append(req)
         if req["api"]:
             self.api_pending.append(req)
@@ -225,8 +228,17 @@ class LogParser:
             if req is None:
                 req = self._new_request(now, "api", tag)  # Verbose logging off: this is the first sign.
             req["running"] = True
+            req["active_at"] = now
             req["model"] = req["model"] or tag
             self.last_running = req
+            return
+        if PROMPT_PROGRESS_RE.search(line):
+            # Prompt evaluation is progressing for the oldest dispatched request of this model.
+            tag = model_tag(line)
+            req = next((r for r in self.open if r.get("running") and r["first"] is None
+                        and r.get("model") in (None, tag)), None)
+            if req is not None:
+                req["active_at"] = now
             return
         if STREAMING_RE.search(line):
             if self.last_running is not None:
@@ -283,14 +295,40 @@ class LogParser:
         req = next((r for r in self.open if r.get("model") == model), None)
         if req is None:
             return
-        self.open.remove(req)
+        self._drop(req)
+        req["failed"] = True
+        self.w["failed"] += 1
+        self.totals["failed"] += 1
+
+    def _is_stalled(self, req, now):
+        return now - req["active_at"] > self.stall_after
+
+    def _drop(self, req):
+        """Stop tracking an in-flight request without recording it as completed."""
+        if req in self.open:
+            self.open.remove(req)
         if req in self.api_pending:
             self.api_pending.remove(req)
         self.by_task.pop(req.get("task"), None)
         self.by_cid.pop(req.get("cid"), None)
-        req["failed"] = True
-        self.w["failed"] += 1
-        self.totals["failed"] += 1
+
+    def dismiss(self, seq=None, stalled_only=False):
+        """
+        Remove in-flight requests from tracking, e.g. entries whose completion LM Studio never
+        logged. ``seq`` selects one request; ``stalled_only`` selects all stalled ones. This only
+        affects the monitor: LM Studio offers no way to cancel another client's request.
+        Returns the number of removed requests.
+        """
+        with self.lock:
+            now = self.clock()
+            victims = [r for r in self.open
+                       if (seq is not None and r["seq"] == seq)
+                       or (stalled_only and self._is_stalled(r, now))]
+            for req in victims:
+                self._drop(req)
+                req["dismissed"] = True
+            self.totals["dismissed"] += len(victims)
+            return len(victims)
 
     def _pop_api_pending(self, prefer_streamed):
         """
@@ -353,7 +391,10 @@ class LogParser:
             if req is None:
                 # First chunk of a new stream: bind to the oldest open streaming API request without an ID.
                 unbound = [r for r in self.open if r["api"] and not r.get("cid") and r.get("stream_flag") is not False]
-                req = next((r for r in unbound if r.get("stream_flag")), unbound[0] if unbound else None)
+                # Hung entries (no activity for a while) must not capture a new stream, otherwise the
+                # real request would look queued forever; prefer live candidates, oldest first.
+                unbound = sorted(unbound, key=lambda r: (self._is_stalled(r, now), not r.get("stream_flag")))
+                req = unbound[0] if unbound else None
                 if req is None:  # Monitor started mid-stream.
                     req = self._new_request(now, "api")
                 req["cid"], req["streamed"] = cid, True
@@ -361,6 +402,7 @@ class LogParser:
             if req["first"] is None:
                 req["first"] = now
             req["chunks"] = req.get("chunks", 0) + 1
+            req["active_at"] = now
             if not req.get("task"):
                 self.token_events.append((now, 1))
                 req["live_tokens"] = True
@@ -442,6 +484,7 @@ class LogParser:
 
     def _engine_launch(self, key, eng, uptime, now):
         candidates = [r for r in self.open if r["api"] and not r.get("task") and r["end"] is None]
+        candidates.sort(key=lambda r: self._is_stalled(r, now))  # Stable: oldest live candidate first.
         if eng["model"]:
             same_model = [r for r in candidates if r.get("model") == eng["model"]]
             candidates = same_model or [r for r in candidates if r.get("model") is None] or candidates
@@ -453,10 +496,12 @@ class LogParser:
             req["sources"].add("engine")
             if req.get("model") and not eng["model"]:
                 eng["model"] = req["model"]  # Learn which model this engine process serves.
-        req.update(task=key, engine_id=eng["id"], et_launch=uptime, launched=now, ngen=0, ngen_et=uptime)
+        req.update(task=key, engine_id=eng["id"], et_launch=uptime, launched=now, ngen=0, ngen_et=uptime,
+                   active_at=now)
         self.by_task[key] = req
 
     def _engine_timing(self, req, detail, uptime, now):
+        req["active_at"] = now
         ng = NGEN_RE.search(detail)
         if ng:
             n, tg = int(ng.group(1)), float(ng.group(2))
@@ -555,21 +600,16 @@ class LogParser:
             self.w["models"][req["model"]] = self.w["models"].get(req["model"], 0) + 1
 
     def _expire_stale(self, now):
-        def expired(r):
-            if now - r["start"] > self.stale_after:
-                return True
+        def never_started(r):
             # Announced but never dispatched to a model: LM Studio rejected it without a log entry.
-            never_started = r["api"] and not r.get("running") and not r.get("task") and not r.get("cid")
-            return never_started and now - r["start"] > self.dispatch_timeout
+            return r["api"] and not r.get("running") and not r.get("task") and not r.get("cid")
 
-        for req in [r for r in self.open if expired(r)]:
-            if now - req["start"] <= self.stale_after:
-                self.totals["rejected"] += 1  # Never dispatched: rejected by LM Studio.
-            self.open.remove(req)  # E.g. an aborted request that never logged a completion entry.
-            if req in self.api_pending:
-                self.api_pending.remove(req)
-            self.by_task.pop(req.get("task"), None)
-            self.by_cid.pop(req.get("cid"), None)
+        for req in list(self.open):
+            if never_started(req) and now - req["start"] > self.dispatch_timeout:
+                self.totals["rejected"] += 1
+            elif now - req["active_at"] <= self.stale_after:
+                continue  # Still showing activity (or not idle long enough to give up on it).
+            self._drop(req)  # E.g. an aborted request that never logged a completion entry.
             self.w["stale"] += 1
 
     def replay(self, lines, since, until, sample=None):
@@ -657,8 +697,10 @@ class LogParser:
         now = self.clock()
         with self.lock:
             self._expire_stale(now)
-            running = [{"age": round(now - r["start"], 1), "generating": r["first"] is not None and r["first"] <= now,
-                        "model": r.get("model")} for r in self.open]
+            running = [{"id": r["seq"], "age": round(now - r["start"], 1),
+                        "generating": r["first"] is not None and r["first"] <= now,
+                        "idle_s": round(now - r["active_at"]), "stalled": self._is_stalled(r, now),
+                        "model": r.get("model"), "source": "api" if r["api"] else "app"} for r in self.open]
             recent = list(self.recent)
             totals = dict(self.totals)
             last_line = self.last_line_wall

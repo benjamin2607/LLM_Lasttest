@@ -60,12 +60,15 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .notice b { color: var(--text); }
 .alert .ico { color: var(--critical); font-size: 16px; }
 
-.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
+.card { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 12px; }
 .kpi .label { font-size: 12px; color: var(--text-2); }
 .kpi .value { font-size: 30px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.15; margin-top: 2px; }
 .kpi .value small { font-size: 14px; font-weight: 500; color: var(--text-2); margin-left: 3px; }
 .kpi .sub { font-size: 12px; color: var(--text-3); margin-top: 2px; min-height: 18px; }
+.kpi .range-avg { border-top: 1px solid var(--grid); margin-top: 8px; padding-top: 6px; font-size: 12px;
+  color: var(--text-2); font-variant-numeric: tabular-nums; min-height: 18px; }
+.kpi .range-avg b { color: var(--text); font-weight: 600; }
 .status { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; }
 
 .hw { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -81,6 +84,11 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
 .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .now { font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.head-right { display: inline-flex; align-items: baseline; gap: 0; flex-wrap: wrap; justify-content: flex-end; }
+.stats { font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; padding-right: 10px; margin-right: 10px;
+  border-right: 1px solid var(--border); }
+.stats b { color: var(--text); font-weight: 600; }
+.stats:empty { display: none; }
 .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .legend i { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
@@ -95,7 +103,25 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .tip .r i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 
 .running { display: flex; flex-direction: column; gap: 8px; max-height: 260px; overflow: auto; padding-right: 4px; }
-.run { display: grid; grid-template-columns: 26px 1fr 64px; align-items: center; gap: 8px; font-size: 12px; }
+.run { display: grid; grid-template-columns: 26px 1fr 64px 28px; align-items: center; gap: 8px; font-size: 12px; }
+.run.stalled .track span { color: var(--text); font-weight: 600; }
+.menu-btn { border: 1px solid transparent; background: none; color: var(--text-2); border-radius: 6px; cursor: pointer;
+  font: inherit; font-size: 15px; line-height: 1; padding: 2px 6px; }
+.menu-btn:hover, .menu-btn[aria-expanded="true"] { background: var(--surface-2); border-color: var(--border); color: var(--text); }
+.menu { position: absolute; z-index: 10; min-width: 230px; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 4px; display: none; }
+.menu.show { display: block; }
+.menu button { display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text); font: inherit;
+  font-size: 13px; padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+.menu button:hover { background: var(--surface-2); }
+.menu .hint { color: var(--text-3); font-size: 11px; padding: 4px 10px 6px; max-width: 260px; }
+.btn-small { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 6px; font: inherit;
+  font-size: 12px; padding: 3px 9px; cursor: pointer; display: none; }
+.btn-small.show { display: inline-flex; align-items: center; gap: 5px; }
+.btn-small:hover { background: var(--surface-2); }
+.toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+  border-radius: 8px; padding: 7px 14px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 20; }
+.toast.show { opacity: 1; }
 .run .n { color: var(--text-3); text-align: right; font-variant-numeric: tabular-nums; }
 .run .track { position: relative; height: 18px; background: var(--track); border-radius: 4px; overflow: hidden; }
 .run .track i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; transition: width .9s linear; }
@@ -139,11 +165,11 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     Enable it under Developer → Logging → Verbose Logging to monitor all requests.</span></div>
 
   <section class="kpis">
-    <div class="card kpi"><div class="label">Active requests</div><div class="value" id="kActive">–</div><div class="sub" id="kActiveSub"></div></div>
-    <div class="card kpi"><div class="label">Responses per minute</div><div class="value" id="kRpm">–</div><div class="sub">rolling, last 60 s</div></div>
-    <div class="card kpi"><div class="label">Generated tokens/s</div><div class="value" id="kTps">–</div><div class="sub">rolling, last 30 s</div></div>
-    <div class="card kpi"><div class="label">Response time p95</div><div class="value" id="kP95">–</div><div class="sub" id="kP95Sub">last 5 min</div></div>
-    <div class="card kpi"><div class="label">First token p95</div><div class="value" id="kTtft">–</div><div class="sub">last 5 min</div></div>
+    <div class="card kpi"><div class="label">Active requests</div><div class="value" id="kActive">–</div><div class="sub" id="kActiveSub"></div><div class="range-avg" id="aActive"></div></div>
+    <div class="card kpi"><div class="label">Responses per minute</div><div class="value" id="kRpm">–</div><div class="sub">rolling, last 60 s</div><div class="range-avg" id="aRpm"></div></div>
+    <div class="card kpi"><div class="label">Generated tokens/s</div><div class="value" id="kTps">–</div><div class="sub">rolling, last 30 s</div><div class="range-avg" id="aTps"></div></div>
+    <div class="card kpi"><div class="label">Response time p95</div><div class="value" id="kP95">–</div><div class="sub" id="kP95Sub">last 5 min</div><div class="range-avg" id="aP95"></div></div>
+    <div class="card kpi"><div class="label">First token p95</div><div class="value" id="kTtft">–</div><div class="sub">last 5 min</div><div class="range-avg" id="aTtft"></div></div>
     <div class="card kpi"><div class="label">Requests since start</div><div class="value" id="kTotal">–</div><div class="sub" id="kTotalSub"></div></div>
   </section>
 
@@ -156,7 +182,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       <div class="plot" id="cActive"></div>
     </div>
     <div class="card">
-      <div class="chart-head"><h2>Generated tokens per second</h2><span class="now" id="nTps"></span></div>
+      <div class="chart-head"><h2>Generated tokens per second</h2><span class="head-right"><span class="stats" id="sTps"></span><span class="now" id="nTps"></span></span></div>
       <div class="legend" style="visibility:hidden"><span><i></i>.</span></div>
       <div class="plot" id="cTps"></div>
     </div>
@@ -166,7 +192,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       <div class="plot" id="cGpu"></div>
     </div>
     <div class="card">
-      <div class="chart-head"><h2>Response time per request (s)</h2><span class="now" id="nLat"></span></div>
+      <div class="chart-head"><h2>Response time per request (s)</h2><span class="head-right"><span class="stats" id="sLat"></span><span class="now" id="nLat"></span></span></div>
       <div class="legend"><span><i class="dotkey" style="background:var(--s1)"></i>total duration</span><span><i class="dotkey" style="background:var(--s2)"></i>time to first token</span></div>
       <div class="plot" id="cLat"></div>
     </div>
@@ -174,8 +200,14 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
 
   <section class="grid2">
     <div class="card">
-      <div class="chart-head"><h2>Running requests</h2><span class="legend"><span><i style="background:var(--s2)"></i>queued / processing prompt</span><span><i style="background:var(--s1)"></i>generating response</span></span></div>
+      <div class="chart-head"><h2>Running requests</h2>
+        <button class="btn-small" id="dismissStalled" title="Remove all requests without log activity from the monitor"></button>
+        <span class="legend"><span><i style="background:var(--s2)"></i>queued / processing prompt</span><span><i style="background:var(--s1)"></i>generating response</span><span><i style="background:var(--critical)"></i>stalled</span></span></div>
       <div class="running" id="running"></div>
+      <div class="menu" id="runMenu" role="menu">
+        <button role="menuitem" id="menuDismiss">Remove from monitor</button>
+        <div class="hint">Use for entries whose completion LM Studio never logged. LM Studio itself cannot be told to cancel another client's request; if it is still generating, it keeps running there.</div>
+      </div>
     </div>
     <div class="card">
       <div class="chart-head"><h2>Recently completed</h2><span class="legend">metrics only, no content</span></div>
@@ -191,6 +223,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <div class="plot" id="cHist" style="height:170px"></div>
   </section>
 
+  <div class="toast" id="toast" role="status"></div>
   <footer>
     <span>Privacy: only timing and token metrics are shown – no prompts, responses, IP addresses or user identifiers.</span>
     <span id="footLog"></span>
@@ -303,6 +336,31 @@ function roundTop(g, x, y, w, h, r) { if (h <= 0) return; r = Math.min(r, h); g.
 // Time window: the selected range, but never earlier than the first data point (right after start-up)
 const liveRange = () => { const now = series.length ? series[series.length - 1].t : Date.now() / 1000;
   const first = series.length ? series[0].t : now; return [Math.max(now - rangeMin * 60, Math.min(first, now - 60)), now]; };
+// ---------- Statistics over the selected time range ----------
+function describe(values) {
+  const v = values.filter(x => x != null && !Number.isNaN(x)).sort((a, b) => a - b);
+  if (!v.length) return null;
+  const mean = v.reduce((a, b) => a + b, 0) / v.length;
+  const mid = Math.floor(v.length / 2), median = v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+  const sd = Math.sqrt(v.reduce((a, x) => a + (x - mean) ** 2, 0) / v.length);
+  const p95 = v[Math.max(0, Math.min(v.length - 1, Math.round(0.95 * v.length) - 1))];
+  return { n: v.length, mean, median, sd, p95 };
+}
+function inRange(points) { const [x0, x1] = liveRange(); return points.filter(p => p.t >= x0 && p.t <= x1); }
+function rangeStats() {
+  const [x0, x1] = liveRange(), minutes = Math.max((x1 - x0) / 60, 1 / 60);
+  const pts = inRange(series), done = inRange([...latPoints.values()]);
+  return {
+    minutes,
+    active: describe(pts.map(p => p.active)),
+    tps: describe(pts.map(p => p.tokens_per_s)),
+    lat: describe(done.map(p => p.duration)),
+    ttft: describe(done.map(p => p.ttft)),
+    rpm: done.length / minutes,
+  };
+}
+const rangeLabel = st => `Ø ${st.minutes >= rangeMin - 0.5 ? rangeMin : Math.max(1, Math.round(st.minutes))} min`;
+
 const charts = [
   new Chart($("cActive"), { data: () => series, xRange: liveRange, minMax: 4, series: [
     { key: "active", label: "active", color: "--s1", fill: "--s1-fill", step: true },
@@ -351,14 +409,97 @@ function renderHw() {
   }).join("");
 }
 
+// ---------- Running requests and their menu ----------
+let menuFor = null;
+const duration = s => s >= 60 ? `${Math.floor(s / 60)} min ${Math.round(s % 60)} s` : `${Math.round(s)} s`;
+
 function renderRunning() {
   const run = state.running || [];
-  if (!run.length) { $("running").innerHTML = `<div class="empty">No running requests</div>`; return; }
+  const stalled = run.filter(r => r.stalled).length;
+  $("dismissStalled").classList.toggle("show", stalled > 0);
+  $("dismissStalled").innerHTML = `<span style="color:var(--critical)">⚠</span>Remove ${stalled} stalled`;
+  if (menuFor !== null && !run.some(r => r.id === menuFor)) closeMenu();
+  const box = $("running");
+  if (!run.length) { box.innerHTML = `<div class="empty">No running requests</div>`; return; }
+  box.querySelector(".empty")?.remove();
+  // Rows are keyed by request id and updated in place, so a click on a menu button is never lost
+  // to the once-per-second refresh.
+  const rows = new Map([...box.querySelectorAll(".run")].map(el => [+el.dataset.id, el]));
   const scale = Math.max(config.alert_p95 || 60, ...run.map(r => r.age));
-  $("running").innerHTML = run.map((r, i) => `<div class="run"><span class="n">${i + 1}</span>
-    <div class="track"><i style="width:${Math.max(2, r.age / scale * 100)}%;background:${r.generating ? "var(--s1-fill)" : "var(--s2-fill)"};border-right:3px solid ${r.generating ? "var(--s1)" : "var(--s2)"}"></i>
-    <span>${r.generating ? "generating response" : "queued / processing prompt"}${r.model ? " · " + escapeHtml(r.model) : ""}</span></div>
-    <span class="age">${fmt(r.age, 0)} s</span></div>`).join("");
+  run.forEach((r, i) => {
+    let el = rows.get(r.id);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "run"; el.dataset.id = r.id;
+      el.innerHTML = `<span class="n"></span><div class="track"><i></i><span></span></div><span class="age"></span>
+        <button class="menu-btn" data-id="${r.id}" aria-haspopup="menu" aria-expanded="false" title="Actions">⋯</button>`;
+    }
+    rows.delete(r.id);
+    if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null);
+    const color = r.stalled ? "var(--critical)" : r.generating ? "var(--s1)" : "var(--s2)";
+    const fill = r.stalled ? "rgba(208,59,59,.16)" : r.generating ? "var(--s1-fill)" : "var(--s2-fill)";
+    const label = r.stalled ? `⚠ stalled – no output for ${duration(r.idle_s)}`
+      : r.generating ? "generating response" : "queued / processing prompt";
+    el.classList.toggle("stalled", r.stalled);
+    el.querySelector(".n").textContent = i + 1;
+    const bar = el.querySelector(".track i");
+    bar.style.width = Math.max(2, r.age / scale * 100) + "%";
+    bar.style.background = fill;
+    bar.style.borderRight = `3px solid ${color}`;
+    el.querySelector(".track span").textContent =
+      label + (r.model ? " · " + r.model : "") + (r.source === "app" ? " · LM Studio app" : "");
+    el.querySelector(".age").textContent = duration(r.age);
+    el.querySelector(".menu-btn").setAttribute("aria-expanded", menuFor === r.id);
+  });
+  rows.forEach(el => el.remove());
+}
+
+function renderRangeStats() {
+  const st = rangeStats(), label = rangeLabel(st);
+  const sec = v => v == null ? "–" : `${fmt(v, 1)} s`;
+  $("aActive").innerHTML = st.active ? `${label}: <b>${fmt(st.active.mean, 1)}</b> active` : "";
+  $("aRpm").innerHTML = `${label}: <b>${fmt(st.rpm, 1)}</b> / min`;
+  $("aTps").innerHTML = st.tps ? `${label}: <b>${fmt(st.tps.mean, 1)}</b> tokens/s` : "";
+  $("aP95").innerHTML = st.lat ? `${label}: <b>${sec(st.lat.mean)}</b> · p95 ${sec(st.lat.p95)}` : `${label}: no completed requests`;
+  $("aTtft").innerHTML = st.ttft ? `${label}: <b>${sec(st.ttft.mean)}</b> · p95 ${sec(st.ttft.p95)}` : `${label}: –`;
+  const line = (d, unit, digits) => d
+    ? `Ø <b>${fmt(d.mean, digits)}</b>${unit} · median <b>${fmt(d.median, digits)}</b>${unit} · σ <b>${fmt(d.sd, digits)}</b>${unit}`
+    : "";
+  $("sTps").innerHTML = line(st.tps, "", 1);
+  $("sLat").innerHTML = st.lat ? `${line(st.lat, " s", 1)} · n ${st.lat.n}` : "";
+}
+
+function closeMenu() { menuFor = null; $("runMenu").classList.remove("show"); }
+$("running").addEventListener("click", e => {
+  const btn = e.target.closest(".menu-btn");
+  if (!btn) return;
+  e.stopPropagation();
+  const id = +btn.dataset.id;
+  if (menuFor === id) { closeMenu(); renderRunning(); return; }
+  menuFor = id;
+  const menu = $("runMenu"), card = menu.parentElement.getBoundingClientRect(), b = btn.getBoundingClientRect();
+  menu.classList.add("show");
+  menu.style.top = (b.bottom - card.top + 4) + "px";
+  menu.style.left = Math.max(8, b.right - card.left - menu.offsetWidth) + "px";
+  renderRunning();
+});
+document.addEventListener("click", e => { if (menuFor !== null && !e.target.closest("#runMenu")) { closeMenu(); renderRunning(); } });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && menuFor !== null) { closeMenu(); renderRunning(); } });
+
+async function dismiss(path, what) {
+  try {
+    const res = await fetch(path, { method: "POST", headers: { "X-Monitor-Action": "dismiss" } });
+    const { removed } = await res.json();
+    toast(removed ? `Removed ${what} from the monitor` : "Request already finished");
+  } catch (e) { toast("Could not reach the monitor"); }
+}
+$("menuDismiss").addEventListener("click", () => { const id = menuFor; closeMenu(); dismiss(`api/requests/${id}/dismiss`, `request #${id}`); });
+$("dismissStalled").addEventListener("click", () => dismiss("api/requests/dismiss-stalled", "stalled requests"));
+
+let toastTimer;
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2500);
 }
 
 function renderRecent() {
@@ -413,7 +554,7 @@ function render() {
   const hl = history[history.length - 1];
   $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;
 
-  renderHw(); renderRunning(); renderRecent();
+  renderHw(); renderRunning(); renderRecent(); renderRangeStats();
   charts.forEach(c => c.draw()); histChart.draw();
 }
 

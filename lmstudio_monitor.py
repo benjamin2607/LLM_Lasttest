@@ -326,7 +326,8 @@ class LiveRecorder(threading.Thread):
                     "latency_points": self.parser.latency_points(),
                     "config": {"interval": self.args.interval, "alert_p95": self.args.alert_p95,
                                "alert_vram_pct": self.args.alert_vram_pct,
-                               "alert_gpu_temp": self.args.alert_gpu_temp}}
+                               "alert_gpu_temp": self.args.alert_gpu_temp,
+                               "stall_after": self.parser.stall_after}}
 
 
 # --- Local dashboard server (bound to 127.0.0.1 only) ---
@@ -352,6 +353,27 @@ def start_dashboard(port, recorder):
                 self._stream()
             else:
                 self.send_error(404)
+
+        def do_POST(self):
+            """
+            Remove hung requests from tracking. A custom header is required: browsers only send it
+            from the dashboard's own origin (other sites would need a CORS preflight, which this server
+            never grants), so third-party pages cannot trigger it.
+            """
+            if self.headers.get("X-Monitor-Action") != "dismiss":
+                self.send_error(403)
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            if path == "/api/requests/dismiss-stalled":
+                removed, what = recorder.parser.dismiss(stalled_only=True), "stalled requests"
+            elif path.startswith("/api/requests/") and path.endswith("/dismiss") and path.split("/")[3].isdigit():
+                seq = int(path.split("/")[3])
+                removed, what = recorder.parser.dismiss(seq=seq), f"request #{seq}"
+            else:
+                self.send_error(404)
+                return
+            print(f"[monitor] removed {removed} {what} from tracking (dashboard)")
+            self._send(json.dumps({"removed": removed}).encode(), "application/json")
 
         def _stream(self):
             """Server-Sent Events: push the latest data point and state once per second."""
@@ -395,6 +417,8 @@ def main():
                     help="Send a synthetic probe request every N seconds (0 = disabled)")
     ap.add_argument("--from-start", action="store_true", help="Parse the log from the beginning instead of new lines only")
     ap.add_argument("--no-api", action="store_true", help="Do not query the LM Studio API")
+    ap.add_argument("--stall-minutes", type=float, default=5,
+                    help="Mark a running request as stalled after N minutes without any log activity")
     ap.add_argument("--replay-minutes", type=int, default=30,
                     help="Rebuild the dashboard from the last N minutes of the log on start (0 = off)")
     ap.add_argument("--diagnose", action="store_true",
@@ -419,7 +443,7 @@ def main():
               "Only GPU and API metrics will be collected.")
         target = None
 
-    parser = LogParser(use_log_time=args.from_start)
+    parser = LogParser(use_log_time=args.from_start, stall_after=args.stall_minutes * 60)
     follower = LogFollower(target, parser, from_start=args.from_start) if target else None
     sampler = SystemSampler(interval=1.0, gpu_index=args.gpu_index)
     out_dir = Path(args.out)

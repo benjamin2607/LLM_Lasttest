@@ -57,6 +57,14 @@ Limits (configurable): `--max-fail-rate 0.05`, `--max-p95 120` (seconds, chat
 request), `--max-vram-pct 98`, `--max-gpu-temp 88`. Everything after `--` is
 forwarded to `main.py` (e.g. `--mode chat`).
 
+**Emergency stop.** The stage limits above are evaluated when a stage ends. In addition, the
+hardware is checked every second while a stage runs: if VRAM, system memory or GPU temperature
+stays at or above its emergency limit for 10 s (`--stop-after`), Locust is stopped immediately,
+no further stages run, and the report opens with "⛔ Emergency stop". Defaults:
+`--stop-vram-pct 99`, `--stop-ram-pct 99`, `--stop-gpu-temp 90` (`0` disables a limit; the
+temperature is not available on macOS). The highest stage that passed before is the safe
+operating limit.
+
 Results are written to `loadtest_results/<timestamp>/`: `report.md` (summary and
 recommendation), `results.csv`/`results.json`, and a Locust HTML report plus log
 per stage. The report also identifies throughput saturation and estimates how
@@ -104,10 +112,17 @@ Opens the dashboard at `http://127.0.0.1:8765` (reachable from the local machine
 only). It updates **every second** via a live stream and shows:
 
 - **Status bar:** connection, LM Studio online/offline, whether the log is being written, loaded models, and an alert banner when thresholds are exceeded
-- **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start
+- **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start. Below a divider, each tile also shows the average over the selected time range (5/15/30 min); the response time and first token tiles add the p95 for that range
+- **Statistics:** the tokens-per-second and response-time charts show mean (Ø), median and standard deviation (σ) for the selected range next to the current value
 - **Hardware:** GPU utilisation, VRAM (GB and %), temperature, power draw, system memory, CPU – with alert thresholds
 - **Live charts** (5/15/30 minutes, tooltips on hover): concurrent requests, tokens per second, GPU/VRAM, response time of every individual request
-- **Running requests** as bars that grow in real time (phase: queued/processing prompt or generating)
+- **Running requests** as bars that grow in real time (phase: queued/processing prompt or generating).
+  A request without any log activity for 5 minutes (`--stall-minutes`) is marked **stalled** in red.
+  Its "⋯" menu removes it from the monitor, and "Remove N stalled" removes all of them; each removal is
+  printed to the console. This only affects the monitor: LM Studio offers no way to cancel another
+  client's request, so a generation that is really still running continues there. Stalled entries are
+  typically requests whose completion LM Studio never logged (e.g. the client disconnected); they no
+  longer capture newer streams and are dropped automatically after 15 minutes without activity.
 - **Recently completed requests** (duration, first token, tokens in/out, tokens per second, model – no content)
 - **Daily view** of completed requests per interval
 
