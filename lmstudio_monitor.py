@@ -5,7 +5,7 @@ Privacy-preserving live monitor for LM Studio. Runs entirely on the local machin
 Data sources:
   1. LM Studio server log, followed like ``tail -f`` (daily log rotation is handled)
   2. Local LM Studio REST API (loaded models, optional synthetic probe request)
-  3. GPU and host metrics via nvidia-smi and psutil
+  3. GPU and host metrics (NVIDIA via nvidia-smi, macOS via ioreg; detected automatically) and psutil
 
 Only numeric metrics (request counts, latencies, token counts, hardware load) are
 kept. LM Studio writes prompt and completion text to its log; this monitor
@@ -46,11 +46,15 @@ REQUEST_RE = re.compile(r"Received (?:request: )?(POST|GET) (?:request )?to (\S+
 FIRST_TOKEN_RE = re.compile(r"First token generated", re.I)
 STREAM_DONE_RE = re.compile(r"Finished streaming response", re.I)
 PREDICTION_RE = re.compile(r"Generated prediction", re.I)
+# Streaming responses are logged as one "Generated packet" entry per chunk (roughly one token).
+PACKET_RE = re.compile(r"Generated packet", re.I)
 # Only these fields are extracted from JSON bodies; all other content is ignored.
 MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]{1,200})"')
 PROMPT_TOK_RE = re.compile(r'"prompt_tokens"\s*:\s*(\d+)')
 COMPL_TOK_RE = re.compile(r'"completion_tokens"\s*:\s*(\d+)')
 TPS_RE = re.compile(r'"tokens_per_second"\s*:\s*([\d.]+)')
+COMPLETION_ID_RE = re.compile(r'"id"\s*:\s*"(chatcmpl-[^"]{1,100})"')
+FINISH_REASON_RE = re.compile(r'"finish_reason"\s*:\s*"([^"]+)"')
 
 DEFAULT_LOG_DIRS = [
     Path.home() / ".lmstudio" / "server-logs",
@@ -84,9 +88,13 @@ class LogParser:
     """
     Turns LM Studio log lines into request metrics.
 
-    LM Studio does not log a request ID, so concurrent requests are matched
-    start-to-finish in FIFO order. Counters and token totals are exact;
-    per-request latencies are approximations under high concurrency.
+    LM Studio does not log an ID when a request arrives. Streaming chunks carry
+    a completion ID, so a request is bound to its ID at the first chunk and is
+    tracked exactly from then on (time to first token, chunk count, finish).
+    Non-streaming requests are matched start-to-finish in FIFO order; their
+    latencies are approximations under high concurrency. Counters are exact.
+    For streaming responses without a usage block, completion tokens are
+    estimated from the number of chunks.
     """
 
     def __init__(self, use_log_time=False, stale_after=900):
@@ -102,6 +110,9 @@ class LogParser:
         self.lines_seen = 0
         self.last_line_wall = None       # Wall-clock time of the most recent log line.
         self.recent = deque(maxlen=500)  # Recently completed requests (numeric fields only).
+        self.by_id = {}                  # Streaming requests keyed by completion ID.
+        self.pending_stream_done = 0     # Requests finished via a final chunk, awaiting "Finished streaming".
+        self.chunk_times = deque(maxlen=200_000)  # Arrival time of each streamed chunk (live tokens/s).
         self.totals = {"started": 0, "completed": 0, "embeddings": 0, "errors": 0,
                        "prompt_tokens": 0, "completion_tokens": 0}
         self._new_window()
@@ -138,7 +149,7 @@ class LogParser:
                 return
             now = self._now(ts)
             streamed, self.just_streamed = self.just_streamed, False
-            self.ctx = self.ctx_req = None
+            self._close_ctx()
 
             rq = REQUEST_RE.search(line)
             if rq:
@@ -160,8 +171,15 @@ class LogParser:
                         req["first"] = now
                         break
                 return
+            if PACKET_RE.search(line):
+                self.ctx, self.ctx_req = "packet", {"now": now}
+                self._scan_body(line)
+                return
             if STREAM_DONE_RE.search(line):
-                self._finish(now)
+                if self.pending_stream_done:
+                    self.pending_stream_done -= 1  # Already finished by its final chunk.
+                else:
+                    self._finish(now)
                 self.just_streamed = True
                 return
             if PREDICTION_RE.search(line):
@@ -174,8 +192,21 @@ class LogParser:
             if lvl and lvl.group(1) == "ERROR":
                 self._inc("errors")
 
-    def _finish(self, now):
-        req = self.open.popleft() if self.open else {"start": None, "first": None, "model": None}
+    def _finish(self, now, req=None):
+        """Complete ``req`` (or the oldest open request) and record its metrics."""
+        if req is not None:
+            try:
+                self.open.remove(req)
+            except ValueError:
+                pass
+        elif self.open:
+            # Streaming requests finish via their own chunks, so FIFO matching prefers the others.
+            req = next((r for r in self.open if not r.get("streamed")), self.open[0])
+            self.open.remove(req)
+        else:
+            req = {"start": None, "first": None, "model": None}
+        if req.get("id"):
+            self.by_id.pop(req["id"], None)
         self._inc("completed")
         req["end"] = now
         self.recent.append(req)
@@ -189,6 +220,9 @@ class LogParser:
     def _scan_body(self, line):
         """Extract the model name and token counts from a JSON body; all other content is discarded."""
         if self.ctx is None or self.ctx_req is None:
+            return
+        if self.ctx == "packet":
+            self._scan_packet(line)
             return
         req = self.ctx_req
         if req.get("model") is None:
@@ -207,6 +241,60 @@ class LogParser:
                 req["tps"] = float(m.group(1))
             self._count_model(req)
 
+    def _scan_packet(self, line):
+        """Track a streamed chunk: bind it to its request by completion ID; content is ignored."""
+        pkt = self.ctx_req
+        m = COMPLETION_ID_RE.search(line)
+        if m and "req" not in pkt:
+            cid, now = m.group(1), pkt["now"]
+            req = self.by_id.get(cid)
+            if req is None:
+                # First chunk of a new stream: bind to the oldest open request that has no ID yet.
+                req = next((r for r in self.open if not r.get("id")), None)
+                if req is None:
+                    return
+                req["id"], req["streamed"] = cid, True
+                self.by_id[cid] = req
+            if req["first"] is None:
+                req["first"] = now
+            req["chunks"] = req.get("chunks", 0) + 1
+            self.chunk_times.append(now)
+            pkt["req"] = req
+            return
+        req = pkt.get("req")
+        if req is None:
+            return
+        if req.get("model") is None:
+            m = MODEL_RE.search(line)
+            if m:
+                req["model"] = m.group(1)
+        for regex, key in ((PROMPT_TOK_RE, "prompt_tokens"), (COMPL_TOK_RE, "completion_tokens")):
+            m = regex.search(line)
+            if m:  # Optional usage block in the final chunk (stream_options.include_usage).
+                req[key] = int(m.group(1))
+                req["usage_seen"] = True
+        m = FINISH_REASON_RE.search(line)
+        if m and not req.get("end"):
+            req["chunks"] -= 1  # The final chunk carries no token.
+            self.chunk_times.pop()
+            self._finish(pkt["now"], req)
+            self.pending_stream_done += 1
+
+    def _close_ctx(self):
+        """Called when a new log entry starts: settle token accounting of a finished stream."""
+        if self.ctx == "packet":
+            req = self.ctx_req.get("req")
+            if req and req.get("end") and not req.get("tokens_booked"):
+                req["tokens_booked"] = True
+                if not req.get("usage_seen"):
+                    req["completion_tokens"] = req.get("chunks", 0)
+                    req["tokens_estimated"] = True
+                self._inc("completion_tokens", req.get("completion_tokens") or 0)
+                if req.get("prompt_tokens"):
+                    self._inc("prompt_tokens", req["prompt_tokens"])
+                self._count_model(req)
+        self.ctx = self.ctx_req = None
+
     def _count_model(self, req):
         if req.get("model") and not req.get("counted"):
             self.w["models"][req["model"]] = self.w["models"].get(req["model"], 0) + 1
@@ -224,7 +312,7 @@ class LogParser:
                      "ttft": rnd(r["first"] - r["start"]) if r["first"] is not None else None}
                     for r in self.recent if r["start"] is not None and now - r["end"] <= window]
 
-    def live(self, tps_window=30, rate_window=60, lat_window=300, recent_n=25):
+    def live(self, tps_window=30, stream_window=10, rate_window=60, lat_window=300, recent_n=25):
         """Real-time snapshot for the dashboard, using sliding windows on wall-clock time."""
         now = time.time()
         with self.lock:
@@ -233,6 +321,12 @@ class LogParser:
             recent = list(self.recent)
             totals = dict(self.totals)
             last_line = self.last_line_wall
+            chunks = 0
+            for t in reversed(self.chunk_times):
+                if now - t > stream_window:
+                    break
+                chunks += 1
+            stream_tps = chunks / stream_window
 
         def ended(win):
             return [r for r in recent if now - r["end"] <= win]
@@ -253,7 +347,9 @@ class LogParser:
         return {
             "active": len(running), "waiting": sum(not r["generating"] for r in running),
             "running": sorted(running, key=lambda r: -r["age"]),
-            "tokens_per_s": rnd(sum(r.get("completion_tokens") or 0 for r in ended(tps_window)) / tps_window, 1),
+            # Streamed chunks are counted as they arrive; non-streamed requests once they complete.
+            "tokens_per_s": rnd(stream_tps + sum(r.get("completion_tokens") or 0 for r in ended(tps_window)
+                                                 if not r.get("streamed")) / tps_window, 1),
             "requests_per_min": round(len(ended(rate_window)) * 60 / rate_window, 1),
             "latency_p95_s": rnd(pct(lat, 95)), "latency_avg_s": rnd(statistics.fmean(lat)) if lat else None,
             "ttft_p95_s": rnd(pct(ttft, 95)),
@@ -293,7 +389,7 @@ class LogParser:
 class LogFollower(threading.Thread):
     """Continuously follows the newest LM Studio log file and feeds lines to a LogParser."""
 
-    def __init__(self, target, parser, from_start=False, poll=0.5):
+    def __init__(self, target, parser, from_start=False, poll=0.2):
         super().__init__(daemon=True)
         self.target = Path(target)
         self.parser = parser
@@ -428,7 +524,8 @@ class LiveRecorder(threading.Thread):
         self.started = time.time()
 
     def _poll_api(self):
-        if self.args.no_api or time.time() - self._last_api < 10:
+        # Every poll adds a line to the LM Studio log, so poll sparingly; loaded models rarely change.
+        if self.args.no_api or time.time() - self._last_api < 30:
             return
         self._last_api = time.time()
         models = loaded_models(self.args.lmstudio_url, self.args.token)
@@ -458,6 +555,7 @@ class LiveRecorder(threading.Thread):
                                                  "gpu_temp", "gpu_power_w", "ram_pct", "ram_used_gb", "cpu_pct")}}
             state = {**live, "system": sysm, "alerts": self.alerts(live, sysm), "models": self.models,
                      "api_ok": self.api_ok, "gpu_available": self.sampler.gpu_available,
+                     **self.sampler.gpu.info(),
                      "log_file": self.follower.current.name if self.follower and self.follower.current else None,
                      "monitor_started": self.started}
             with self.cond:
@@ -563,8 +661,11 @@ def main():
         follower.start()
     sampler = SystemSampler(interval=1.0, gpu_index=args.gpu_index)
     sampler.start()
-    if not sampler.gpu_available:
-        print("[monitor] Note: nvidia-smi not found, GPU metrics are unavailable.")
+    gpu = sampler.gpu.info()
+    if sampler.gpu_available:
+        print(f"[monitor] GPU detected: {gpu['gpu_name'] or 'unknown'} ({gpu['gpu_backend']})")
+    else:
+        print("[monitor] Note: no supported GPU metrics source found, GPU fields stay empty.")
     recorder = LiveRecorder(parser, sampler, args, follower)
     recorder.start()
 
@@ -611,10 +712,11 @@ def main():
                 writer.writerow(row)
 
             dash = lambda v: "-" if v is None else v
+            mem_label = "GPU mem" if gpu["unified_memory"] else "VRAM"
             print(f"{now:%H:%M:%S}  active {row['active_now']:>2} (max {row['max_active']:>2})  "
                   f"done {row['requests_completed']:>3}  p95 {dash(row['latency_p95_s']):>6}s  "
                   f"tok/s {dash(row['gen_tokens_per_s_total']):>6}  GPU {dash(row['gpu_util_avg']):>5}%  "
-                  f"VRAM {dash(row['vram_pct_max']):>5}%  RAM {dash(row['ram_pct_max']):>5}%  {row['alerts']}")
+                  f"{mem_label} {dash(row['vram_pct_max']):>5}%  RAM {dash(row['ram_pct_max']):>5}%  {row['alerts']}")
     except KeyboardInterrupt:
         print("\n[monitor] stopped.")
     finally:

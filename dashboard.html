@@ -120,6 +120,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       <span class="chip" id="chipApi"><span class="dot"></span><span>API</span></span>
       <span class="chip" id="chipLog"><span class="dot"></span><span>Log</span></span>
       <span class="chip" id="chipModel"><span class="dot"></span><span>Model –</span></span>
+      <span class="chip" id="chipGpu"><span class="dot"></span><span>GPU –</span></span>
     </div>
     <div class="spacer"></div>
     <div class="seg" id="range" role="group" aria-label="Time range">
@@ -153,8 +154,8 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
       <div class="plot" id="cTps"></div>
     </div>
     <div class="card">
-      <div class="chart-head"><h2>GPU utilisation and VRAM (%)</h2><span class="now" id="nGpu"></span></div>
-      <div class="legend"><span><i style="background:var(--s1)"></i>GPU utilisation</span><span><i style="background:var(--s2)"></i>VRAM used</span></div>
+      <div class="chart-head"><h2>GPU utilisation and <span class="memLabel">VRAM</span> (%)</h2><span class="now" id="nGpu"></span></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>GPU utilisation</span><span><i style="background:var(--s2)"></i><span class="memLabel">VRAM</span> used</span></div>
       <div class="plot" id="cGpu"></div>
     </div>
     <div class="card">
@@ -287,6 +288,8 @@ class Chart {
     const tw = this.tip.offsetWidth; this.tip.style.left = (bx + 12 + tw > W ? bx - tw - 12 : bx + 12) + "px"; this.tip.style.top = "6px";
   }
 }
+// Macs share system memory with the GPU, so "VRAM" is labelled "GPU memory" there.
+function memLabel() { return state.unified_memory ? "GPU memory" : "VRAM"; }
 function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p; }
 function roundTop(g, x, y, w, h, r) { if (h <= 0) return; r = Math.min(r, h); g.beginPath(); g.moveTo(x, y + h); g.lineTo(x, y + r); g.quadraticCurveTo(x, y, x + r, y); g.lineTo(x + w - r, y); g.quadraticCurveTo(x + w, y, x + w, y + r); g.lineTo(x + w, y + h); g.closePath(); g.fill(); }
 
@@ -299,9 +302,9 @@ const charts = [
     { key: "waiting", label: "waiting", color: "--s2", step: true }] }),
   new Chart($("cTps"), { data: () => series, xRange: liveRange, minMax: 10, series: [
     { key: "tokens_per_s", label: "Tokens/s", color: "--s1", fill: "--s1-fill", digits: 1 }] }),
-  new Chart($("cGpu"), { data: () => series, xRange: liveRange, yMax: 100, threshold: () => config.alert_vram_pct, thresholdLabel: "VRAM alert threshold", series: [
+  new Chart($("cGpu"), { data: () => series, xRange: liveRange, yMax: 100, threshold: () => config.alert_vram_pct, get thresholdLabel() { return memLabel() + " alert threshold"; }, series: [
     { key: "gpu_util", label: "GPU", color: "--s1", unit: " %" },
-    { key: "vram_pct", label: "VRAM", color: "--s2", unit: " %", digits: 1 }] }),
+    { key: "vram_pct", get label() { return memLabel(); }, color: "--s2", unit: " %", digits: 1 }] }),
   new Chart($("cLat"), { data: () => [...latPoints.values()].sort((a, b) => a.t - b.t), xRange: liveRange, minMax: 5,
     threshold: () => config.alert_p95, thresholdLabel: "p95 alert threshold", series: [
     { key: "duration", label: "total", color: "--s1", type: "dots", unit: " s", digits: 1 },
@@ -323,9 +326,9 @@ function renderHw() {
   const s = state.system || {}, gpu = state.gpu_available;
   const vramGb = s.vram_used_mb != null ? s.vram_used_mb / 1024 : null, vramTot = s.vram_total_mb != null ? s.vram_total_mb / 1024 : null;
   const items = [
-    { label: "GPU utilisation", v: s.gpu_util, unit: "%", max: 100, st: null, sub: gpu ? "" : "nvidia-smi not found" },
-    { label: "VRAM", v: vramGb, unit: vramTot ? `/ ${fmt(vramTot)} GB` : "GB", d: 1, max: vramTot || 96, mark: vramTot ? vramTot * config.alert_vram_pct / 100 : null,
-      st: statusOf(s.vram_pct, config.alert_vram_pct - 10, config.alert_vram_pct), sub: s.vram_pct != null ? `${fmt(s.vram_pct, 1)} % used` : "" },
+    { label: "GPU utilisation", v: s.gpu_util, unit: "%", max: 100, st: null, sub: gpu ? "" : "no GPU metrics available" },
+    { label: memLabel(), v: vramGb, unit: vramTot ? `/ ${fmt(vramTot)} GB` : "GB", d: 1, max: vramTot || 96, mark: vramTot ? vramTot * config.alert_vram_pct / 100 : null,
+      st: statusOf(s.vram_pct, config.alert_vram_pct - 10, config.alert_vram_pct), sub: s.vram_pct != null ? `${fmt(s.vram_pct, 1)} % ${state.unified_memory ? "of GPU memory limit" : "used"}` : "" },
     { label: "GPU temperature", v: s.gpu_temp, unit: "°C", min: 25, max: 95, mark: config.alert_gpu_temp, st: statusOf(s.gpu_temp, config.alert_gpu_temp - 8, config.alert_gpu_temp) },
     { label: "GPU power", v: s.gpu_power_w, unit: "W", max: 600 },
     { label: "System memory", v: s.ram_pct, unit: "%", max: 100, st: statusOf(s.ram_pct, 85, 95), sub: s.ram_used_gb != null ? `${fmt(s.ram_used_gb, 1)} GB used` : "" },
@@ -383,6 +386,8 @@ function render() {
     !s.log_file ? "no log found" : la == null ? "log: no lines yet" : la < 60 ? `log active (${fmt(la)} s ago)` : `log idle for ${fmt(la / 60)} min`);
   const models = s.models || [];
   setChip("chipModel", models.length ? "good" : "", models.length ? models.join(", ") : "no model loaded");
+  setChip("chipGpu", s.gpu_backend ? "good" : "", s.gpu_name || (s.gpu_backend ? "GPU" : "no GPU metrics"));
+  document.querySelectorAll(".memLabel").forEach(el => { el.textContent = memLabel(); });
   $("footLog").textContent = s.log_file ? `Log file: ${s.log_file}` : "";
 
   const al = s.alerts || [];
@@ -390,7 +395,7 @@ function render() {
 
   $("nActive").textContent = `now ${fmt(s.active)}`;
   $("nTps").textContent = `now ${fmt(s.tokens_per_s, 1)}`;
-  $("nGpu").textContent = sys.gpu_util != null ? `GPU ${fmt(sys.gpu_util)} % · VRAM ${fmt(sys.vram_pct, 1)} %` : "no GPU data";
+  $("nGpu").textContent = sys.gpu_util != null ? `GPU ${fmt(sys.gpu_util)} % · ${memLabel()} ${fmt(sys.vram_pct, 1)} %` : "no GPU data";
   $("nLat").textContent = s.latency_p95_s != null ? `p95 ${fmt(s.latency_p95_s, 1)} s` : "";
   const hl = history[history.length - 1];
   $("nHist").textContent = hl ? `last interval: ${fmt(hl.requests_completed)} requests, p95 ${fmt(hl.latency_p95_s, 1)} s` : `first interval after ${config.interval || 60} s`;

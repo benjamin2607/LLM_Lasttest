@@ -255,7 +255,9 @@ def main():
     sampler = SystemSampler()
     sampler.start()
     if not sampler.gpu_available:
-        print("Note: nvidia-smi not found, GPU limits will not be checked.")
+        print("Note: no supported GPU metrics source found, GPU limits will not be checked.")
+    elif sampler.gpu.backend == "apple":
+        print("Note: GPU temperature is not available on macOS without sudo, the temperature limit is skipped.")
     watcher = None
     if args.lmstudio_log != "off":
         target = find_log_target(None if args.lmstudio_log == "auto" else args.lmstudio_log)

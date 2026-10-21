@@ -10,7 +10,7 @@ leaves the machine.
 | `auto_loadtest.py` | Automated capacity test: increases concurrent users stage by stage until a limit is exceeded |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
 | `dashboard.html` | Dashboard front end, served by the monitor (no external libraries) |
-| `system_metrics.py` | Shared GPU/host metrics sampler (nvidia-smi, psutil) |
+| `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
 | `prompts.json` | Questions sent by the simulated users |
 
 No additional packages are required beyond `locust` (which ships `psutil`) and
@@ -22,7 +22,9 @@ the Python standard library.
 2. **AnythingLLM API key** (AnythingLLM → Settings → Developer API) and the workspace slug as environment variables:
    - Linux/macOS: `export ANYTHING_API_KEY=...` and `export WORKSPACE_SLUG=...`
    - Windows PowerShell: `$env:ANYTHING_API_KEY="..."` and `$env:WORKSPACE_SLUG="..."`
-3. **nvidia-smi** on the `PATH` (installed with the NVIDIA driver; no administrator rights needed to read it).
+3. **GPU metrics** are detected automatically (no configuration needed):
+   - **NVIDIA (Linux/Windows):** `nvidia-smi` on the `PATH` (installed with the driver; no administrator rights needed).
+   - **macOS (Apple Silicon and Intel Macs):** read via `ioreg`, no administrator rights needed. See [macOS notes](#macos-notes).
 4. **Read access to the LM Studio log directory** `~/.lmstudio/server-logs`
    (Windows: `C:\Users\<name>\.lmstudio\server-logs`). The simplest setup is to run
    the scripts under the same user account as LM Studio; otherwise pass `--log PATH`.
@@ -87,10 +89,28 @@ monitor writes one line per interval to stdout and to
 - `--probe-interval 300` sends a fixed synthetic request every 5 minutes and measures user-perceived response time (it counts as one request in the log).
 - `--from-start` parses an existing log file from the beginning (useful for CSV output; the live view is meaningful for new lines only).
 
-Note: LM Studio logs concurrent requests without a request ID. Counters
-(requests, tokens) are exact; latencies are approximations under high
-concurrency. If a newer LM Studio release changes the log format, adjust the
+Note: LM Studio does not log an ID when a request arrives. Streaming responses carry a
+completion ID in every chunk, so they are tracked exactly (time to first token, live tokens/s;
+completion tokens are estimated from the chunk count unless LM Studio logs a usage block).
+Non-streaming requests are matched in arrival order: counters and token totals
+are exact, latencies are approximations under high concurrency. If a newer LM Studio release changes the log format, adjust the
 regular expressions at the top of `lmstudio_monitor.py`.
+
+## macOS notes
+
+The monitor and the load test run unchanged on a MacBook; the platform is detected at start-up.
+
+| Metric | NVIDIA | macOS |
+|---|---|---|
+| GPU utilisation | ✓ | ✓ |
+| GPU memory | VRAM used / total | GPU memory allocated / GPU memory limit (unified memory) |
+| GPU temperature | ✓ | empty (requires `sudo powermetrics`) |
+| GPU power draw | ✓ | empty (requires `sudo powermetrics`) |
+| System memory, CPU | ✓ | ✓ |
+
+On Macs the GPU shares system memory. The limit is taken from `sysctl iogpu.wired_limit_mb` if set,
+otherwise the macOS default (about two thirds of RAM up to 36 GB, three quarters above). The dashboard
+labels the metric "GPU memory" instead of "VRAM". In the load test, the GPU temperature limit is skipped on macOS.
 
 ## Privacy
 
