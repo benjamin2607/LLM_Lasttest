@@ -54,6 +54,10 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .alert { display: none; align-items: center; gap: 10px; border: 1px solid var(--critical); border-left-width: 4px;
   background: var(--surface); border-radius: 8px; padding: 9px 12px; margin-bottom: 14px; font-weight: 600; }
 .alert.show { display: flex; }
+.notice { display: none; gap: 10px; align-items: baseline; border: 1px solid var(--border); border-left: 4px solid var(--s1);
+  background: var(--surface); border-radius: 8px; padding: 9px 12px; margin-bottom: 14px; color: var(--text-2); }
+.notice.show { display: flex; }
+.notice b { color: var(--text); }
 .alert .ico { color: var(--critical); font-size: 16px; }
 
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
@@ -130,6 +134,9 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
   </header>
 
   <div class="alert" id="alert" role="alert"><span class="ico">⚠</span><span id="alertText"></span></div>
+  <div class="notice" id="verboseNotice"><span>ⓘ</span><span><b>Verbose logging is off in LM Studio.</b>
+    API requests (e.g. from AnythingLLM) are tracked, but chats in the LM Studio app are not.
+    Enable it under Developer → Logging → Verbose Logging to monitor all requests.</span></div>
 
   <section class="kpis">
     <div class="card kpi"><div class="label">Active requests</div><div class="value" id="kActive">–</div><div class="sub" id="kActiveSub"></div></div>
@@ -173,7 +180,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <div class="card">
       <div class="chart-head"><h2>Recently completed</h2><span class="legend">metrics only, no content</span></div>
       <div class="tablewrap"><table>
-        <thead><tr><th>Time</th><th>Duration</th><th>First token</th><th>Tokens in</th><th>Tokens out</th><th>Tokens/s</th><th>Model</th></tr></thead>
+        <thead><tr><th>Time</th><th>Duration</th><th>First token</th><th>Tokens in</th><th>Tokens out</th><th>Tokens/s</th><th>Model</th><th>Source</th></tr></thead>
         <tbody id="recent"></tbody>
       </table></div>
     </div>
@@ -359,8 +366,8 @@ function renderRecent() {
   $("recent").innerHTML = rows.length ? rows.map(r => {
     const key = r.end + "|" + r.duration_s, fresh = !seenRecent.has(key); seenRecent.add(key);
     return `<tr class="${fresh && seenRecent.size > rows.length ? "fresh" : ""}"><td>${hhmmss(r.end)}</td><td>${fmt(r.duration_s, 1)} s</td><td>${r.ttft_s != null ? fmt(r.ttft_s, 1) + " s" : "–"}</td>
-      <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.completion_tokens)}</td><td>${fmt(r.tokens_per_s, 1)}</td><td class="model">${escapeHtml(r.model || "–")}</td></tr>`;
-  }).join("") : `<tr><td colspan="7" class="empty">No completed requests since start</td></tr>`;
+      <td>${fmt(r.prompt_tokens)}</td><td title="${r.tokens_estimated ? "estimated" : ""}">${r.tokens_estimated && r.completion_tokens != null ? "≈ " : ""}${fmt(r.completion_tokens)}</td><td>${fmt(r.tokens_per_s, 1)}</td><td class="model">${escapeHtml(r.model || "–")}</td><td>${r.source === "app" ? "LM Studio app" : "API"}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">No completed requests since start</td></tr>`;
   for (const r of rows) if (r.duration_s != null) latPoints.set(r.end + "|" + r.duration_s, { t: r.end, duration: r.duration_s, ttft: r.ttft_s });
   const cutoff = Date.now() / 1000 - 1800;
   for (const [k, p] of latPoints) if (p.t < cutoff) latPoints.delete(k);
@@ -391,6 +398,9 @@ function render() {
   $("footLog").textContent = s.log_file ? `Log file: ${s.log_file}` : "";
 
   const al = s.alerts || [];
+  // Verbose logging is detected from DEBUG entries; the monitor's own model polling produces one within ~30 s.
+  const sig = s.log_signals || {}, runningFor = s.monitor_started ? Date.now() / 1000 - s.monitor_started : 0;
+  $("verboseNotice").classList.toggle("show", !!s.log_file && sig.verbose === false && runningFor > 45);
   $("alert").classList.toggle("show", al.length > 0); $("alertText").textContent = al.length ? "Warning: " + al.join(" · ") : "";
 
   $("nActive").textContent = `now ${fmt(s.active)}`;

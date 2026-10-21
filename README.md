@@ -9,9 +9,11 @@ leaves the machine.
 | `main.py` | Locust user behaviour against the AnythingLLM developer API (see `start_command.md`) |
 | `auto_loadtest.py` | Automated capacity test: increases concurrent users stage by stage until a limit is exceeded |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
+| `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
 | `dashboard.html` | Dashboard front end, served by the monitor (no external libraries) |
 | `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
 | `prompts.json` | Questions sent by the simulated users |
+| `tests/` | Unit tests for the log parser |
 
 No additional packages are required beyond `locust` (which ships `psutil`) and
 the Python standard library.
@@ -30,7 +32,7 @@ the Python standard library.
    the scripts under the same user account as LM Studio; otherwise pass `--log PATH`.
 5. **LM Studio** server running (default port 1234). If "Require API token" is enabled,
    pass the token via `--token` or `LMSTUDIO_API_TOKEN`.
-6. Optionally enable "Verbose logging" in the LM Studio developer tab if token counts are missing from the log.
+6. **Recommended: enable Verbose Logging** in LM Studio (Developer → Logging → Verbose Logging). See [What the monitor can see](#what-the-monitor-can-see).
 
 ## 1. Automated capacity test
 
@@ -89,12 +91,51 @@ monitor writes one line per interval to stdout and to
 - `--probe-interval 300` sends a fixed synthetic request every 5 minutes and measures user-perceived response time (it counts as one request in the log).
 - `--from-start` parses an existing log file from the beginning (useful for CSV output; the live view is meaningful for new lines only).
 
-Note: LM Studio does not log an ID when a request arrives. Streaming responses carry a
-completion ID in every chunk, so they are tracked exactly (time to first token, live tokens/s;
-completion tokens are estimated from the chunk count unless LM Studio logs a usage block).
-Non-streaming requests are matched in arrival order: counters and token totals
-are exact, latencies are approximations under high concurrency. If a newer LM Studio release changes the log format, adjust the
-regular expressions at the top of `lmstudio_monitor.py`.
+### What the monitor can see
+
+The monitor reads the LM Studio server log. What LM Studio writes there depends on
+where a request comes from and on the Verbose Logging setting:
+
+| Request source | Verbose Logging off (default) | Verbose Logging on |
+|---|---|---|
+| HTTP API (AnythingLLM, Locust, scripts) | ✓ tracked | ✓ tracked, plus engine timings |
+| Chat window of the LM Studio app | – not logged by LM Studio | ✓ tracked via llama.cpp engine entries |
+
+A request that appears in several sources (an API request served by the llama.cpp
+engine) is merged into one record, so nothing is counted twice. The dashboard
+shows a notice when Verbose Logging is off and marks each completed request as
+"API" or "LM Studio app".
+
+Accuracy:
+
+- **Streaming API responses** carry a completion ID in every chunk and are tracked exactly:
+  duration, time to first token and live tokens/s. Completion tokens are counted per chunk
+  (≈ one token each, marked "≈" in the dashboard) unless LM Studio logs a usage block.
+- **Non-streaming API responses** report exact token counts; with several in flight at once,
+  they are matched in arrival order, so individual latencies are approximations.
+- **llama.cpp engine tasks** carry a task ID and an engine uptime clock, so durations are exact.
+  Completion tokens come from the engine's final timing entry or are extrapolated from its
+  progress reports (≈). Several loaded models are told apart by their engine process.
+- A request that LM Studio announces but never starts (for example, rejected while a model
+  loads on demand) is dropped after 120 s.
+
+### Troubleshooting
+
+If the dashboard shows no requests while the GPU is busy, run the diagnosis. It lists only
+which entry types were recognised – no content – and gives hints:
+
+```bash
+python lmstudio_monitor.py --diagnose
+```
+
+If a newer LM Studio release changes the log format, share that report; the patterns are
+defined at the top of `lmstudio_log_parser.py`.
+
+### Tests
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## macOS notes
 
