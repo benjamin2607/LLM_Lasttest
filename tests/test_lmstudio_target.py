@@ -3,6 +3,7 @@ import csv
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import auto_loadtest  # noqa: E402
 import lmstudio_user  # noqa: E402
+from lmstudio_models import ModelControl, clean_request_settings, request_arguments  # noqa: E402
 from lmstudio_monitor import LoadTestControl  # noqa: E402
 
 
@@ -66,12 +68,20 @@ class TargetTests(unittest.TestCase):
                 self.assertEqual(refusals, {"REJECTED http-503": 1})
 
     def test_dashboard_launch_validates_lmstudio_values(self):
+        class Models:
+            def loaded_model(self):
+                return "google/gemma-4-e4b"
+
+            def request_settings(self, model):
+                return {}
+
         with tempfile.TemporaryDirectory() as tmp:
             control = LoadTestControl(tmp, "http://localhost:3001", None)
             self.assertEqual(control.launch({"target": "other", "users": "1"})[0], False)
-            ok, message = control.launch({"target": "lmstudio", "users": "1,2", "model": "bad model; rm -rf"})
+            ok, message = control.launch({"target": "lmstudio", "users": "1"})
             self.assertFalse(ok)
-            self.assertIn("model", message)
+            self.assertIn("no model is loaded", message)  # Without the model card nothing is started.
+            control.models = Models()
             ok, message = control.launch({"target": "lmstudio", "users": "1", "context_tokens": "-5"})
             self.assertFalse(ok)
             self.assertIn("context_tokens", message)
@@ -79,6 +89,83 @@ class TargetTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("name", message)
             self.assertIsNone(control.process)  # Nothing was started.
+
+
+class ModelControlTests(unittest.TestCase):
+    MODELS = {"models": [
+        {"type": "llm", "key": "google/gemma-4-e4b", "display_name": "Gemma 4 E4B", "max_context_length": 131072,
+         "loaded_instances": [{"id": "google/gemma-4-e4b", "config": {"context_length": 8192, "parallel": 4}}],
+         "capabilities": {"reasoning": {"allowed_options": ["off", "on"], "default": "on"}}},
+        {"type": "llm", "key": "google/gemma-4-e4b", "display_name": "Gemma 4 E4B", "loaded_instances": []},
+        {"type": "embedding", "key": "nomic-embed", "loaded_instances": []}]}
+
+    def control(self, tmp):
+        control = ModelControl("http://localhost:1234", None, Path(tmp) / "model_configs.json")
+        control.calls = []
+
+        def api(method, path, body=None, timeout=10):
+            control.calls.append((method, path, body))
+            return self.MODELS if method == "GET" else {"load_config": body}
+        control._api = api
+        return control
+
+    def test_models_are_merged_and_filtered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            models = self.control(tmp).models()
+            self.assertEqual([m["key"] for m in models], ["google/gemma-4-e4b"])  # Embeddings left out, variants merged.
+            self.assertEqual(len(models[0]["instances"]), 1)
+
+    def test_settings_are_validated(self):
+        self.assertEqual(clean_request_settings({"temperature": "0.5", "reasoning": "off", "top_k": ""})[0],
+                         {"temperature": 0.5, "reasoning": "off"})
+        self.assertIn("temperature", clean_request_settings({"temperature": "5"})[1])
+        self.assertIn("thinking", clean_request_settings({"reasoning": "maybe"})[1])
+        self.assertEqual(request_arguments({"presence_penalty": -0.5, "system_prompt": "Hi there"}),
+                         ["--presence-penalty=-0.5", "--system-prompt=Hi there"])
+
+    def test_reload_unloads_then_loads_and_becomes_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = self.control(tmp)
+            ok, _ = control.apply({"action": "adjust", "model": "google/gemma-4-e4b",
+                                   "load": {"context_length": "16384", "flash_attention": "true"},
+                                   "request": {"temperature": "0.3"}})
+            self.assertTrue(ok)
+            for _ in range(100):  # Loading runs in a background thread.
+                if control.progress.get("phase") != "working":
+                    break
+                time.sleep(0.02)
+            posts = [(p, b) for m, p, b in control.calls if m == "POST"]
+            self.assertEqual(posts[0], ("/api/v1/models/unload", {"instance_id": "google/gemma-4-e4b"}))
+            self.assertEqual(posts[1][1]["context_length"], 16384)
+            self.assertIs(posts[1][1]["flash_attention"], True)
+            self.assertEqual(control.request_settings("google/gemma-4-e4b"), {"temperature": 0.3})
+            stored = json.loads((Path(tmp) / "model_configs.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["active"]["model"], "google/gemma-4-e4b")
+
+    def test_context_length_above_the_maximum_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, message = self.control(tmp).apply({"action": "adjust", "model": "google/gemma-4-e4b",
+                                                   "load": {"context_length": 200000}})
+            self.assertFalse(ok)
+            self.assertIn("maximum", message)
+
+    def test_no_changes_while_a_load_test_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = self.control(tmp)
+            control.busy = lambda: True
+            self.assertFalse(control.apply({"action": "defaults", "model": "google/gemma-4-e4b"})[0])
+            self.assertFalse(control.unload("google/gemma-4-e4b")[0])
+
+    def test_configurations_are_saved_and_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = self.control(tmp)
+            self.assertTrue(control.save_config({"name": " Gemma  8k ", "model": "google/gemma-4-e4b",
+                                                 "load": {"context_length": 8192}, "request": {"reasoning": "off"}})[0])
+            self.assertFalse(control.save_config({"name": "", "load": {}})[0])
+            reopened = self.control(tmp)
+            self.assertEqual(reopened.store["configs"][0]["name"], "Gemma 8k")
+            self.assertTrue(reopened.delete_config("Gemma 8k")[0])
+            self.assertFalse(reopened.delete_config("Gemma 8k")[0])
 
 
 class ReportTests(unittest.TestCase):

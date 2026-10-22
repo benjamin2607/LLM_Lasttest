@@ -1,10 +1,15 @@
 """
-Locust user definition for load testing LM Studio directly, without AnythingLLM.
+Locust user definition for load testing LM Studio natively, without AnythingLLM.
 
 Each simulated user sends questions from prompts_lmstudio.json (general questions that
 need no workspace documents) to LM Studio's OpenAI-compatible endpoint
 ``/v1/chat/completions``. Every question is a new conversation without chat history,
 like a new AnythingLLM thread.
+
+Requests go to the OpenAI-compatible endpoint because LM Studio logs a completion ID for
+every streamed chunk there, so the monitor and the report can track parallel requests
+exactly. Sampling and reasoning options are only sent when given; otherwise LM Studio
+uses the model's own settings.
 
 Responses are streamed by default, as in a chat window. The response time recorded in
 the Locust statistics is the time until the last chunk has arrived, not only until the
@@ -40,8 +45,6 @@ import locust_final_stats  # noqa: F401 - writes complete statistics when Locust
 API_TOKEN = os.environ.get("LMSTUDIO_API_TOKEN")
 CHAT_ENDPOINT = "/v1/chat/completions"  # Also the name of the chat entry in the statistics.
 DEFAULT_PROMPTS = Path(__file__).resolve().parent / "prompts_lmstudio.json"
-DEFAULT_SYSTEM_PROMPT = ("Du bist ein hilfreicher Assistent für Studierende einer Hochschule. "
-                         "Antworte sachlich, verständlich und auf Deutsch.")
 EXAMPLES_PER_CATEGORY = 3
 EXAMPLE_CHARS = 150
 CHARS_PER_TOKEN = 4  # Rough average for German and English text; the report shows the exact count from the log.
@@ -78,12 +81,19 @@ def add_custom_args(parser):
     g.add_argument("--model", default="",
                    help="Model id as listed by LM Studio (default: the first loaded model, else the first LLM)")
     g.add_argument("--prompts", default=str(DEFAULT_PROMPTS), help="JSON file with a list of questions")
-    g.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT, help="System prompt of every request (empty = none)")
+    g.add_argument("--system-prompt", default="", help="System prompt of every request (default: none)")
     g.add_argument("--context-tokens", type=int, default=0,
                    help="Add about N tokens of text to every request to simulate RAG excerpts (0 = off)")
     g.add_argument("--max-tokens", type=int, default=0,
                    help="Maximum tokens per answer (0 = no limit, as in AnythingLLM)")
-    g.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    # Sampling and reasoning: only sent when given, otherwise the model's settings in LM Studio apply.
+    g.add_argument("--temperature", type=float, default=None, help="Sampling temperature")
+    g.add_argument("--top-p", type=float, default=None, help="Top P sampling")
+    g.add_argument("--top-k", type=int, default=None, help="Top K sampling")
+    g.add_argument("--min-p", type=float, default=None, help="Min P sampling")
+    g.add_argument("--repeat-penalty", type=float, default=None, help="Repeat penalty")
+    g.add_argument("--presence-penalty", type=float, default=None, help="Presence penalty")
+    g.add_argument("--reasoning", default="", help="Thinking: off, on, low, medium, high, xhigh (default: model setting)")
     g.add_argument("--no-stream", action="store_true", help="Request the complete answer at once instead of streaming")
     g.add_argument("--wait-min", type=float, default=5.0, help="Minimum think time in seconds")
     g.add_argument("--wait-max", type=float, default=15.0, help="Maximum think time in seconds")
@@ -227,9 +237,14 @@ class LMStudioUser(HttpUser):
         if opts.context_tokens > 0:
             system = (system + "\n\n" if system else "") + "Kontext aus den Unterlagen:\n" + context_block(opts.context_tokens)
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
-        payload = {"model": MODEL, "messages": messages, "temperature": opts.temperature, "stream": not opts.no_stream}
+        payload = {"model": MODEL, "messages": messages, "stream": not opts.no_stream}
         if opts.max_tokens > 0:
             payload["max_tokens"] = opts.max_tokens
+        for key in ("temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty"):
+            if getattr(opts, key) is not None:
+                payload[key] = getattr(opts, key)
+        if opts.reasoning and opts.reasoning != "on":  # "on" is the default of reasoning models.
+            payload["reasoning_effort"] = "none" if opts.reasoning == "off" else opts.reasoning
         if payload["stream"]:
             payload["stream_options"] = {"include_usage": True}
         return payload

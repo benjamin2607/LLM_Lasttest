@@ -140,12 +140,18 @@ Every question is a new conversation without chat history.
 
 | Option | Default | Description | Guideline |
 |---|---|---|---|
-| `--model ID` | first loaded model | Model id as listed by LM Studio (`lms ps` or the Developer tab). Without a loaded model, the first language model is used and LM Studio loads it on demand. | The model AnythingLLM uses |
+| `--model ID` | first loaded model | Model id as listed by LM Studio (`lms ps` or the Developer tab). Without a loaded model, the first language model is used and LM Studio loads it on demand. From the dashboard: the model of the LM Studio model card. | The model AnythingLLM uses |
 | `--prompts PATH` | `prompts_lmstudio.json` | JSON list of questions. The default questions are general study questions that need no documents. | – |
-| `--system-prompt TEXT` | short German assistant prompt | System prompt of every request; empty = none. | Copy the workspace's system prompt from AnythingLLM for a close comparison |
+| `--system-prompt TEXT` | none | System prompt of every request. | Copy the workspace's system prompt from AnythingLLM for a close comparison |
 | `--context-tokens N` | `0` | Adds about N tokens of lecture-style text to every request, to simulate the document excerpts AnythingLLM adds in RAG mode. The sentences are shuffled per request, so LM Studio cannot reuse a cached prompt. The exact input size is shown under *Tokens in* in the report. | `0` for the pure model; for RAG: the *Tokens in* average of an AnythingLLM load test minus about 100, typically `1000`–`3000` |
 | `--max-tokens N` | `0` | Maximum tokens per answer; `0` = no limit, as in AnythingLLM. | `0`; a limit makes stages comparable but shortens answers |
-| `--temperature T` | `0.7` | Sampling temperature. | As configured in the workspace |
+| `--temperature T` | model setting | Sampling temperature (0–2). Like all sampling options, only sent when given; otherwise the model's settings in LM Studio apply. | As configured in the AnythingLLM workspace |
+| `--top-p P` | model setting | Top P sampling (0–1). | `0.95` |
+| `--top-k K` | model setting | Top K sampling. | `40` |
+| `--min-p P` | model setting | Min P sampling (0–1). | `0.05` |
+| `--repeat-penalty R` | model setting | Repeat penalty (0.5–3). | `1.1` |
+| `--presence-penalty R` | model setting | Presence penalty (−2–2). | `0` |
+| `--reasoning MODE` | model setting | Thinking: `off`, `on`, or an effort level the model offers (`low`, `medium`, `high`, `xhigh`). | `off` for the fastest answers; as students use it for realistic load |
 | `--no-stream` | off | Request the complete answer at once instead of streaming. | Leave streaming on (realistic chat behaviour) |
 | `--wait-min S` / `--wait-max S` | `5` / `15` | Think time between two questions, as for AnythingLLM. | As for AnythingLLM, so results are comparable |
 | `--request-timeout S` | `300` | Timeout per request. | Above `--max-p95` |
@@ -233,14 +239,33 @@ checks every value against the range below before starting; the process is start
 | Limit: failure rate (%) | `--max-fail-rate` (as a fraction) | 0–100 % | `5` |
 | Student think time for estimate (s) | `--student-think-time` | 1–3600 | `90` |
 | Threads kept in AnythingLLM *(AnythingLLM only)* | `-- --max-threads` | 0–10000 | `30` |
-| Model *(LM Studio only)* | `-- --model` | model id | first loaded model |
 | Context tokens per request *(LM Studio only)* | `-- --context-tokens` | 0–200000 | `0` |
-| Max tokens per answer *(LM Studio only)* | `-- --max-tokens` | 0–131072, 0 = no limit | `0` |
-| Temperature *(LM Studio only)* | `-- --temperature` | 0–2 | `0.7` |
 | Find the exact limit | `--refine` | on/off | off |
 
 The remaining options (GPU limits, refusal highlight, LM Studio log) keep their defaults; use the
-command line to change them.
+command line to change them. For "LM Studio native", the model and its request settings come from
+the LM Studio model card:
+
+### LM Studio model card
+
+| Field | Applies | Allowed range | Default |
+|---|---|---|---|
+| Model | – | language models on disk | the loaded model |
+| Context length | when loading | 256 – the model's maximum | as loaded / LM Studio default |
+| Parallel requests | when loading | 1–64 | as loaded / LM Studio default. Guideline: at least the number of concurrent users you expect, as far as GPU memory allows |
+| System prompt | every request | up to 8000 characters | German assistant prompt |
+| Max response tokens | every request | 0–131072, empty = no limit | no limit |
+| Temperature | every request | 0–2 | model setting |
+| Top P sampling | every request | 0–1 | model setting |
+| Thinking | every request | the model's options | model default |
+| *Advanced:* flash attention | when loading | on/off | as loaded / LM Studio default |
+| *Advanced:* evaluation batch size | when loading | 1–65536 | as loaded / LM Studio default |
+| *Advanced:* KV cache on GPU | when loading | on/off | as loaded / LM Studio default |
+| *Advanced:* experts | when loading | 1–512, MoE models only | model default |
+| *Advanced:* top K, min P, repeat penalty, presence penalty | every request | see section 4 | model setting |
+
+GPU offload, context overflow and unloading on idle are not offered by LM Studio's API; they stay
+as set in LM Studio.
 
 ---
 
@@ -272,9 +297,9 @@ python auto_loadtest.py --users 1,4,8 --stage-duration 120 --cooldown 15
 # Strict interactive limits for a chat workspace
 python auto_loadtest.py --users 2,4,8,12,16,24 --max-p95 45 --max-fail-rate 0.01 --refine -- --mode chat
 
-# LM Studio directly, pure model capacity
+# LM Studio natively, pure model capacity
 python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32,48,64 --refine
 
-# LM Studio directly with a RAG-like input of about 2000 tokens per question
-python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- --model google/gemma-4-12b --context-tokens 2000
+# LM Studio natively with a RAG-like input of about 2000 tokens per question and thinking off
+python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- --model google/gemma-4-12b --context-tokens 2000 --reasoning off
 ```

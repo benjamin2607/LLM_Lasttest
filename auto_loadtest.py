@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated capacity test for AnythingLLM backed by LM Studio, or for LM Studio directly.
+Automated capacity test for AnythingLLM backed by LM Studio, or for LM Studio natively (without AnythingLLM).
 
 Runs a Locust user file headless several times with an increasing number of
 concurrent users: main.py for AnythingLLM (--target anythingllm, the default) or
@@ -47,7 +47,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TARGETS = {
     "anythingllm": {"label": "AnythingLLM", "host": "http://localhost:3001", "locustfile": "main.py",
                     "chat": "/thread/chat"},
-    "lmstudio": {"label": "LM Studio (direct)", "host": "http://localhost:1234", "locustfile": "lmstudio_user.py",
+    "lmstudio": {"label": "LM Studio native", "host": "http://localhost:1234", "locustfile": "lmstudio_user.py",
                  "chat": "/v1/chat/completions"},
 }
 CHAT_PREFIXES = tuple(t["chat"] for t in TARGETS.values())  # Names of the chat entries in the Locust statistics.
@@ -708,8 +708,10 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
     if args.target == "lmstudio":
         model = passthrough_value(args.passthrough, "--model")
         context = passthrough_value(args.passthrough, "--context-tokens")
+        reasoning, temperature = passthrough_value(args.passthrough, "--reasoning"), passthrough_value(args.passthrough, "--temperature")
         details = [f"model {model}" if model else None,
-                   f"≈ {context} context tokens per request" if context and context != "0" else None]
+                   f"≈ {context} context tokens per request" if context and context != "0" else None,
+                   f"thinking {reasoning}" if reasoning else None, f"temperature {temperature}" if temperature else None]
     else:
         details = [f"mode {passthrough_value(args.passthrough, '--mode') or 'query'}"]
     body = [f"<h1>{html.escape(report_title(args, out_dir))} – {html.escape(TARGETS[args.target]['label'])}</h1>",
@@ -817,7 +819,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--name", default="", help="Name of the load test, shown as the report title (optional)")
     ap.add_argument("--target", choices=sorted(TARGETS), default="anythingllm",
-                    help="System under test: AnythingLLM (via its developer API) or LM Studio directly")
+                    help="System under test: AnythingLLM (via its developer API) or LM Studio natively")
     ap.add_argument("--host", help="Base URL (default: http://localhost:3001 for AnythingLLM, "
                                    "http://localhost:1234 for LM Studio)")
     ap.add_argument("--locustfile", type=Path, help="Locust user file (default: main.py or lmstudio_user.py)")

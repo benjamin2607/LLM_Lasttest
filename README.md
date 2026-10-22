@@ -19,6 +19,7 @@ Step-by-step guide for the first run: **[QUICKSTART.md](QUICKSTART.md)**. All op
 | `auto_loadtest.py` | Automated capacity test of AnythingLLM or LM Studio (`--target`): increases concurrent users stage by stage until a limit is exceeded |
 | `locust_final_stats.py` | Writes complete Locust statistics at the end of each stage (used by both Locust files) |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
+| `lmstudio_models.py` | LM Studio model card of the dashboard: list, load, reload and unload models, saved model configurations |
 | `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
 | `dashboard.html` | Dashboard front end, served by the monitor (no external libraries) |
 | `report_charts.py` | Self-contained SVG charts and HTML rendering for the reports |
@@ -101,17 +102,22 @@ this feature get the print layout when the monitor serves them. Give load tests 
 
 Tip: run once with `--mode query` and once with `--mode chat`; for overnight runs, choose a generous `--users` list.
 
-### Testing LM Studio directly
+### Testing LM Studio natively
 
-`--target lmstudio` runs the same test against LM Studio's OpenAI-compatible API
-(`http://localhost:1234/v1/chat/completions`) instead of AnythingLLM:
+`--target lmstudio` ("LM Studio native" in the dashboard) runs the same test against LM Studio
+itself instead of AnythingLLM. Requests go to LM Studio's OpenAI-compatible endpoint
+(`/v1/chat/completions`), because LM Studio logs a completion ID for every chunk there, so
+parallel requests are tracked exactly:
 
 ```bash
 python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- --context-tokens 2000
 ```
 
-- No AnythingLLM API key or workspace is needed. The first loaded model is used unless
-  `-- --model ID` is given; `LMSTUDIO_API_TOKEN` is used if "Require API token" is enabled.
+- No AnythingLLM API key or workspace is needed; `LMSTUDIO_API_TOKEN` is used if "Require API
+  token" is enabled. From the dashboard, the test uses the model and settings chosen in the
+  **LM Studio model** card (see below); on the command line the first loaded model is used
+  unless `-- --model ID` is given, and sampling options such as `-- --temperature 0.3
+  --reasoning off` are only sent when given.
 - The questions come from `prompts_lmstudio.json`: general study questions that need no documents
   (the AnythingLLM questions in `prompts.json` refer to the workspace documents).
 - Answers are streamed as in a chat window; the response time counts until the last token.
@@ -121,6 +127,32 @@ python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- -
 - Stages, limits, report layout and result files are the same, and the dashboard form offers the
   same choice ("System under test"). Threads and "no relevant documents" refusals do not exist
   here; technical rejections are reported as usual.
+
+#### LM Studio model card (dashboard)
+
+A card above the load test chooses and loads the model, independently of the load test:
+
+- **Model:** all language models on disk, with their load state and the settings of a loaded one.
+- **Loaded model:** *Keep current LM Studio settings* (test it as it is), *Adjust settings*
+  (reload with the settings of the card) or *Reload model* (reload with LM Studio's defaults).
+  A model that is not loaded can be loaded with the card's settings or with the defaults.
+- **Settings**, grouped like in LM Studio: *Load* (context length, parallel requests; under
+  Advanced: flash attention, evaluation batch size, KV cache on the GPU, experts), *Settings*
+  (system prompt, max response tokens), *Sampling* (temperature, top P; under Advanced: top K,
+  min P, repeat and presence penalty) and *Reasoning* (thinking, with the options the model
+  offers). Load settings apply when the model is loaded; the others are sent with every request
+  of an "LM Studio native" load test. GPU offload, context overflow and unloading on idle are
+  not offered by LM Studio's API and stay as set in LM Studio.
+- **Saved configurations:** save the card's settings under a name and pick them again later.
+  They are kept in `model_configs.json` in the project folder (settings only).
+- **Unload model** (bottom left) unloads the model after a confirmation.
+- Models cannot be changed while a load test is running.
+
+With "AnythingLLM" selected, the load test form shows which model AnythingLLM uses (workspace or
+system setting, read through its API) and warns if it is not loaded in LM Studio: AnythingLLM
+always uses its own model setting, system prompt and temperature, so the card's request settings
+do not apply to AnythingLLM tests. If an AnythingLLM model is not loaded, LM Studio loads it on
+demand with default settings, next to the model already loaded.
 
 Comparing both reports separates the model's capacity from the time AnythingLLM adds (document
 search, embedding, prompt building). All options: [PARAMETERS.md](PARAMETERS.md#4-simulated-users-for-lm-studio--lmstudio_userpy).

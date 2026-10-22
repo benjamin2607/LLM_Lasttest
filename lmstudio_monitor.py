@@ -40,6 +40,7 @@ from pathlib import Path
 
 from live_session import SessionManager, build_from_log, list_sessions
 from lmstudio_log_parser import LogParser, diagnose, rnd
+from lmstudio_models import ModelControl, request_arguments
 from report_charts import with_print_support
 from system_metrics import SystemSampler
 
@@ -408,7 +409,7 @@ class LoadTestControl:
         "stop_timeout": (int, 0, 600), "max_p95": (float, 1, 3600), "max_fail_rate": (float, 0, 1),
         "student_think_time": (float, 1, 3600), "wait_min": (float, 0, 600), "wait_max": (float, 0, 600),
         "request_timeout": (float, 5, 3600), "max_threads": (int, 0, 10000),
-        "max_tokens": (int, 0, 131072), "context_tokens": (int, 0, 200000), "temperature": (float, 0, 2),
+        "context_tokens": (int, 0, 200000),
     }
 
     def __init__(self, project_dir, anythingllm_url, api_key, lmstudio_url="http://localhost:1234", lmstudio_token=None):
@@ -422,6 +423,8 @@ class LoadTestControl:
         self.api_key = api_key
         self.lmstudio_url = lmstudio_url.rstrip("/")
         self.lmstudio_token = lmstudio_token
+        self.models = None  # ModelControl of the dashboard, set by main().
+        self._workspace_model = (0.0, None)
         self.lock = threading.Lock()
         self.progress = {"phase": "idle"}
 
@@ -445,7 +448,10 @@ class LoadTestControl:
             forwarded = []
         opts = {}
         for i, arg in enumerate(forwarded):
-            if arg.startswith("--") and i + 1 < len(forwarded) and not forwarded[i + 1].startswith("--"):
+            if arg.startswith("--") and "=" in arg:
+                key, value = arg[2:].split("=", 1)
+                opts[key.replace("-", "_")] = value
+            elif arg.startswith("--") and i + 1 < len(forwarded) and not forwarded[i + 1].startswith("--"):
                 opts[arg[2:].replace("-", "_")] = forwarded[i + 1]
         cfg["forwarded"] = opts
         return cfg
@@ -523,6 +529,37 @@ class LoadTestControl:
                 "report": (folder / "report.html").exists()})
         return out
 
+    def anythingllm_model(self, max_age=30):
+        """
+        The model AnythingLLM uses for WORKSPACE_SLUG: the workspace's own model, otherwise the system
+        model. Returns {"model", "provider", "source"} or None if it cannot be read; cached for 30 s.
+        """
+        at, cached = self._workspace_model
+        if time.time() - at < max_age:
+            return cached
+        workspace, info = os.environ.get("WORKSPACE_SLUG"), None
+        if self.api_key and workspace:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+
+            def get(path):
+                with urllib.request.urlopen(urllib.request.Request(f"{self.url}{path}", headers=headers), timeout=5) as r:
+                    return json.loads(r.read())
+            try:
+                ws = get(f"/api/v1/workspace/{workspace}").get("workspace")
+                ws = (ws[0] if isinstance(ws, list) and ws else ws) or {}
+                if ws.get("chatModel"):
+                    info = {"model": ws["chatModel"], "provider": ws.get("chatProvider"), "source": "workspace"}
+                else:
+                    settings = get("/api/v1/system").get("settings") or {}
+                    provider = settings.get("LLMProvider")
+                    pref = next((v for k, v in settings.items() if k.lower() == f"{(provider or '').lower()}modelpref"), None)
+                    if pref:
+                        info = {"model": pref, "provider": provider, "source": "system"}
+            except (urllib.error.URLError, OSError, ValueError, AttributeError):
+                info = None
+        self._workspace_model = (time.time(), info)
+        return info
+
     def threads(self):
         try:
             return json.loads(self.registry_file.read_text(encoding="utf-8")).get("threads", [])
@@ -589,9 +626,11 @@ class LoadTestControl:
             secret = api_key
         else:
             workspace, mode = None, None
-            model = str(params.get("model") or "").strip()
-            if model and not re.fullmatch(r"[\w][\w.:/@-]{0,199}", model):
-                return False, "model must be a model id as listed by LM Studio"
+            # The model and its request settings come from the dashboard's LM Studio model card.
+            model = self.models.loaded_model() if self.models else None
+            if not model:
+                return False, "no model is loaded in LM Studio – load one in the LM Studio model card first"
+            request_args = request_arguments(self.models.request_settings(model))
             if self.lmstudio_token:
                 env["LMSTUDIO_API_TOKEN"] = self.lmstudio_token
             secret = self.lmstudio_token
@@ -622,8 +661,8 @@ class LoadTestControl:
             cmd += ["--", "--mode", mode]
             forwarded = ("wait_min", "wait_max", "request_timeout", "max_threads")
         else:
-            cmd += ["--", "--model", model] if model else ["--"]
-            forwarded = ("wait_min", "wait_max", "request_timeout", "max_tokens", "context_tokens", "temperature")
+            cmd += ["--", "--model", model, *request_args]
+            forwarded = ("wait_min", "wait_max", "request_timeout", "context_tokens")
         for key in forwarded:
             if key in values:
                 cmd += [f"--{key.replace('_', '-')}", str(values[key])]
@@ -741,6 +780,9 @@ def start_dashboard(port, recorder, control, sessions):
                                        "session": sessions.state()}).encode(), "application/json")
             elif path == "/api/loadtests":
                 self._send(json.dumps(control.list_runs()).encode(), "application/json")
+            elif path == "/api/models":
+                state = control.models.state() if control.models else {"models": [], "error": "not available"}
+                self._send(json.dumps({**state, "anythingllm": control.anythingllm_model()}).encode(), "application/json")
             elif path == "/api/loadtest/details":
                 self._send(json.dumps(control.loadtest_details()).encode(), "application/json")
             elif path == "/api/sessions":
@@ -780,10 +822,23 @@ def start_dashboard(port, recorder, control, sessions):
             """
             if not self._trusted():
                 return
-            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest", "delete"):
+            if self.headers.get("X-Monitor-Action") not in ("dismiss", "stop", "clear", "session", "loadtest", "delete",
+                                                            "model"):
                 self.send_error(403)
                 return
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/api/models/") and control.models:
+                body, models = self._json_body(), control.models
+                actions = {"/api/models/apply": lambda: models.apply(body),
+                           "/api/models/unload": lambda: models.unload(str(body.get("model") or "")),
+                           "/api/models/configs/save": lambda: models.save_config(body),
+                           "/api/models/configs/delete": lambda: models.delete_config(str(body.get("name") or ""))}
+                if path not in actions:
+                    self.send_error(404)
+                    return
+                ok, message = actions[path]()
+                self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
+                return
             if path == "/api/monitor/clear":
                 recorder.clear()
                 session = sessions.current
@@ -971,6 +1026,8 @@ def main():
         try:
             control = LoadTestControl(args.project_dir, args.anythingllm_url, os.environ.get("ANYTHING_API_KEY"),
                                       args.lmstudio_url, args.token)
+            control.models = ModelControl(args.lmstudio_url, args.token, Path(args.project_dir) / "model_configs.json",
+                                          busy=lambda: control.loadtest()["running"])
             start_dashboard(args.dashboard_port, recorder, control, sessions)
         except OSError as exc:
             sys.exit(f"[monitor] ERROR: cannot bind dashboard to 127.0.0.1:{args.dashboard_port} ({exc.strerror}). "

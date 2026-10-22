@@ -97,15 +97,18 @@ above 120 s, more than 5 % failures, GPU memory or temperature too high).
 table. The *Result* section at the top shows the highest stable number of concurrent users and an
 estimate of how many real students the system can serve.
 
-### Testing LM Studio directly
+### Testing LM Studio natively
 
-To measure the model alone, without AnythingLLM, choose **LM Studio directly** in the form, or:
+To measure the model alone, without AnythingLLM, choose the model and its settings in the
+**LM Studio model** card (keep it as loaded, adjust and reload, or load a saved configuration),
+then choose **LM Studio native** in the load test form. On the command line:
 
 ```bash
 python auto_loadtest.py --target lmstudio --users 1,2,4,8,16
 ```
 
-No API key or workspace is needed; the first loaded model is used (`-- --model ID` picks another).
+No API key or workspace is needed; on the command line the first loaded model is used
+(`-- --model ID` picks another).
 The questions come from `prompts_lmstudio.json` and need no documents. Add
 `-- --context-tokens 2000` to put a RAG-like input load on the model. The report has the same
 layout; comparing it with an AnythingLLM report shows how much time AnythingLLM itself adds.
