@@ -168,6 +168,37 @@ class ModelControlTests(unittest.TestCase):
             self.assertFalse(reopened.delete_config("Gemma 8k")[0])
 
 
+class WarmupTests(unittest.TestCase):
+    class Args:
+        target, host, passthrough = "lmstudio", "http://localhost:1234", ["--model", "m"]
+
+    def test_waits_for_the_answer_and_survives_errors(self):
+        original = auto_loadtest.warmup_lmstudio
+        try:
+            auto_loadtest.warmup_lmstudio = lambda host, model: time.sleep(0.2) or model
+            took, stopped = auto_loadtest.warm_up(self.Args, "run")
+            self.assertGreaterEqual(took, 0.2)
+            self.assertFalse(stopped)
+
+            def fail(host, model):
+                raise RuntimeError("no model")
+            auto_loadtest.warmup_lmstudio = fail
+            self.assertFalse(auto_loadtest.warm_up(self.Args, "run")[1])  # The test goes on; the console warns.
+        finally:
+            auto_loadtest.warmup_lmstudio = original
+
+    def test_stop_from_the_dashboard_ends_the_warm_up(self):
+        original, original_stop = auto_loadtest.warmup_lmstudio, auto_loadtest.stop_requested
+        try:
+            auto_loadtest.warmup_lmstudio = lambda host, model: time.sleep(5)
+            auto_loadtest.stop_requested = lambda: True
+            took, stopped = auto_loadtest.warm_up(self.Args, "run")
+            self.assertTrue(stopped)
+            self.assertLess(took, 2)
+        finally:
+            auto_loadtest.warmup_lmstudio, auto_loadtest.stop_requested = original, original_stop
+
+
 class ReportTests(unittest.TestCase):
     def test_print_support_is_added_once_to_old_reports(self):
         from report_charts import PRINT_MARKER, html_page, with_print_support

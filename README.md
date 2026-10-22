@@ -64,6 +64,11 @@ Run the test:
 python auto_loadtest.py --users 1,2,4,8,16,24,32,48,64 --stage-duration 300 --refine -- --mode query --wait-min 5 --wait-max 15
 ```
 
+Before the first stage, a **warm-up** request is sent and the test waits for its answer, so the
+model is loaded (LM Studio loads it on demand) before anything is measured; for AnythingLLM it
+runs in a temporary thread that is deleted afterwards. The report notes how long it took; the
+dashboard shows "waiting for the model" meanwhile (`--skip-warmup` turns it off).
+
 Each stage starts Locust headless, ramps up, measures for `--stage-duration`
 seconds while sampling GPU/host/token metrics, and evaluates the result. The
 first stage that violates a limit ends the run; `--refine` then bisects to find

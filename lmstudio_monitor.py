@@ -434,7 +434,8 @@ class LoadTestControl:
         except (OSError, ValueError):
             return {"running": False}
         running = time.time() - status.get("heartbeat", 0) < self.HEARTBEAT_TIMEOUT_S
-        return {"running": running, **{k: status.get(k) for k in ("run", "name", "stage", "users", "workspace", "run_started", "target")}}
+        return {"running": running, **{k: status.get(k) for k in ("run", "name", "stage", "users", "workspace", "run_started", "target",
+                                                       "phase")}}
 
     def _run_config(self, run):
         """Settings of a load test run from its config.json (values as the run recorded them)."""

@@ -220,6 +220,89 @@ def preflight(host):
     print(f"[preflight] AnythingLLM reachable, API key valid, workspace '{ws}'.")
 
 
+# --- Warm-up: the model must be loaded before anything is measured ---
+WARMUP_TIMEOUT_S = 900  # Loading a large model can take minutes.
+
+
+def _post_json(url, body, headers, timeout, method="POST"):
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json", **headers}, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def warmup_lmstudio(host, model):
+    """One short request to LM Studio, so a model that is not loaded yet is loaded before stage 1."""
+    token = os.environ.get("LMSTUDIO_API_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    if not model:
+        listed = _post_json(f"{host}/api/v1/models", None, headers, 10, method="GET").get("models", [])
+        llms = [m for m in listed if m.get("type") in ("llm", "vlm")]
+        model = next((m["key"] for m in llms if m.get("loaded_instances")), None) or (llms[0]["key"] if llms else None)
+    if not model:
+        raise RuntimeError("LM Studio offers no language model")
+    _post_json(f"{host}/v1/chat/completions", {"model": model, "max_tokens": 8, "stream": False,
+                                               "messages": [{"role": "user", "content": "Hallo"}]},
+               headers, WARMUP_TIMEOUT_S)
+    return model
+
+
+def warmup_anythingllm(host, mode, run):
+    """
+    One question through AnythingLLM in a temporary thread, so AnythingLLM's model (and its embedding
+    model) is loaded before stage 1. The thread is deleted afterwards.
+    """
+    key, ws = os.environ["ANYTHING_API_KEY"], os.environ["WORKSPACE_SLUG"]
+    headers = {"Authorization": f"Bearer {key}"}
+    slug = f"lt-warmup-{re.sub(r'[^a-z0-9-]+', '-', run.lower())}"
+    created = _post_json(f"{host}/api/v1/workspace/{ws}/thread/new", {"name": f"Loadtest {run} warm-up", "slug": slug},
+                         headers, 30)
+    slug = (created.get("thread") or {}).get("slug", slug)
+    try:
+        prompts = json.loads((BASE_DIR / "prompts.json").read_text(encoding="utf-8"))
+        _post_json(f"{host}/api/v1/workspace/{ws}/thread/{slug}/chat", {"message": prompts[0], "mode": mode},
+                   headers, WARMUP_TIMEOUT_S)
+    finally:
+        try:
+            _post_json(f"{host}/api/v1/workspace/{ws}/thread/{slug}", None, headers, 30, method="DELETE")
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+
+
+def warm_up(args, run):
+    """
+    Send one request and wait for its answer before the first stage, so that loading the model (on demand
+    in LM Studio) is not part of any measurement. Returns (seconds, stopped); stopping from the dashboard
+    is honoured while waiting.
+    """
+    if args.target == "lmstudio":
+        task = lambda: warmup_lmstudio(args.host, passthrough_value(args.passthrough, "--model"))  # noqa: E731
+    else:
+        task = lambda: warmup_anythingllm(args.host, passthrough_value(args.passthrough, "--mode") or "query", run)  # noqa: E731
+    outcome = {}
+
+    def run_task():
+        try:
+            outcome["result"] = task()
+        except (urllib.error.URLError, OSError, ValueError, RuntimeError, KeyError) as exc:
+            outcome["error"] = exc
+
+    t0 = time.time()
+    worker = threading.Thread(target=run_task, daemon=True)
+    worker.start()
+    print("\n=== Warm-up: waiting until the model is loaded and answers (not measured) ===")
+    while worker.is_alive():
+        if stop_requested():
+            return round(time.time() - t0, 1), True
+        worker.join(1)
+    took = round(time.time() - t0, 1)
+    if "error" in outcome:
+        print(color(f"  Warm-up request failed ({outcome['error']}); the first stage may include loading time.", "1;33"))
+    else:
+        print(f"  model ready after {took} s")
+    return took, False
+
+
 def build_levels(args):
     """Return the ordered list of user counts to test."""
     if args.users:
@@ -479,9 +562,13 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
              f"forwarded to {args.locustfile.name}: `{' '.join(args.passthrough) or '-'}`",
              f"- Limits: failure rate ≤ {args.max_fail_rate:.0%}, chat p95 ≤ {args.max_p95}s, "
              f"VRAM ≤ {args.max_vram_pct}%, GPU ≤ {args.max_gpu_temp}°C", ""]
+    if getattr(args, "warmup_s", None) is not None:
+        lines += [f"- Warm-up: the model answered after {args.warmup_s} s; measurement started only then.", ""]
     if aborted:
         lines += ["**The test was aborted manually; results are incomplete.**", ""]
-    if user_stop and not any(r.get("stopped") for r in results):
+    if user_stop and not results:
+        lines += ["**The test was stopped from the dashboard during the warm-up; no stage was run.**", ""]
+    elif user_stop and not any(r.get("stopped") for r in results):
         lines += ["**The test was stopped from the dashboard between stages; later stages were not run.**", ""]
     lines += ["## Result", ""]
     stopped = next((r for r in results if r.get("stopped")), None)
@@ -696,7 +783,8 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
         banners.append(f"Stopped from the dashboard at {stopped['users']} users (stage {stopped['stage']}); "
                        "no further stages were run.")
     elif summary["user_stop"]:
-        banners.append("Stopped from the dashboard between stages; later stages were not run.")
+        banners.append("Stopped from the dashboard between stages; later stages were not run." if results
+                       else "Stopped from the dashboard during the warm-up; no stage was run.")
     if summary["aborted"]:
         banners.append("The test was aborted manually; results are incomplete.")
     if failed:
@@ -718,7 +806,9 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
             "<p class='meta'>" + " · ".join(html.escape(x) for x in filter(None, [
                 started.strftime("%Y-%m-%d %H:%M") if started else None, f"run {out_dir.name}" if args.name else None,
                 args.host, *details,
-                f"{args.stage_duration} s per stage", gpu])) + "</p>"]
+                f"{args.stage_duration} s per stage",
+                f"warm-up {args.warmup_s:g} s (not measured)" if getattr(args, "warmup_s", None) is not None else None,
+                gpu])) + "</p>"]
     body += [f"<div class='banner'>{html.escape(b)}</div>" for b in banners]
     if failed:
         body.append(f"<pre>{html.escape(failed['error'])}</pre>")
@@ -846,6 +936,8 @@ def main():
     ap.add_argument("--lmstudio-log", default="auto", help="'auto', a path, or 'off'")
     ap.add_argument("--out", default="loadtest_results")
     ap.add_argument("--skip-preflight", action="store_true")
+    ap.add_argument("--skip-warmup", action="store_true",
+                    help="Start stage 1 right away instead of waiting until the model is loaded and answers")
     ap.add_argument("--dry-run", action="store_true", help="Only print the planned stages and duration")
     args, passthrough = ap.parse_known_args()
     sys.stdout.reconfigure(line_buffering=True)  # Flush every line, also when redirected to a file.
@@ -900,7 +992,11 @@ def main():
 
     results, last_ok, first_bad, aborted, user_stop = [], None, None, False, False
     try:
-        for users in levels:
+        if not args.skip_warmup:
+            STATUS.update(phase="warmup")
+            args.warmup_s, user_stop = warm_up(args, out_dir.name)
+            STATUS.update(phase="stages")
+        for users in ([] if user_stop else levels):
             r = run_stage(len(results) + 1, users, args, args.passthrough, out_dir, sampler, watcher)
             results.append(r)
             write_results(out_dir, results, args, last_ok, first_bad, False)

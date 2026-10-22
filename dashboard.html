@@ -855,10 +855,13 @@ function renderControl() {
   const lt = control.loadtest || {}, p = control.progress || {}, busy = p.phase === "stopping" || p.phase === "deleting";
   const elapsed = lt.running && lt.run_started ? ` · ${clockTime(Date.now() / 1000 - lt.run_started)}` : "";
   setChip("chipLoad", lt.running ? "warn" : "", lt.running
-    ? `load test running · stage ${lt.stage || 0} · ${lt.users || 0} users${elapsed}` : "load test idle", lt.running);
+    ? (lt.phase === "warmup" ? `load test · waiting for the model${elapsed}` : `load test running · stage ${lt.stage || 0} · ${lt.users || 0} users${elapsed}`)
+    : "load test idle", lt.running);
   $("stopAll").disabled = busy || (!lt.running && !control.threads);
   $("loadText").innerHTML = (lt.running
-    ? `<b>Running</b> – stage ${lt.stage || 0} with ${lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`
+    ? (lt.phase === "warmup"
+      ? `<b>Warm-up</b> – waiting until the model is loaded and answers; measuring starts then (run ${escapeHtml(lt.run || "")}).`
+      : `<b>Running</b> – stage ${lt.stage || 0} with ${lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`)
     : "No load test is running.")
     + ` ${control.threads || 0} load-test threads in AnythingLLM`
     + (control.can_delete ? "." : " (set ANYTHING_API_KEY for the monitor to delete them).");

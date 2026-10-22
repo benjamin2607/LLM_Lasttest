@@ -105,6 +105,7 @@ first stage that breaks a limit. Everything after `--` is forwarded to the simul
 | `--locustfile PATH` | `main.py` or `lmstudio_user.py` next to the script, depending on `--target` | Locust file with the user behaviour. |
 | `--lmstudio-log VALUE` | `auto` | LM Studio log for exact token and timing figures: `auto` (default location), a path, or `off`. |
 | `--skip-preflight` | off | Skip the initial check (AnythingLLM: API key and workspace; LM Studio: server reachable and model available). |
+| `--skip-warmup` | off | Start stage 1 right away. By default the test first sends one request and waits for its answer, so loading the model (LM Studio loads it on demand) and, for AnythingLLM, the embedding model is never part of a measurement. | Leave off |
 | `--dry-run` | off | Only print the planned stages and the expected duration, then exit. |
 
 ---
