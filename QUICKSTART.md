@@ -7,8 +7,8 @@ From zero to a running dashboard, a first load test and a recorded live session 
 ## 1. Requirements
 
 - Python 3.10 or newer
-- LM Studio with the local server running (default port 1234) and a model loaded
-- AnythingLLM using LM Studio as its LLM provider (default port 3001)
+- LM Studio with the local server running (default port 1234)
+- AnythingLLM using LM Studio as its LLM provider (default port 3001) – only for AnythingLLM load tests
 - Recommended: in LM Studio, **Developer → Logging → Verbose Logging** on, so that requests from
   the LM Studio chat window are tracked as well
 
@@ -73,11 +73,26 @@ If no requests appear, run `python lmstudio_monitor.py --diagnose` (see the READ
 
 Keep the monitor running during load tests and live tests.
 
+### Choose the model
+
+The **LM Studio model** card (above the load test) shows all models with their load state. Pick a
+model, then either keep it as loaded, **Adjust settings** (context length, parallel requests,
+system prompt, temperature, top P, thinking; more under *Advanced*) and reload it, or reload it
+with LM Studio's defaults. Click the save icon to keep the settings as a named configuration and
+pick it again later from *Saved configuration*. **Unload model** (bottom left) frees the memory.
+
+Tip: set *Parallel requests* at least to the number of users you want to test at the same time –
+with fewer slots, LM Studio queues the requests.
+
 ## 5. Run a load test
 
-**From the dashboard:** open **New load test …** in the Load test card at the bottom, check the
-stages (e.g. `1,2,4,8,16`) and start. The chip at the top shows stage, users and elapsed time;
-**Stop & delete threads** ends the test at any time.
+**From the dashboard:** open **New load test …** in the Load test card at the bottom, give it a
+name (it becomes the report title), choose **AnythingLLM** or **LM Studio native**, check the
+stages (e.g. `1,2,4,8,16`) and start. The form shows which model will be tested. The chip at the
+top shows stage, users and elapsed time; **Stop & delete threads** ends the test at any time.
+
+Before the first stage, the test waits until the model is loaded and answers ("waiting for the
+model"), so loading time is never measured.
 
 **From a second terminal** (with the variables from step 3 set):
 
@@ -135,3 +150,5 @@ Sessions store only numbers, times and model names, no prompts, answers or user 
 - Adjust the limits to what students will tolerate, e.g. `--max-p95 45`.
 - Use `--refine` for the final measurement to find the exact limit.
 - Edit `prompts.json` so the questions match the documents in the workspace.
+- Save model configurations for the setups you compare (e.g. context length or parallel requests)
+  and name the load tests accordingly; export the reports as PDF for your documentation.

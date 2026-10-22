@@ -855,13 +855,13 @@ function renderControl() {
   const lt = control.loadtest || {}, p = control.progress || {}, busy = p.phase === "stopping" || p.phase === "deleting";
   const elapsed = lt.running && lt.run_started ? ` · ${clockTime(Date.now() / 1000 - lt.run_started)}` : "";
   setChip("chipLoad", lt.running ? "warn" : "", lt.running
-    ? (lt.phase === "warmup" ? `load test · waiting for the model${elapsed}` : `load test running · stage ${lt.stage || 0} · ${lt.users || 0} users${elapsed}`)
+    ? (lt.phase === "warmup" ? `load test · waiting for the model${elapsed}` : `load test running · stage ${+lt.stage || 0} · ${+lt.users || 0} users${elapsed}`)
     : "load test idle", lt.running);
   $("stopAll").disabled = busy || (!lt.running && !control.threads);
   $("loadText").innerHTML = (lt.running
     ? (lt.phase === "warmup"
       ? `<b>Warm-up</b> – waiting until the model is loaded and answers; measuring starts then (run ${escapeHtml(lt.run || "")}).`
-      : `<b>Running</b> – stage ${lt.stage || 0} with ${lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`)
+      : `<b>Running</b> – stage ${+lt.stage || 0} with ${+lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`)
     : "No load test is running.")
     + ` ${control.threads || 0} load-test threads in AnythingLLM`
     + (control.can_delete ? "." : " (set ANYTHING_API_KEY for the monitor to delete them).");
@@ -1045,7 +1045,7 @@ function renderModelChoice() {
     `<button type="button" class="mc-opt${k === mcAction ? " on" : ""}" data-action="${k}" role="radio" aria-checked="${k === mcAction}"><b>${title}</b><span>${text}</span></button>`).join("");
   const cfg = (m.instances[0] || {}).config || {};
   $("mcState").innerHTML = loaded ? `<span class="pill good">Loaded</span> ${escapeHtml(mcConfigText(cfg))}`
-    : `<span class="pill">Not loaded</span>${m.max_context ? ` max context ${m.max_context}` : ""}`;
+    : `<span class="pill">Not loaded</span>${m.max_context ? ` max context ${+m.max_context}` : ""}`;
   const active = models.active && models.active.model === m.key ? models.active : null;
   $("mcCurrent").textContent = mcAction === "keep"
     ? `Requests of LM Studio load tests: ${active && active.action === "adjust" && mcRequestText(active.request) || "the model's own settings in LM Studio"}.` : "";
@@ -1155,7 +1155,7 @@ async function openLoadTestPanel() {
     if (!d.run) { panel.innerHTML = `<h3>No load test yet</h3><div class="lt-sub">Start one in the Load test card at the bottom.</div>`; return; }
     const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v, lms = c.target === "lmstudio";
     const started = /^\d{8}_\d{6}$/.test(d.run) ? `${d.run.slice(6, 8)}.${d.run.slice(4, 6)}. ${d.run.slice(9, 11)}:${d.run.slice(11, 13)}` : d.run;
-    panel.innerHTML = `<h3>${d.running ? `Running – stage ${d.stage || 0} with ${d.users || 0} users` : "Last load test"}</h3>
+    panel.innerHTML = `<h3>${d.running ? `Running – stage ${+d.stage || 0} with ${+d.users || 0} users` : "Last load test"}</h3>
       <div class="lt-sub">${c.name && c.name !== "None" ? `<b>${escapeHtml(c.name)}</b> · ` : ""}Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
       + dl([["Started", started], ["System under test", lms ? "LM Studio native" : "AnythingLLM"],
             ...(lms ? [["Model", f.model || "first loaded model"], ["Context tokens per request", f.context_tokens || "0"],

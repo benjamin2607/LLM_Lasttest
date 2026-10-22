@@ -40,9 +40,13 @@ LOAD_TIMEOUT_S = 900  # Large models can take minutes to load.
 
 def _clean(settings, rules):
     """Validate settings against ``rules``; empty values are left out. Returns (values, error)."""
+    if settings in (None, ""):
+        settings = {}
+    if not isinstance(settings, dict):
+        return None, "settings must be an object"
     out = {}
     for key, (kind, lo, hi) in rules.items():
-        value = (settings or {}).get(key)
+        value = settings.get(key)
         if value in (None, ""):
             continue
         try:
@@ -63,12 +67,15 @@ def clean_request_settings(settings):
     out, error = _clean(settings, REQUEST_SETTINGS)
     if error:
         return None, error
-    prompt = str((settings or {}).get("system_prompt") or "")
+    settings = settings or {}
+    prompt = settings.get("system_prompt") or ""
+    if not isinstance(prompt, str):
+        return None, "the system prompt must be text"
     if len(prompt) > MAX_SYSTEM_PROMPT:
         return None, f"the system prompt must not exceed {MAX_SYSTEM_PROMPT} characters"
     if prompt.strip():
         out["system_prompt"] = prompt
-    reasoning = str((settings or {}).get("reasoning") or "")
+    reasoning = str(settings.get("reasoning") or "")
     if reasoning and reasoning not in REASONING_OPTIONS:
         return None, "thinking must be one of " + ", ".join(REASONING_OPTIONS)
     if reasoning:
@@ -99,10 +106,13 @@ class ModelControl:
         self.store = {"active": None, "configs": []}
         try:
             data = json.loads(self.store_path.read_text(encoding="utf-8"))
-            self.store.update({k: data.get(k) for k in ("active", "configs") if k in data})
-            self.store["configs"] = self.store["configs"] or []
         except (OSError, ValueError):
-            pass
+            data = {}
+        # The file may have been edited by hand: keep only well-formed entries.
+        if isinstance(data, dict):
+            if isinstance(data.get("active"), dict):
+                self.store["active"] = data["active"]
+            self.store["configs"] = [c for c in data.get("configs") or [] if isinstance(c, dict) and c.get("name")]
 
     # --- LM Studio API ---
     def _api(self, method, path, body=None, timeout=10):
@@ -255,7 +265,8 @@ class ModelControl:
 
     def save_config(self, params):
         """Save (or overwrite) a named configuration. Returns (ok, message)."""
-        name = " ".join(str(params.get("name") or "").split())[:80]
+        name = params.get("name")
+        name = " ".join(name.split())[:80] if isinstance(name, str) else ""
         if not name:
             return False, "enter a name for the configuration"
         load, error = _clean(params.get("load"), LOAD_SETTINGS)

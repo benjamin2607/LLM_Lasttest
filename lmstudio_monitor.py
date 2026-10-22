@@ -837,7 +837,11 @@ def start_dashboard(port, recorder, control, sessions):
                 if path not in actions:
                     self.send_error(404)
                     return
-                ok, message = actions[path]()
+                try:
+                    ok, message = actions[path]()
+                except Exception as exc:  # noqa: BLE001 - report any unexpected failure instead of dropping the connection.
+                    print(f"[monitor] model action failed: {type(exc).__name__}: {exc}")
+                    ok, message = False, "the action failed – see the monitor console"
                 self._send(json.dumps({"ok": ok, "message": message}).encode(), "application/json")
                 return
             if path == "/api/monitor/clear":

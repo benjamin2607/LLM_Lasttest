@@ -177,8 +177,8 @@ None of the options is required: the monitor finds the LM Studio log, the API an
 | Option | Default | Description |
 |---|---|---|
 | `--log PATH` | `~/.lmstudio/server-logs` | LM Studio log file or folder (or `LMSTUDIO_LOG_DIR`). |
-| `--lmstudio-url URL` | `http://localhost:1234` | LM Studio server, used for the loaded models and the status. |
-| `--token TOKEN` | `LMSTUDIO_API_TOKEN` | LM Studio API token, only if "Require API token" is enabled. |
+| `--lmstudio-url URL` | `http://localhost:1234` | LM Studio server, used for the status, the LM Studio model card (listing, loading, unloading models) and LM Studio native load tests started from the dashboard. |
+| `--token TOKEN` | `LMSTUDIO_API_TOKEN` | LM Studio API token, only if "Require API token" is enabled; also used by the model card and passed to LM Studio load tests. |
 | `--no-api` | off | Do not query the LM Studio API (log and GPU only). |
 | `--gpu-index N` | `0` | GPU to monitor in multi-GPU systems (NVIDIA). |
 | `--from-start` | off | Read the whole log from the beginning instead of new lines only. Rarely needed; see `--replay-minutes`. |
@@ -210,8 +210,8 @@ None of the options is required: the monitor finds the LM Studio log, the API an
 | `--interval S` | `60` | Aggregation interval of the CSV files, in seconds. Keep `60`, as the session reports work per minute. |
 | `--session LABEL` | – | Start a recording session right away (same as **Start session** in the dashboard). |
 | `--probe-interval S` | `0` | Send a short synthetic test request to LM Studio every S seconds to measure the response time even without users. `0` = off. Each probe adds a little load. |
-| `--anythingllm-url URL` | `http://localhost:3001` | AnythingLLM, used to delete load-test threads ("Stop & delete threads"). Needs `ANYTHING_API_KEY`. |
-| `--project-dir DIR` | folder of the script | Folder of `auto_loadtest.py`, its status and stop files and `loadtest_results/`. |
+| `--anythingllm-url URL` | `http://localhost:3001` | AnythingLLM, used to delete load-test threads ("Stop & delete threads") and to show which model AnythingLLM uses. Needs `ANYTHING_API_KEY` (and `WORKSPACE_SLUG` for the model). |
+| `--project-dir DIR` | folder of the script | Folder of `auto_loadtest.py`, its status and stop files, `loadtest_results/` and the saved model configurations (`model_configs.json`). |
 | `--diagnose` | off | Print which LM Studio log entry types are recognised (no content) and exit. |
 
 ---
