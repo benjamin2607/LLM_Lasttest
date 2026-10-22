@@ -347,6 +347,35 @@ def markdown_to_html(markdown, charts_html=None, insert_before=None):
     return "\n".join(out)
 
 
+# Print and PDF export ("Save as PDF" in the browser's print dialog): A4, always light colours, no page
+# breaks inside tiles, charts or table rows. report.html?print=1 opens the print dialog right away.
+PRINT_MARKER = "print-support"
+PRINT_SUPPORT = """<style id="print-support">
+@page { size: A4; margin: 14mm 12mm; }
+@media print {
+  :root { color-scheme: light; --bg: #ffffff; --surface: #ffffff; --border: #d9d8d2; --grid: #e6e5e0; --text: #0b0b0b;
+    --text-2: #52514e; --text-3: #6b6a65; --s1: #2a78d6; --s2: #eb6834; --critical: #d03b3b; }
+  body { background: #fff; font-size: 12px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  main { max-width: none; padding: 0; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 18px; break-after: avoid; page-break-after: avoid; }
+  .charts { grid-template-columns: 1fr; gap: 10px; }
+  .charts figure, .tile, tr, blockquote, pre, .banner { break-inside: avoid; page-break-inside: avoid; }
+  .table { overflow: visible; } table { font-size: 11px; }
+  a { color: inherit; text-decoration: none; }
+}
+</style>
+<script>
+if (new URLSearchParams(location.search).has("print")) addEventListener("load", () => setTimeout(print, 300));
+</script>"""
+
+
+def with_print_support(page):
+    """Add the print styles to a report written before they existed (inserted before </head>)."""
+    if PRINT_MARKER in page or "</head>" not in page:
+        return page
+    return page.replace("</head>", PRINT_SUPPORT + "</head>", 1)
+
+
 def html_page(title, body):
     """Wrap rendered content in a complete, self-contained HTML page with light/dark styling."""
     return f"""<!doctype html>
@@ -369,7 +398,7 @@ th:last-child, td:last-child {{ text-align: left; }}
 .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; }}
 .charts figure {{ margin: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; background: var(--surface); }}
 @media (max-width: 520px) {{ .charts {{ grid-template-columns: 1fr; }} }}
-</style></head><body><main>
+</style>{PRINT_SUPPORT}</head><body><main>
 {body}
 </main></body></html>
 """

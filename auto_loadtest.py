@@ -261,9 +261,9 @@ def stop_requested():
 class StatusPublisher(threading.Thread):
     """Keeps the status file fresh (every 2 s) for as long as the run is active."""
 
-    def __init__(self, run, target="anythingllm"):
+    def __init__(self, run, target="anythingllm", name=""):
         super().__init__(daemon=True)
-        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time(), "target": target,
+        self.fields = {"run": run, "name": name, "stage": 0, "users": 0, "stage_started": time.time(), "target": target,
                        "workspace": os.environ.get("WORKSPACE_SLUG") if target == "anythingllm" else None,
                        "run_started": time.time()}
         self._stop = threading.Event()
@@ -473,7 +473,8 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
             break
     best = max(passing, key=lambda r: r["chat_rps"], default=None)
 
-    lines = [f"# Load test report {out_dir.name}", "",
+    lines = [f"# {report_title(args, out_dir)}", "",
+             *([f"- Run: `{out_dir.name}`"] if args.name else []),
              f"- Target: {TARGETS[args.target]['label']}, host `{args.host}`, stage duration {args.stage_duration}s, "
              f"forwarded to {args.locustfile.name}: `{' '.join(args.passthrough) or '-'}`",
              f"- Limits: failure rate ≤ {args.max_fail_rate:.0%}, chat p95 ≤ {args.max_p95}s, "
@@ -578,6 +579,11 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
                "user_stop": user_stop}
     (out_dir / "report.html").write_text(html_report(out_dir, ordered, results, args, summary, lines, charts),
                                          encoding="utf-8")
+
+
+def report_title(args, out_dir):
+    """The load test's name if one was given, otherwise "Load test <folder>" (the folder stays the unique id)."""
+    return args.name or f"Load test {out_dir.name}"
 
 
 def passthrough_value(args, flag):
@@ -706,9 +712,10 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
                    f"≈ {context} context tokens per request" if context and context != "0" else None]
     else:
         details = [f"mode {passthrough_value(args.passthrough, '--mode') or 'query'}"]
-    body = [f"<h1>Load test {html.escape(out_dir.name)} – {html.escape(TARGETS[args.target]['label'])}</h1>",
+    body = [f"<h1>{html.escape(report_title(args, out_dir))} – {html.escape(TARGETS[args.target]['label'])}</h1>",
             "<p class='meta'>" + " · ".join(html.escape(x) for x in filter(None, [
-                started.strftime("%Y-%m-%d %H:%M") if started else None, args.host, *details,
+                started.strftime("%Y-%m-%d %H:%M") if started else None, f"run {out_dir.name}" if args.name else None,
+                args.host, *details,
                 f"{args.stage_duration} s per stage", gpu])) + "</p>"]
     body += [f"<div class='banner'>{html.escape(b)}</div>" for b in banners]
     if failed:
@@ -743,7 +750,7 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
     # Detailed sections from the Markdown report (refusals, stage table, notes); the result summary is in the tiles.
     rest = next((i for i, line in enumerate(lines) if line.startswith("## ") and not line.startswith("## Result")), len(lines))
     body.append(markdown_to_html("\n".join(lines[rest:])))
-    return html_page(f"Load test {out_dir.name}", TILE_CSS + "\n".join(body))
+    return html_page(report_title(args, out_dir), TILE_CSS + "\n".join(body))
 
 
 def time_charts(ordered, ref):
@@ -808,6 +815,7 @@ def build_charts(ordered, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--name", default="", help="Name of the load test, shown as the report title (optional)")
     ap.add_argument("--target", choices=sorted(TARGETS), default="anythingllm",
                     help="System under test: AnythingLLM (via its developer API) or LM Studio directly")
     ap.add_argument("--host", help="Base URL (default: http://localhost:3001 for AnythingLLM, "
@@ -840,6 +848,7 @@ def main():
     args, passthrough = ap.parse_known_args()
     sys.stdout.reconfigure(line_buffering=True)  # Flush every line, also when redirected to a file.
     args.passthrough = [p for p in passthrough if p != "--"]
+    args.name = " ".join(args.name.split())[:120]  # One line; the result folder stays the unique identifier.
     target = TARGETS[args.target]
     args.host = (args.host or target["host"]).rstrip("/")
     args.locustfile = (args.locustfile or BASE_DIR / target["locustfile"]).resolve()
@@ -871,7 +880,7 @@ def main():
     global STATUS
     if stop_requested():
         STOP_FILE.unlink()  # A stop request from an earlier run must not end this one.
-    STATUS = StatusPublisher(out_dir.name, args.target)
+    STATUS = StatusPublisher(out_dir.name, args.target, args.name)
     STATUS.start()
     print(f"Target: {target['label']} at {args.host}")
     print("Stop at any time with the \"Stop & delete threads\" button in the live monitor's dashboard.")

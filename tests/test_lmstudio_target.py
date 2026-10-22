@@ -75,7 +75,27 @@ class TargetTests(unittest.TestCase):
             ok, message = control.launch({"target": "lmstudio", "users": "1", "context_tokens": "-5"})
             self.assertFalse(ok)
             self.assertIn("context_tokens", message)
+            ok, message = control.launch({"target": "lmstudio", "users": "1", "name": "x" * 121})
+            self.assertFalse(ok)
+            self.assertIn("name", message)
             self.assertIsNone(control.process)  # Nothing was started.
+
+
+class ReportTests(unittest.TestCase):
+    def test_print_support_is_added_once_to_old_reports(self):
+        from report_charts import PRINT_MARKER, html_page, with_print_support
+        old = "<html><head><title>x</title><style></style></head><body></body></html>"
+        page = with_print_support(old)
+        self.assertEqual(page.count(f'id="{PRINT_MARKER}"'), 1)
+        self.assertEqual(with_print_support(page), page)
+        self.assertEqual(html_page("T", "<p>x</p>").count(f'id="{PRINT_MARKER}"'), 1)
+
+    def test_name_replaces_the_folder_in_the_title(self):
+        class Args:
+            name = "Gemma 12B"
+        self.assertEqual(auto_loadtest.report_title(Args, Path("20261022_120000")), "Gemma 12B")
+        Args.name = ""
+        self.assertEqual(auto_loadtest.report_title(Args, Path("20261022_120000")), "Load test 20261022_120000")
 
 
 if __name__ == "__main__":

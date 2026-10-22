@@ -117,6 +117,10 @@ layout; comparing it with an AnythingLLM report shows how much time AnythingLLM 
 3. Click **End session**. The report is written to `monitoring/sessions/<date_time>_<name>/report.html`
    and linked in the Sessions card.
 
+**PDF:** the **PDF** button next to each load test and session report opens it with a print layout
+and the print dialog; choose "Save as PDF". Give load tests a name in the form, it becomes the
+report title.
+
 Forgot to start a session? As long as the monitor was running, use **Create a report for a past time range**
 in the Sessions card and enter the start and end time.
 

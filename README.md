@@ -93,6 +93,12 @@ Results are written to `loadtest_results/<timestamp>/`:
 The report also identifies throughput saturation and estimates how many *real* students the
 system can serve, using Little's law with `--student-think-time` (default: 90 s between two questions).
 
+**PDF export.** The **PDF** button next to a report opens it with a print layout (A4, light colours,
+no page breaks inside tiles, charts or table rows) and the browser's print dialog right away; choose
+"Save as PDF". This works in every browser and needs no extra software; reports created before
+this feature get the print layout when the monitor serves them. Give load tests a name
+(`--name` or the form) so the PDF has a meaningful title.
+
 Tip: run once with `--mode query` and once with `--mode chat`; for overnight runs, choose a generous `--users` list.
 
 ### Testing LM Studio directly
@@ -159,8 +165,8 @@ only). It updates **every second** via a live stream and shows:
 
 - **Status bar:** a compact row of status LEDs (connection, LM Studio, log, model, GPU) that expands into the details on click, the load test status, and **Clear**, which resets all values shown and starts afresh (stored CSV data is kept; a restart does not restore cleared values). Warnings appear only in the tile they belong to
 - **Load test chip** at the top: shows stage, users and elapsed time; click it to see the settings of the running (or last) load test; technical details are under "Advanced"
-- **Load test card** at the bottom: status, link to the latest report, "Stop & delete threads", a table of all previous load tests (settings, result, throughput, p95, status, report, and a trash button that deletes the run's folder from disk after confirmation), and **New load test** – a form with all main parameters (stages, durations, think time, mode, limits, threads kept) and their defaults that starts `auto_loadtest.py`. The monitor needs `ANYTHING_API_KEY` and `WORKSPACE_SLUG` (or enter them in the form; the key is passed to the process only and never stored)
-- **Sessions card** at the bottom: **Report for a past time range** (see below) and the list of recorded sessions with links to their reports and a trash button (deletes the session folder from disk after confirmation; the recording session cannot be deleted)
+- **Load test card** at the bottom: status, link to the latest report, "Stop & delete threads", a table of all previous load tests (date, name, target, mode, stages, result, throughput, p95, status, **Open** and **PDF** for the report, and a trash button that deletes the run's folder from disk after confirmation), and **New load test** – a form with an optional name (shown as the report title; the result folder keeps its date name, so names may repeat), the system under test and all main parameters with their defaults that starts `auto_loadtest.py`. For AnythingLLM the monitor needs `ANYTHING_API_KEY` and `WORKSPACE_SLUG` (or enter them in the form; the key is passed to the process only and never stored)
+- **Sessions card** at the bottom: **Report for a past time range** (see below) and the list of recorded sessions with **Open** and **PDF** for their reports and a trash button (deletes the session folder from disk after confirmation; the recording session cannot be deleted)
 - Long ranges (30 min, Max) are drawn with at most 600 points per chart, using fixed time buckets aligned to the clock (maximum per bucket), so the drawn data stays stable while the window moves
 - **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start. Below a divider, each tile also shows the average over the selected time range (5/15/30 min); the response time and first token tiles add the p95 for that range
 - **While busy vs. overall:** averages over time (active requests, responses per minute, generated tokens/s, GPU utilisation) are shown "while busy" – only the seconds with at least one request in flight, including waiting for the first token – and "overall", which includes idle time. The busy share tells how much of the range the system was working. Use "while busy" to judge performance and "overall" for usage and planning. Figures per request are never affected by idle time

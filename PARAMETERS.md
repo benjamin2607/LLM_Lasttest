@@ -94,6 +94,7 @@ first stage that breaks a limit. Everything after `--` is forwarded to the simul
 |---|---|---|---|
 | `--refusal-warn-rate F` | `0.10` | Refusal rate from which refusals are highlighted in red. Refusals never fail a stage. | `0.10` |
 | `--student-think-time S` | `90` | Assumed time between two questions of one real student; used to estimate how many students the system can serve (Little's law). | `60`–`180`; measure it in a live session if possible |
+| `--name TEXT` | – | Name of the load test, shown as the report title instead of the folder name (one line, at most 120 characters). The result folder keeps its date and time, so the same name can be used several times. | Describe what is tested, e.g. `Gemma 12B, query, 30 users` |
 | `--out DIR` | `loadtest_results` | Results folder (one subfolder per run). | – |
 
 ### Connection and setup
@@ -215,6 +216,7 @@ checks every value against the range below before starting; the process is start
 
 | Field | Option | Allowed range | Default |
 |---|---|---|---|
+| Name (optional) | `--name` | one line, at most 120 characters | – |
 | System under test | `--target` | AnythingLLM, LM Studio | AnythingLLM |
 | AnythingLLM URL / LM Studio URL | `--host` | http(s) URL | `--anythingllm-url` or `--lmstudio-url` of the monitor |
 | Workspace slug | `WORKSPACE_SLUG` | letters, digits, `-`, `_` | `WORKSPACE_SLUG` of the monitor |

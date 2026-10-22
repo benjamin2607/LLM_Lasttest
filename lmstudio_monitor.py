@@ -40,6 +40,7 @@ from pathlib import Path
 
 from live_session import SessionManager, build_from_log, list_sessions
 from lmstudio_log_parser import LogParser, diagnose, rnd
+from report_charts import with_print_support
 from system_metrics import SystemSampler
 
 DEFAULT_LOG_DIRS = [
@@ -430,7 +431,7 @@ class LoadTestControl:
         except (OSError, ValueError):
             return {"running": False}
         running = time.time() - status.get("heartbeat", 0) < self.HEARTBEAT_TIMEOUT_S
-        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users", "workspace", "run_started", "target")}}
+        return {"running": running, **{k: status.get(k) for k in ("run", "name", "stage", "users", "workspace", "run_started", "target")}}
 
     def _run_config(self, run):
         """Settings of a load test run from its config.json (values as the run recorded them)."""
@@ -506,11 +507,13 @@ class LoadTestControl:
                 status = "completed"
             target = cfg.get("target") or "anythingllm"  # Runs from before --target existed tested AnythingLLM.
             forwarded = cfg.get("forwarded", {})
+            models = sorted({m.rsplit(":", 1)[0] for r in stages for m in (r.get("models") or "").split(";") if m})
             out.append({
-                "run": folder.name, "status": status, "target": target,
+                "run": folder.name, "name": cfg.get("name") or "", "status": status, "target": target,
+                "model": forwarded.get("model") or ", ".join(models) or None,
                 "users": cfg.get("users") if cfg.get("users") not in (None, "", "None")
                 else ",".join(str(r["users"]) for r in sorted(stages, key=lambda r: r["users"])),
-                "mode": forwarded.get("mode", "query") if target == "anythingllm" else forwarded.get("model", "auto"),
+                "mode": forwarded.get("mode", "query") if target == "anythingllm" else "direct",
                 "stage_duration": cfg.get("stage_duration"),
                 "stages_run": len(stages), "highest_passing": max((r["users"] for r in passing), default=None),
                 "limit_at": first_fail["users"] if first_fail else None,
@@ -562,6 +565,9 @@ class LoadTestControl:
         users = str(params.get("users", "")).replace(" ", "")
         if not re.fullmatch(r"\d{1,4}(,\d{1,4}){0,40}", users) or not all(int(u) > 0 for u in users.split(",")):
             return False, "users must be a comma-separated list of positive numbers, e.g. 1,2,4,8"
+        name = " ".join(str(params.get("name") or "").split())
+        if len(name) > 120 or any(ord(c) < 32 for c in name):
+            return False, "the name must be one line of at most 120 characters"
         target = params.get("target") or "anythingllm"
         if target not in ("anythingllm", "lmstudio"):
             return False, "target must be anythingllm or lmstudio"
@@ -604,7 +610,7 @@ class LoadTestControl:
             return False, "wait_min must not exceed wait_max"
 
         cmd = [sys.executable, str(self.project_dir / "auto_loadtest.py"), "--target", target, "--host", host,
-               "--users", users]
+               "--users", users] + (["--name", name] if name else [])
         for key in ("stage_duration", "spawn_rate", "cooldown", "stop_timeout", "max_p95", "max_fail_rate",
                     "student_think_time"):
             if key in values:
@@ -745,7 +751,9 @@ def start_dashboard(port, recorder, control, sessions):
                 folder = safe_child(root, path.split("/")[2])
                 report = folder / "report.html" if folder else None
                 if report is not None and report.is_file():
-                    self._send(report.read_bytes(), "text/html; charset=utf-8")
+                    # Reports written before the print styles existed get them here, for the PDF export.
+                    page = with_print_support(report.read_text(encoding="utf-8", errors="replace"))
+                    self._send(page.encode("utf-8"), "text/html; charset=utf-8")
                 else:
                     self.send_error(404)
             elif path == "/api/stream":

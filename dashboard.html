@@ -179,6 +179,9 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .hint { grid-column: 1 / -1; color: var(--text-3); font-size: 12px; margin: 0; }
 #ltLog { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px;
   white-space: pre-wrap; margin: 10px 0 0; color: var(--text); }
+.report-links { display: inline-flex; gap: 10px; white-space: nowrap; }
+.pdf-link { border: 1px solid var(--border); border-radius: 6px; padding: 0 6px; font-size: 12px; }
+.cell-sub { color: var(--text-3); font-size: 11px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .badge { font-size: 11px; color: var(--text-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
 @media (max-width: 520px) { .form-grid label.wide { grid-column: auto; } }
 .session { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; }
@@ -328,6 +331,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <details id="ltDetails">
       <summary>New load test …</summary>
       <form id="ltForm" class="form-grid" autocomplete="off">
+        <label class="wide">Name (optional, shown as the report title)<input name="name" maxlength="120" placeholder="e.g. Gemma 12B, 2000 context tokens"></label>
         <label>System under test<select name="target" id="ltTarget"><option value="anythingllm">AnythingLLM (with RAG)</option><option value="lmstudio">LM Studio directly</option></select></label>
         <label><span id="ltHostLabel">AnythingLLM URL</span><input name="host" type="url" required></label>
         <label data-for="anythingllm">Workspace slug<input name="workspace" required pattern="[A-Za-z0-9_\-]+"></label>
@@ -361,7 +365,7 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <div class="listing">
       <div class="subhead">Previous load tests</div>
       <div class="tablewrap" style="max-height:none"><table>
-        <thead><tr><th>Date</th><th>Stages (users)</th><th>Target</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th><th><span class="sr-only">Delete</span></th></tr></thead>
+        <thead><tr><th>Date</th><th>Name</th><th>Target</th><th>Mode</th><th>Stages (users)</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th><th><span class="sr-only">Delete</span></th></tr></thead>
         <tbody id="ltList"></tbody>
       </table></div>
     </div>
@@ -883,7 +887,7 @@ async function openLoadTestPanel() {
     const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v, lms = c.target === "lmstudio";
     const started = /^\d{8}_\d{6}$/.test(d.run) ? `${d.run.slice(6, 8)}.${d.run.slice(4, 6)}. ${d.run.slice(9, 11)}:${d.run.slice(11, 13)}` : d.run;
     panel.innerHTML = `<h3>${d.running ? `Running – stage ${d.stage || 0} with ${d.users || 0} users` : "Last load test"}</h3>
-      <div class="lt-sub">Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
+      <div class="lt-sub">${c.name && c.name !== "None" ? `<b>${escapeHtml(c.name)}</b> · ` : ""}Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
       + dl([["Started", started], ["System under test", lms ? "LM Studio directly" : "AnythingLLM"],
             ...(lms ? [["Model", f.model || "auto (first loaded model)"], ["Context tokens per request", f.context_tokens || "0"],
                        ["Max tokens per answer", f.max_tokens && f.max_tokens !== "0" ? f.max_tokens : "no limit"]]
@@ -912,6 +916,11 @@ $("chipLoad").addEventListener("click", e => {
 document.addEventListener("click", e => {
   if (!e.target.closest("#ltPanel") && !e.target.closest("#chipLoad")) { $("ltPanel").classList.remove("show"); $("chipLoad").setAttribute("aria-expanded", false); }
 });
+// "Open" shows the report; "PDF" opens it with its print layout and the print dialog ("Save as PDF").
+function reportLinks(href) {
+  return `<span class="report-links"><a href="${href}" target="_blank" rel="noopener">Open</a>`
+    + `<a href="${href}?print=1" target="_blank" rel="noopener" class="pdf-link" title="Opens the print dialog – choose “Save as PDF”">PDF</a></span>`;
+}
 async function loadLoadTests() {
   try {
     const list = await (await fetch("api/loadtests", { cache: "no-store" })).json();
@@ -920,12 +929,15 @@ async function loadLoadTests() {
       const result = x.highest_passing != null ? `passed up to ${x.highest_passing} users` + (x.limit_at ? ` · limit at ${x.limit_at}` : "")
         : x.limit_at ? `limit at ${x.limit_at} users` : "–";
       const tag = x.status === "setup error" ? "error" : x.status;
-      return `<tr><td>${date}</td><td>${escapeHtml(x.users || "–")}</td><td>${x.target === "lmstudio" ? "LM Studio · " : "AnythingLLM · "}${escapeHtml(x.mode)}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
+      const lms = x.target === "lmstudio";
+      return `<tr><td>${date}</td><td>${escapeHtml(x.name || "–")}</td><td>${lms ? "LM Studio" : "AnythingLLM"}</td>
+        <td${lms && x.model ? ` title="${escapeHtml(x.model)}"` : ""}>${escapeHtml(x.mode)}${lms && x.model ? `<div class="cell-sub">${escapeHtml(x.model)}</div>` : ""}</td>
+        <td>${escapeHtml(x.users || "–")}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
         <td title="${escapeHtml(x.limit_reason || "")}">${result}</td><td>${x.max_per_min != null ? fmt(x.max_per_min, 1) + " /min" : "–"}</td>
         <td>${x.p95_at_best != null ? fmt(x.p95_at_best, 1) + " s" : "–"}</td><td><span class="status-tag ${tag}">${escapeHtml(x.status)}</span></td>
-        <td>${x.report ? `<a href="loadtest/${encodeURIComponent(x.run)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td>
-        <td>${x.status === "running" ? "" : `<button class="icon-btn" data-delete-run="${escapeHtml(x.run)}" data-label="${escapeHtml(date)}" title="Delete this load test from disk"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button>`}</td></tr>`;
-    }).join("") : `<tr><td colspan="10" class="empty">No load tests yet</td></tr>`;
+        <td>${x.report ? reportLinks(`loadtest/${encodeURIComponent(x.run)}/report.html`) : "–"}</td>
+        <td>${x.status === "running" ? "" : `<button class="icon-btn" data-delete-run="${escapeHtml(x.run)}" data-label="${escapeHtml(x.name ? `${x.name} (${date})` : date)}" title="Delete this load test from disk"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button>`}</td></tr>`;
+    }).join("") : `<tr><td colspan="12" class="empty">No load tests yet</td></tr>`;
   } catch (e) {}
 }
 loadLoadTests(); setInterval(loadLoadTests, 20000);
@@ -967,7 +979,7 @@ async function loadSessions() {
     $("sessionList").innerHTML = list.length ? list.map(x => `<tr><td>${escapeHtml(x.label || x.folder)}${x.retroactive ? '<span class="badge">from log</span>' : ""}</td>
       <td>${new Date(x.started * 1000).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" })} – ${x.ended ? hhmm(x.ended) : "running"}</td>
       <td>${fmt(x.completed)}</td>
-      <td>${x.report ? `<a href="sessions/${encodeURIComponent(x.folder)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td>
+      <td>${x.report ? reportLinks(`sessions/${encodeURIComponent(x.folder)}/report.html`) : "–"}</td>
       <td>${session && session.active && session.folder === x.folder ? "" : `<button class="icon-btn" data-delete-session="${escapeHtml(x.folder)}" data-label="${escapeHtml(x.label || x.folder)}" title="Delete this session from disk"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button>`}</td></tr>`).join("")
       : `<tr><td colspan="5" class="empty">No sessions yet</td></tr>`;
   } catch (e) {}
