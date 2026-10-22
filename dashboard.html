@@ -160,6 +160,22 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
   font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
 .btn-stop:hover { filter: brightness(1.08); }
 .btn-stop:disabled { opacity: .55; cursor: default; filter: none; }
+.btn-unload { border: 1px solid var(--critical); background: var(--surface); color: var(--critical); border-radius: 8px; font: inherit;
+  font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.btn-unload:hover { background: var(--surface-2); } .btn-unload:disabled, .btn-clear:disabled { opacity: .5; cursor: default; }
+.mc-row { display: flex; gap: 6px; align-items: center; } .mc-row select { flex: 1; }
+.mc-state, .mc-current, .mc-hint { color: var(--text-2); font-size: 12px; }
+.mc-state { margin: 2px 0 10px; } .mc-current { margin-top: 10px; } .mc-hint:empty { display: none; }
+.mc-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+.mc-opt { text-align: left; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px;
+  padding: 9px 11px; cursor: pointer; font: inherit; }
+.mc-opt b { display: block; font-size: 13px; } .mc-opt span { color: var(--text-2); font-size: 12px; }
+.mc-opt.on { border: 2px solid var(--s1); padding: 8px 10px; }
+.mc-cat { font-size: 12px; font-weight: 700; color: var(--text); margin: 12px 0 -4px; }
+#mcForm textarea { font: inherit; font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; resize: vertical; }
+.mc-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; border-top: 1px solid var(--grid); padding-top: 10px; }
+.pill { font-size: 11px; border-radius: 999px; padding: 1px 7px; border: 1px solid var(--border); }
+.pill.good { color: var(--good); border-color: var(--good); }
 .btn-stop .sq { width: 9px; height: 9px; background: #fff; border-radius: 2px; display: inline-block; }
 .btn-clear { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; font: inherit;
   font-size: 13px; font-weight: 600; padding: 5px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
@@ -179,6 +195,9 @@ h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--text-2); }
 .hint { grid-column: 1 / -1; color: var(--text-3); font-size: 12px; margin: 0; }
 #ltLog { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 12px;
   white-space: pre-wrap; margin: 10px 0 0; color: var(--text); }
+.report-links { display: inline-flex; gap: 10px; white-space: nowrap; }
+.pdf-link { border: 1px solid var(--border); border-radius: 6px; padding: 0 6px; font-size: 12px; }
+.cell-sub { color: var(--text-3); font-size: 11px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .badge { font-size: 11px; color: var(--text-2); border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; margin-left: 6px; }
 @media (max-width: 520px) { .form-grid label.wide { grid-column: auto; } }
 .session { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 12px; }
@@ -318,6 +337,65 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <div class="plot" id="cHist" style="height:170px"></div>
   </section>
 
+  <section class="card tool" id="modelCard" style="margin-bottom:12px">
+    <div class="control">
+      <h2>LM Studio model</h2>
+      <span class="text" id="mcStatus">Loading the model list …</span>
+    </div>
+    <div class="form-grid">
+      <label>Model<select id="mcModel"></select></label>
+      <label>Saved configuration<span class="mc-row"><select id="mcConfig"><option value="">– none –</option></select>
+        <button type="button" class="icon-btn" id="mcSave" title="Save the settings below as a configuration"><svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M3 2h8l2 2v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2zm2 1v3h5V3H5zm0 6v4h6V9H5z" fill="currentColor"/></svg></button>
+        <button type="button" class="icon-btn" id="mcDelete" title="Delete the selected configuration"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button></span></label>
+    </div>
+    <div class="mc-state" id="mcState"></div>
+    <div class="mc-options" id="mcOptions" role="radiogroup" aria-label="What to do with the model"></div>
+    <div class="mc-current" id="mcCurrent"></div>
+    <form id="mcForm" autocomplete="off" hidden>
+      <div class="mc-cat">Load</div>
+      <div class="form-grid">
+        <label>Context length<input name="context_length" type="number" min="256" step="1"><span class="mc-hint" id="mcMaxCtx"></span></label>
+        <label>Parallel requests<input name="parallel" type="number" min="1" max="64" step="1"></label>
+      </div>
+      <div class="mc-cat">Settings</div>
+      <div class="form-grid">
+        <label class="wide">System prompt (sent with every request of an LM Studio load test)<textarea name="system_prompt" rows="2" maxlength="8000"></textarea></label>
+        <label>Max response tokens (empty = no limit)<input name="max_tokens" type="number" min="0" step="1"></label>
+      </div>
+      <div class="mc-cat">Sampling</div>
+      <div class="form-grid">
+        <label>Temperature<input name="temperature" type="number" min="0" max="2" step="any" placeholder="model setting"></label>
+        <label>Top P sampling<input name="top_p" type="number" min="0" max="1" step="any" placeholder="model setting"></label>
+      </div>
+      <div class="mc-cat">Reasoning</div>
+      <div class="form-grid">
+        <label>Thinking<select name="reasoning" id="mcReasoning"></select></label>
+      </div>
+      <details>
+        <summary>Advanced</summary>
+        <div class="mc-cat">Load</div>
+        <div class="form-grid">
+          <label>Flash attention<select name="flash_attention"><option value="">LM Studio default</option><option value="true">on</option><option value="false">off</option></select></label>
+          <label>Evaluation batch size<input name="eval_batch_size" type="number" min="1" step="1" placeholder="LM Studio default"></label>
+          <label>KV cache on GPU<select name="offload_kv_cache_to_gpu"><option value="">LM Studio default</option><option value="true">on</option><option value="false">off</option></select></label>
+          <label>Experts (MoE models only)<input name="num_experts" type="number" min="1" step="1" placeholder="model default"></label>
+        </div>
+        <div class="mc-cat">Sampling</div>
+        <div class="form-grid">
+          <label>Top K<input name="top_k" type="number" min="0" step="1" placeholder="model setting"></label>
+          <label>Min P<input name="min_p" type="number" min="0" max="1" step="any" placeholder="model setting"></label>
+          <label>Repeat penalty<input name="repeat_penalty" type="number" min="0.5" max="3" step="any" placeholder="model setting"></label>
+          <label>Presence penalty<input name="presence_penalty" type="number" min="-2" max="2" step="any" placeholder="model setting"></label>
+        </div>
+        <p class="hint">GPU offload, context overflow and unloading on idle are not offered by LM Studio's API; LM Studio's own settings apply.</p>
+      </details>
+    </form>
+    <div class="mc-foot">
+      <button type="button" class="btn-unload" id="mcUnload"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 2l5 6H3l5-6zM3 11h10v2H3v-2z" fill="currentColor"/></svg>Unload model</button>
+      <button type="button" class="btn-clear" id="mcApply">Use as loaded</button>
+    </div>
+  </section>
+
   <section class="card tool" style="margin-bottom:12px">
     <div class="control">
       <h2>Load test</h2>
@@ -328,10 +406,14 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <details id="ltDetails">
       <summary>New load test …</summary>
       <form id="ltForm" class="form-grid" autocomplete="off">
-        <label>AnythingLLM URL<input name="host" type="url" required></label>
-        <label>Workspace slug<input name="workspace" required pattern="[A-Za-z0-9_\-]+"></label>
-        <label>API key<input name="api_key" type="password" id="ltKey" placeholder="from ANYTHING_API_KEY"></label>
-        <label>Mode<select name="mode"><option value="query">query (RAG, documents only)</option><option value="chat">chat</option></select></label>
+        <label class="wide">Name (optional, shown as the report title)<input name="name" maxlength="120" placeholder="e.g. Gemma 12B, 2000 context tokens"></label>
+        <label class="wide">System under test<span class="seg" id="ltTargetSeg"><button type="button" data-target="anythingllm" class="on">AnythingLLM</button><button type="button" data-target="lmstudio">LM Studio native</button></span>
+          <input type="hidden" name="target" id="ltTarget" value="anythingllm"><span class="mc-hint" id="ltSysInfo"></span></label>
+        <label><span id="ltHostLabel">AnythingLLM URL</span><input name="host" type="url" required></label>
+        <label data-for="anythingllm">Workspace slug<input name="workspace" required pattern="[A-Za-z0-9_\-]+"></label>
+        <label data-for="anythingllm">API key<input name="api_key" type="password" id="ltKey" placeholder="from ANYTHING_API_KEY"></label>
+        <label data-for="anythingllm">Mode<select name="mode"><option value="query">query (RAG, documents only)</option><option value="chat">chat</option></select></label>
+        <label data-for="lmstudio" hidden>Context tokens per request (RAG simulation)<input name="context_tokens" type="number" min="0" value="0" disabled></label>
         <label class="wide">Stages: concurrent users<input name="users" value="1,2,4,8,16" required pattern="\d+(,\d+)*"></label>
         <label>Measurement per stage (s)<input name="stage_duration" type="number" min="10" value="300"></label>
         <label>New users per second<input name="spawn_rate" type="number" min="0.1" step="any" value="1"></label>
@@ -343,20 +425,20 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
         <label>Limit: p95 response time (s)<input name="max_p95" type="number" min="1" value="120"></label>
         <label>Limit: failure rate (%)<input name="max_fail_pct" type="number" min="0" max="100" step="any" value="5"></label>
         <label>Student think time for estimate (s)<input name="student_think_time" type="number" min="1" value="90"></label>
-        <label>Threads kept in AnythingLLM<input name="max_threads" type="number" min="0" value="30"></label>
+        <label data-for="anythingllm">Threads kept in AnythingLLM<input name="max_threads" type="number" min="0" value="30"></label>
         <label class="check"><input name="refine" type="checkbox"> Find the exact limit (bisection)</label>
         <div class="form-foot">
           <span class="text" id="ltEstimate"></span>
           <button type="submit" class="btn-rec">▶ Start load test</button>
         </div>
-        <p class="hint">The load test sends real requests to AnythingLLM and LM Studio. Do not run it while students are using the system.</p>
+        <p class="hint">The load test sends real requests to AnythingLLM and LM Studio (or to LM Studio only). Do not run it while students are using the system.</p>
       </form>
     </details>
     <pre id="ltLog" hidden></pre>
     <div class="listing">
       <div class="subhead">Previous load tests</div>
       <div class="tablewrap" style="max-height:none"><table>
-        <thead><tr><th>Date</th><th>Stages (users)</th><th>Mode</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th><th><span class="sr-only">Delete</span></th></tr></thead>
+        <thead><tr><th>Date</th><th>Name</th><th>Target</th><th>Mode</th><th>Stages (users)</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th><th><span class="sr-only">Delete</span></th></tr></thead>
         <tbody id="ltList"></tbody>
       </table></div>
     </div>
@@ -773,10 +855,13 @@ function renderControl() {
   const lt = control.loadtest || {}, p = control.progress || {}, busy = p.phase === "stopping" || p.phase === "deleting";
   const elapsed = lt.running && lt.run_started ? ` · ${clockTime(Date.now() / 1000 - lt.run_started)}` : "";
   setChip("chipLoad", lt.running ? "warn" : "", lt.running
-    ? `load test running · stage ${lt.stage || 0} · ${lt.users || 0} users${elapsed}` : "load test idle", lt.running);
+    ? (lt.phase === "warmup" ? `load test · waiting for the model${elapsed}` : `load test running · stage ${+lt.stage || 0} · ${+lt.users || 0} users${elapsed}`)
+    : "load test idle", lt.running);
   $("stopAll").disabled = busy || (!lt.running && !control.threads);
   $("loadText").innerHTML = (lt.running
-    ? `<b>Running</b> – stage ${lt.stage || 0} with ${lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`
+    ? (lt.phase === "warmup"
+      ? `<b>Warm-up</b> – waiting until the model is loaded and answers; measuring starts then (run ${escapeHtml(lt.run || "")}).`
+      : `<b>Running</b> – stage ${+lt.stage || 0} with ${+lt.users || 0} simulated users (run ${escapeHtml(lt.run || "")}).`)
     : "No load test is running.")
     + ` ${control.threads || 0} load-test threads in AnythingLLM`
     + (control.can_delete ? "." : " (set ANYTHING_API_KEY for the monitor to delete them).");
@@ -820,6 +905,7 @@ function renderLoadTestTools() {
   const d = control.defaults || {}, f = $("ltForm");
   if (!ltDefaultsSet && control.defaults) {
     f.host.value = d.host || "http://localhost:3001"; f.workspace.value = d.workspace || "";
+    f.host.dataset.anythingllm = f.host.value; f.host.dataset.lmstudio = d.lmstudio_host || "http://localhost:1234";
     $("ltKey").placeholder = d.api_key_set ? "from ANYTHING_API_KEY (set)" : "required: ANYTHING_API_KEY is not set";
     $("ltKey").required = !d.api_key_set;
     ltDefaultsSet = true;
@@ -835,12 +921,26 @@ function renderLoadTestTools() {
   $("ltEstimate").textContent = users.length ? `${users.length} stages, up to about ${duration(sec)}` + (f.refine.checked ? " plus bisection" : "") : "";
 }
 $("ltForm").addEventListener("input", renderLoadTestTools);
+// Show only the fields of the selected system; hidden fields are disabled, so they are neither validated nor sent.
+$("ltTarget").addEventListener("change", e => {
+  const f = $("ltForm"), target = e.target.value, other = target === "lmstudio" ? "anythingllm" : "lmstudio";
+  f.host.dataset[other] = f.host.value;
+  f.host.value = f.host.dataset[target] || "";
+  $("ltHostLabel").textContent = target === "lmstudio" ? "LM Studio URL" : "AnythingLLM URL";
+  f.querySelectorAll("[data-for]").forEach(label => {
+    const on = label.dataset.for === target;
+    label.hidden = !on;
+    label.querySelectorAll("input, select").forEach(el => { el.disabled = !on; });
+  });
+  if (target === "anythingllm") $("ltKey").required = !(control.defaults || {}).api_key_set;
+});
 $("ltForm").addEventListener("submit", async e => {
   e.preventDefault();
   const f = e.target, body = Object.fromEntries(new FormData(f));
   body.refine = f.refine.checked;
   body.max_fail_rate = (+body.max_fail_pct || 0) / 100; delete body.max_fail_pct;
-  if (!confirm(`Start a load test with ${body.users} concurrent users against ${body.host}?\n\nIt sends real requests to AnythingLLM and LM Studio.`)) return;
+  const system = body.target === "lmstudio" ? "LM Studio" : "AnythingLLM and LM Studio";
+  if (!confirm(`Start a load test with ${body.users} concurrent users against ${body.host}?\n\nIt sends real requests to ${system}.`)) return;
   try {
     const res = await fetch("api/loadtest/start", { method: "POST", headers: { "X-Monitor-Action": "loadtest", "Content-Type": "application/json" },
                                                      body: JSON.stringify(body) });
@@ -849,6 +949,199 @@ $("ltForm").addEventListener("submit", async e => {
     if (r.ok) { $("ltKey").value = ""; $("ltDetails").open = false; }
   } catch (err) { toast("Could not reach the monitor"); }
 });
+
+// ---------- LM Studio model card ----------
+// Load settings apply when the model is loaded; request settings are sent with every request of an
+// "LM Studio native" load test. Both are kept by the monitor as the active configuration.
+const MC_LOAD = ["context_length", "parallel", "flash_attention", "eval_batch_size", "offload_kv_cache_to_gpu", "num_experts"];
+const MC_REQUEST = ["system_prompt", "max_tokens", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "reasoning"];
+const MC_DEFAULT_PROMPT = "Du bist ein hilfreicher Assistent für Studierende einer Hochschule. Antworte sachlich, verständlich und auf Deutsch.";
+let models = { models: [], configs: [] }, mcAction = null, mcFilledFor = null;
+const mcModel = () => (models.models || []).find(m => m.key === $("mcModel").value);
+const mcBusy = () => models.busy || (models.progress || {}).phase === "working";
+
+function mcConfigText(cfg) {
+  const parts = [];
+  if (cfg.context_length) parts.push(`context ${cfg.context_length}`);
+  if (cfg.parallel) parts.push(`parallel ${cfg.parallel}`);
+  if (cfg.flash_attention != null) parts.push(`flash attention ${cfg.flash_attention ? "on" : "off"}`);
+  if (cfg.eval_batch_size) parts.push(`batch ${cfg.eval_batch_size}`);
+  if (cfg.offload_kv_cache_to_gpu != null) parts.push(`KV cache ${cfg.offload_kv_cache_to_gpu ? "on GPU" : "in RAM"}`);
+  return parts.join(" · ");
+}
+function mcRequestText(req) {
+  const names = { max_tokens: "max tokens", temperature: "temperature", top_p: "top P", top_k: "top K", min_p: "min P",
+                  repeat_penalty: "repeat penalty", presence_penalty: "presence penalty", reasoning: "thinking" };
+  const parts = Object.entries(req || {}).filter(([k]) => names[k]).map(([k, v]) => `${names[k]} ${v}`);
+  if ((req || {}).system_prompt) parts.unshift("own system prompt");
+  return parts.join(" · ");
+}
+function mcCollect() {
+  const f = $("mcForm"), pick = keys => Object.fromEntries(keys.map(k => [k, f.elements[k].value]).filter(([, v]) => v !== ""));
+  return { load: pick(MC_LOAD), request: pick(MC_REQUEST) };
+}
+function mcFill(load, request) {
+  const f = $("mcForm");
+  for (const k of MC_LOAD) f.elements[k].value = load[k] == null ? "" : String(load[k]);
+  for (const k of MC_REQUEST) f.elements[k].value = request[k] == null ? "" : String(request[k]);
+}
+function mcFillDefaults(m) {
+  // Start from what is loaded (or the active configuration of this model), so "Adjust" changes only what you edit.
+  const active = models.active && models.active.model === m.key ? models.active : null;
+  const cfg = (m.instances[0] || {}).config || (active && active.load) || {};
+  mcFill(Object.fromEntries(MC_LOAD.map(k => [k, cfg[k]])),
+         active && active.request && Object.keys(active.request).length ? active.request : { system_prompt: MC_DEFAULT_PROMPT });
+  mcFilledFor = m.key;
+}
+async function loadModels() {
+  try { models = await (await fetch("api/models", { cache: "no-store" })).json(); } catch (e) { return; }
+  renderModels();
+}
+function renderModels() {
+  const sel = $("mcModel"), list = models.models || [];
+  const sig = list.map(m => m.key + (m.instances.length ? "*" : "")).join("|");
+  if (sel.dataset.sig !== sig) {
+    const keep = sel.value;
+    sel.innerHTML = list.map(m => `<option value="${escapeHtml(m.key)}">${escapeHtml(m.name)}${m.params ? " · " + escapeHtml(m.params) : ""}${m.quantization ? " " + escapeHtml(m.quantization) : ""} · ${m.instances.length ? "loaded" : "not loaded" + (m.size_gb ? ` · ${m.size_gb} GB` : "")}</option>`).join("")
+      || `<option value="">no models found</option>`;
+    const active = models.active && list.some(m => m.key === models.active.model) ? models.active.model : null;
+    sel.value = list.some(m => m.key === keep) ? keep : active || (list.find(m => m.instances.length) || list[0] || {}).key || "";
+    sel.dataset.sig = sig;
+  }
+  const cfgSel = $("mcConfig"), names = (models.configs || []).map(c => c.name);
+  if (cfgSel.dataset.sig !== names.join("|")) {
+    const keep = cfgSel.value;
+    cfgSel.innerHTML = `<option value="">– none –</option>` + (models.configs || []).map(c =>
+      `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join("");
+    cfgSel.value = names.includes(keep) ? keep : "";
+    cfgSel.dataset.sig = names.join("|");
+  }
+  const p = models.progress || {}, a = models.active;
+  const activeModel = a && list.find(m => m.key === a.model);
+  $("mcStatus").innerHTML = models.error ? `<span style="color:var(--critical)">${escapeHtml(models.error)}</span>`
+    : p.phase === "working" ? escapeHtml(p.message || "working …")
+    : activeModel && activeModel.instances.length
+      ? `Load tests use <b>${escapeHtml(activeModel.name)}</b> – ${a.config ? `configuration “${escapeHtml(a.config)}”` : a.action === "adjust" ? "custom settings" : a.action === "defaults" ? "LM Studio defaults" : "as loaded"}`
+      : list.some(m => m.instances.length) ? "Load tests use the first loaded model as it is." : "No model is loaded.";
+  if (p.at && p.at !== renderModels.lastReported && (p.phase === "done" || p.phase === "error")) {
+    if (renderModels.lastReported !== undefined) toast(p.message);
+    renderModels.lastReported = p.at;
+  }
+  renderModelChoice();
+  renderTargetInfo();
+}
+function renderModelChoice() {
+  const m = mcModel();
+  if (!m) { $("mcOptions").innerHTML = ""; $("mcForm").hidden = true; $("mcApply").disabled = $("mcUnload").disabled = true; return; }
+  const loaded = m.instances.length > 0;
+  const opts = loaded
+    ? [["keep", "Keep current LM Studio settings", "Use the model exactly as it is loaded and configured now."],
+       ["adjust", "Adjust settings", "Reload the model with the settings below or a saved configuration."],
+       ["defaults", "Reload model", "Reload with LM Studio's default settings."]]
+    : [["adjust", "Load with these settings", "Load the model with the settings below or a saved configuration."],
+       ["defaults", "Load with default settings", "Load with LM Studio's default settings."]];
+  if (!opts.some(o => o[0] === mcAction)) mcAction = opts[0][0];
+  $("mcOptions").innerHTML = opts.map(([k, title, text]) =>
+    `<button type="button" class="mc-opt${k === mcAction ? " on" : ""}" data-action="${k}" role="radio" aria-checked="${k === mcAction}"><b>${title}</b><span>${text}</span></button>`).join("");
+  const cfg = (m.instances[0] || {}).config || {};
+  $("mcState").innerHTML = loaded ? `<span class="pill good">Loaded</span> ${escapeHtml(mcConfigText(cfg))}`
+    : `<span class="pill">Not loaded</span>${m.max_context ? ` max context ${+m.max_context}` : ""}`;
+  const active = models.active && models.active.model === m.key ? models.active : null;
+  $("mcCurrent").textContent = mcAction === "keep"
+    ? `Requests of LM Studio load tests: ${active && active.action === "adjust" && mcRequestText(active.request) || "the model's own settings in LM Studio"}.` : "";
+  $("mcForm").hidden = mcAction !== "adjust";
+  // Thinking offers the options this model declares (before the form is filled, so the value can be set).
+  const r = $("mcReasoning"), allowed = (m.reasoning || {}).allowed_options || [], keepR = r.value;
+  const rsig = m.key + allowed.join(",");
+  if (r.dataset.sig !== rsig) {
+    r.innerHTML = allowed.length ? `<option value="">model default (${escapeHtml(m.reasoning.default || "on")})</option>` + allowed.map(o => `<option>${escapeHtml(o)}</option>`).join("")
+      : `<option value="">not supported by this model</option>`;
+    r.value = allowed.includes(keepR) ? keepR : ""; r.disabled = !allowed.length; r.dataset.sig = rsig;
+  }
+  if (mcFilledFor !== m.key) mcFillDefaults(m);
+  $("mcMaxCtx").textContent = m.max_context ? `max ${m.max_context}` : "";
+  $("mcApply").textContent = mcAction === "keep" ? "Use as loaded" : mcAction === "adjust" ? (loaded ? "Reload with these settings" : "Load with these settings")
+    : (loaded ? "Reload with defaults" : "Load with defaults");
+  $("mcApply").disabled = mcBusy();
+  $("mcUnload").disabled = !loaded || mcBusy();
+  $("mcApply").title = $("mcUnload").title = models.busy ? "Not possible while a load test is running" : "";
+}
+async function modelCall(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "X-Monitor-Action": "model", "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const r = await res.json();
+  if (!r.ok) toast(`Not done: ${r.message}`);
+  loadModels();
+  return r;
+}
+$("mcModel").addEventListener("change", () => { mcAction = null; $("mcConfig").value = ""; renderModelChoice(); });
+$("mcOptions").addEventListener("click", e => {
+  const b = e.target.closest("[data-action]");
+  if (b) { mcAction = b.dataset.action; renderModelChoice(); }
+});
+$("mcConfig").addEventListener("change", () => {
+  const c = (models.configs || []).find(x => x.name === $("mcConfig").value);
+  if (!c) return;
+  if (c.model && (models.models || []).some(m => m.key === c.model)) { $("mcModel").value = c.model; }
+  mcAction = "adjust"; renderModelChoice();
+  mcFill(c.load || {}, c.request || {}); mcFilledFor = $("mcModel").value;
+});
+$("mcSave").addEventListener("click", async () => {
+  const name = prompt("Name of the configuration:", $("mcConfig").value || "");
+  if (!name) return;
+  if (mcAction !== "adjust") { mcAction = "adjust"; renderModelChoice(); }
+  const r = await modelCall("api/models/configs/save", { name, model: $("mcModel").value, ...mcCollect() });
+  if (r.ok) { toast(r.message); setTimeout(() => { $("mcConfig").value = name.trim(); }, 300); }
+});
+$("mcDelete").addEventListener("click", async () => {
+  const name = $("mcConfig").value;
+  if (!name) { toast("Choose a saved configuration first"); return; }
+  if (!confirm(`Delete the configuration “${name}”?`)) return;
+  const r = await modelCall("api/models/configs/delete", { name });
+  if (r.ok) toast(r.message);
+});
+$("mcApply").addEventListener("click", async () => {
+  const m = mcModel();
+  if (!m) return;
+  if (mcAction !== "keep" && m.instances.length && !confirm(`Reload ${m.name}? Requests that are running on it are aborted.`)) return;
+  const r = await modelCall("api/models/apply", { action: mcAction, model: m.key, config: $("mcConfig").value, ...mcCollect() });
+  if (r.ok) toast(r.message);
+});
+$("mcUnload").addEventListener("click", async () => {
+  const m = mcModel();
+  if (!m || !confirm(`Unload ${m.name} from LM Studio? Requests that are running on it are aborted.`)) return;
+  const r = await modelCall("api/models/unload", { model: m.key });
+  if (r.ok) toast(r.message);
+});
+function renderTargetInfo() {
+  const target = $("ltTarget").value, list = models.models || [], info = $("ltSysInfo");
+  if (target === "lmstudio") {
+    const a = models.active, loaded = list.filter(m => m.instances.length);
+    const m = (a && loaded.find(x => x.key === a.model)) || loaded[0];
+    info.textContent = m ? `Tests ${m.name} as loaded in LM Studio${(m.instances[0] || {}).config ? " (" + mcConfigText(m.instances[0].config) + ")" : ""}`
+      + (a && a.model === m.key && mcRequestText(a.request) ? `; requests: ${mcRequestText(a.request)}` : "") + ". Change it in the LM Studio model card."
+      : "No model is loaded – load one in the LM Studio model card first.";
+  } else {
+    const w = models.anythingllm, m = w && list.find(x => x.key === w.model || w.model.startsWith(x.key));
+    info.textContent = !w ? "AnythingLLM uses the model set in its workspace or system settings."
+      : `AnythingLLM uses ${w.model} (${w.source === "workspace" ? "workspace" : "system"} setting)`
+        + (m && !m.instances.length ? " – not loaded in LM Studio: it is loaded on demand with default settings." : m ? ", loaded in LM Studio." : ".");
+  }
+}
+function setTarget(target) {
+  $("ltTargetSeg").querySelectorAll("button").forEach(x => x.classList.toggle("on", x.dataset.target === target));
+  if ($("ltTarget").value !== target || !setTarget.done) {
+    $("ltTarget").value = target;
+    $("ltTarget").dispatchEvent(new Event("change"));
+    setTarget.done = true;
+  }
+  renderTargetInfo(); renderLoadTestTools();
+}
+$("ltTargetSeg").addEventListener("click", e => {
+  const b = e.target.closest("[data-target]");
+  if (b) setTarget(b.dataset.target);
+});
+setTarget("anythingllm");  // The browser may restore a hidden field's value after a reload; start from a known state.
+loadModels(); setInterval(loadModels, 5000);
 
 // ---------- Load test settings (popover on the load test chip) and history ----------
 function dl(rows, cls) {
@@ -860,21 +1153,29 @@ async function openLoadTestPanel() {
   try {
     const d = await (await fetch("api/loadtest/details", { cache: "no-store" })).json(), c = d.config || {}, f = c.forwarded || {};
     if (!d.run) { panel.innerHTML = `<h3>No load test yet</h3><div class="lt-sub">Start one in the Load test card at the bottom.</div>`; return; }
-    const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v;
+    const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v, lms = c.target === "lmstudio";
     const started = /^\d{8}_\d{6}$/.test(d.run) ? `${d.run.slice(6, 8)}.${d.run.slice(4, 6)}. ${d.run.slice(9, 11)}:${d.run.slice(11, 13)}` : d.run;
-    panel.innerHTML = `<h3>${d.running ? `Running – stage ${d.stage || 0} with ${d.users || 0} users` : "Last load test"}</h3>
-      <div class="lt-sub">Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
-      + dl([["Started", started], ["Workspace", d.workspace], ["Stages (users)", c.users], ["Measurement per stage", c.stage_duration && `${c.stage_duration} s`],
-            ["Mode", f.mode || "query"], ["Think time", f.wait_min && `${f.wait_min}–${f.wait_max} s`],
+    panel.innerHTML = `<h3>${d.running ? `Running – stage ${+d.stage || 0} with ${+d.users || 0} users` : "Last load test"}</h3>
+      <div class="lt-sub">${c.name && c.name !== "None" ? `<b>${escapeHtml(c.name)}</b> · ` : ""}Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
+      + dl([["Started", started], ["System under test", lms ? "LM Studio native" : "AnythingLLM"],
+            ...(lms ? [["Model", f.model || "first loaded model"], ["Context tokens per request", f.context_tokens || "0"],
+                       ["Thinking", f.reasoning || "model setting"], ["Temperature", f.temperature || "model setting"],
+                       ["Max response tokens", f.max_tokens && f.max_tokens !== "0" ? f.max_tokens : "no limit"]]
+                    : [["Workspace", d.workspace], ["Mode", f.mode || "query"]]),
+            ["Stages (users)", c.users], ["Measurement per stage", c.stage_duration && `${c.stage_duration} s`],
+            ["Think time", f.wait_min && `${f.wait_min}–${f.wait_max} s`],
             ["Limit: p95 response time", c.max_p95 && `${c.max_p95} s`], ["Limit: failure rate", c.max_fail_rate && `${(+c.max_fail_rate * 100).toFixed(1)} %`],
-            ["Find exact limit", yes(c.refine)], ["Threads kept", f.max_threads || "30"]])
+            ["Find exact limit", yes(c.refine)], ...(lms ? [] : [["Threads kept", f.max_threads || "30"]])])
       + `<details><summary>Advanced</summary>` + dl([
-            ["AnythingLLM URL", c.host], ["New users per second", c.spawn_rate], ["Pause between stages", c.cooldown && `${c.cooldown} s`],
+            [lms ? "LM Studio URL" : "AnythingLLM URL", c.host], ["New users per second", c.spawn_rate], ["Pause between stages", c.cooldown && `${c.cooldown} s`],
             ["Grace for running requests", c.stop_timeout && `${c.stop_timeout} s`], ["Request timeout", f.request_timeout && `${f.request_timeout} s`],
             ["Student think time (estimate)", c.student_think_time && `${c.student_think_time} s`], ["Refusal highlight from", c.refusal_warn_rate && `${(+c.refusal_warn_rate * 100).toFixed(0)} %`],
             ["Limit: GPU memory", c.max_vram_pct && `${c.max_vram_pct} %`], ["Limit: GPU temperature", c.max_gpu_temp && `${c.max_gpu_temp} °C`],
             ["LM Studio log", c.lmstudio_log], ["Locust file", c.locustfile], ["Results folder", c.out],
-            ["Other options for main.py", Object.entries(f).filter(([k]) => !["mode", "wait_min", "wait_max", "request_timeout", "max_threads"].includes(k)).map(([k, v]) => `--${k.replace(/_/g, "-")} ${v}`).join(" ")]],
+            ["Top P / top K / min P", lms && (f.top_p || f.top_k || f.min_p) ? [f.top_p || "–", f.top_k || "–", f.min_p || "–"].join(" / ") : null],
+            ["Repeat / presence penalty", lms && (f.repeat_penalty || f.presence_penalty) ? `${f.repeat_penalty || "–"} / ${f.presence_penalty || "–"}` : null],
+            ["System prompt", lms && f.system_prompt ? f.system_prompt : null],
+            [`Other options for ${lms ? "lmstudio_user.py" : "main.py"}`, Object.entries(f).filter(([k]) => !["mode", "wait_min", "wait_max", "request_timeout", "max_threads", "model", "context_tokens", "max_tokens", "temperature", "top_p", "top_k", "min_p", "repeat_penalty", "presence_penalty", "reasoning", "system_prompt"].includes(k)).map(([k, v]) => `--${k.replace(/_/g, "-")} ${v}`).join(" ")]],
           "adv") + `</details>`;
   } catch (e) { panel.innerHTML = `<div class="lt-sub">Could not load the settings.</div>`; }
 }
@@ -887,6 +1188,11 @@ $("chipLoad").addEventListener("click", e => {
 document.addEventListener("click", e => {
   if (!e.target.closest("#ltPanel") && !e.target.closest("#chipLoad")) { $("ltPanel").classList.remove("show"); $("chipLoad").setAttribute("aria-expanded", false); }
 });
+// "Open" shows the report; "PDF" opens it with its print layout and the print dialog ("Save as PDF").
+function reportLinks(href) {
+  return `<span class="report-links"><a href="${href}" target="_blank" rel="noopener">Open</a>`
+    + `<a href="${href}?print=1" target="_blank" rel="noopener" class="pdf-link" title="Opens the print dialog – choose “Save as PDF”">PDF</a></span>`;
+}
 async function loadLoadTests() {
   try {
     const list = await (await fetch("api/loadtests", { cache: "no-store" })).json();
@@ -895,12 +1201,15 @@ async function loadLoadTests() {
       const result = x.highest_passing != null ? `passed up to ${x.highest_passing} users` + (x.limit_at ? ` · limit at ${x.limit_at}` : "")
         : x.limit_at ? `limit at ${x.limit_at} users` : "–";
       const tag = x.status === "setup error" ? "error" : x.status;
-      return `<tr><td>${date}</td><td>${escapeHtml(x.users || "–")}</td><td>${escapeHtml(x.mode)}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
+      const lms = x.target === "lmstudio";
+      return `<tr><td>${date}</td><td>${escapeHtml(x.name || "–")}</td><td>${lms ? "LM Studio native" : "AnythingLLM"}</td>
+        <td${lms && x.model ? ` title="${escapeHtml(x.model)}"` : ""}>${escapeHtml(x.mode)}${lms && x.model ? `<div class="cell-sub">${escapeHtml(x.model)}</div>` : ""}</td>
+        <td>${escapeHtml(x.users || "–")}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
         <td title="${escapeHtml(x.limit_reason || "")}">${result}</td><td>${x.max_per_min != null ? fmt(x.max_per_min, 1) + " /min" : "–"}</td>
         <td>${x.p95_at_best != null ? fmt(x.p95_at_best, 1) + " s" : "–"}</td><td><span class="status-tag ${tag}">${escapeHtml(x.status)}</span></td>
-        <td>${x.report ? `<a href="loadtest/${encodeURIComponent(x.run)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td>
-        <td>${x.status === "running" ? "" : `<button class="icon-btn" data-delete-run="${escapeHtml(x.run)}" data-label="${escapeHtml(date)}" title="Delete this load test from disk"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button>`}</td></tr>`;
-    }).join("") : `<tr><td colspan="10" class="empty">No load tests yet</td></tr>`;
+        <td>${x.report ? reportLinks(`loadtest/${encodeURIComponent(x.run)}/report.html`) : "–"}</td>
+        <td>${x.status === "running" ? "" : `<button class="icon-btn" data-delete-run="${escapeHtml(x.run)}" data-label="${escapeHtml(x.name ? `${x.name} (${date})` : date)}" title="Delete this load test from disk"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button>`}</td></tr>`;
+    }).join("") : `<tr><td colspan="12" class="empty">No load tests yet</td></tr>`;
   } catch (e) {}
 }
 loadLoadTests(); setInterval(loadLoadTests, 20000);
@@ -942,7 +1251,7 @@ async function loadSessions() {
     $("sessionList").innerHTML = list.length ? list.map(x => `<tr><td>${escapeHtml(x.label || x.folder)}${x.retroactive ? '<span class="badge">from log</span>' : ""}</td>
       <td>${new Date(x.started * 1000).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" })} – ${x.ended ? hhmm(x.ended) : "running"}</td>
       <td>${fmt(x.completed)}</td>
-      <td>${x.report ? `<a href="sessions/${encodeURIComponent(x.folder)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td>
+      <td>${x.report ? reportLinks(`sessions/${encodeURIComponent(x.folder)}/report.html`) : "–"}</td>
       <td>${session && session.active && session.folder === x.folder ? "" : `<button class="icon-btn" data-delete-session="${escapeHtml(x.folder)}" data-label="${escapeHtml(x.label || x.folder)}" title="Delete this session from disk"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2h4l.5 1H13v1.5H3V3h2.5L6 2zm-1.5 3.5h7l-.6 8.1a1 1 0 0 1-1 .9H6.1a1 1 0 0 1-1-.9l-.6-8.1zM7 7v5.5h1V7H7zm2 0v5.5h1V7H9z" fill="currentColor"/></svg></button>`}</td></tr>`).join("")
       : `<tr><td colspan="5" class="empty">No sessions yet</td></tr>`;
   } catch (e) {}

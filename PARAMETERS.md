@@ -9,11 +9,12 @@ Contents:
 
 1. [Environment variables](#1-environment-variables)
 2. [Automated load test – `auto_loadtest.py`](#2-automated-load-test--auto_loadtestpy)
-3. [Simulated users – `main.py`](#3-simulated-users--mainpy)
-4. [Live monitor – `lmstudio_monitor.py`](#4-live-monitor--lmstudio_monitorpy)
-5. [Load test form in the dashboard](#5-load-test-form-in-the-dashboard)
-6. [Session reports – `live_session.py`](#6-session-reports--live_sessionpy)
-7. [Typical commands](#7-typical-commands)
+3. [Simulated users for AnythingLLM – `main.py`](#3-simulated-users-for-anythingllm--mainpy)
+4. [Simulated users for LM Studio – `lmstudio_user.py`](#4-simulated-users-for-lm-studio--lmstudio_userpy)
+5. [Live monitor – `lmstudio_monitor.py`](#5-live-monitor--lmstudio_monitorpy)
+6. [Load test form in the dashboard](#6-load-test-form-in-the-dashboard)
+7. [Session reports – `live_session.py`](#7-session-reports--live_sessionpy)
+8. [Typical commands](#8-typical-commands)
 
 ---
 
@@ -21,9 +22,9 @@ Contents:
 
 | Variable | Needed by | Required | Description |
 |---|---|---|---|
-| `ANYTHING_API_KEY` | load test; monitor (only to delete load-test threads and to start load tests from the dashboard) | **yes** for the load test | AnythingLLM developer API key (AnythingLLM → Settings → Developer API). Never written to disk by these scripts. |
-| `WORKSPACE_SLUG` | load test; monitor (default of the dashboard form) | **yes** for the load test | Slug of the workspace to test, as shown in the workspace URL (e.g. `my-workspace`). Use a dedicated test workspace if possible. |
-| `LMSTUDIO_API_TOKEN` | monitor | only if "Require API token" is enabled in LM Studio | Same as `--token`. |
+| `ANYTHING_API_KEY` | AnythingLLM load test; monitor (only to delete load-test threads and to start AnythingLLM load tests from the dashboard) | **yes** for the AnythingLLM load test | AnythingLLM developer API key (AnythingLLM → Settings → Developer API). Never written to disk by these scripts. |
+| `WORKSPACE_SLUG` | AnythingLLM load test; monitor (default of the dashboard form) | **yes** for the AnythingLLM load test | Slug of the workspace to test, as shown in the workspace URL (e.g. `my-workspace`). Use a dedicated test workspace if possible. |
+| `LMSTUDIO_API_TOKEN` | monitor; LM Studio load test | only if "Require API token" is enabled in LM Studio | Same as `--token` of the monitor; the monitor passes it on to load tests it starts. |
 | `LMSTUDIO_LOG_DIR` | monitor, load test | no | LM Studio log folder if it is not in the default location (`~/.lmstudio/server-logs`). `--log` takes precedence. |
 | `NO_COLOR` | load test | no | Any value disables coloured console output. |
 
@@ -44,12 +45,19 @@ $env:WORKSPACE_SLUG="my-workspace"
 ## 2. Automated load test – `auto_loadtest.py`
 
 ```bash
-python auto_loadtest.py [options] [-- options for main.py]
+python auto_loadtest.py [--target anythingllm|lmstudio] [options] [-- options for the simulated users]
 ```
 
 The test runs one *stage* per number of concurrent users, measures each stage and stops at the
-first stage that breaks a limit. Everything after `--` is forwarded to `main.py`
-(see [section 3](#3-simulated-users--mainpy)).
+first stage that breaks a limit. Everything after `--` is forwarded to the simulated users:
+`main.py` for AnythingLLM ([section 3](#3-simulated-users-for-anythingllm--mainpy)) or
+`lmstudio_user.py` for LM Studio ([section 4](#4-simulated-users-for-lm-studio--lmstudio_userpy)).
+
+### System under test
+
+| Option | Default | Description | Guideline |
+|---|---|---|---|
+| `--target` | `anythingllm` | `anythingllm`: questions go through AnythingLLM's developer API, including RAG, workspace settings and threads. `lmstudio`: questions go directly to LM Studio's OpenAI-compatible API, without AnythingLLM. Stages, limits and the report are the same. | Run both: the difference shows the time AnythingLLM itself adds (document search, prompt building) |
 
 ### Stages
 
@@ -86,21 +94,23 @@ first stage that breaks a limit. Everything after `--` is forwarded to `main.py`
 |---|---|---|---|
 | `--refusal-warn-rate F` | `0.10` | Refusal rate from which refusals are highlighted in red. Refusals never fail a stage. | `0.10` |
 | `--student-think-time S` | `90` | Assumed time between two questions of one real student; used to estimate how many students the system can serve (Little's law). | `60`–`180`; measure it in a live session if possible |
+| `--name TEXT` | – | Name of the load test, shown as the report title instead of the folder name (one line, at most 120 characters). The result folder keeps its date and time, so the same name can be used several times. | Describe what is tested, e.g. `Gemma 12B, query, 30 users` |
 | `--out DIR` | `loadtest_results` | Results folder (one subfolder per run). | – |
 
 ### Connection and setup
 
 | Option | Default | Description |
 |---|---|---|
-| `--host URL` | `http://localhost:3001` | AnythingLLM base URL. |
-| `--locustfile PATH` | `main.py` next to the script | Locust file with the user behaviour. |
+| `--host URL` | `http://localhost:3001` (AnythingLLM), `http://localhost:1234` (LM Studio) | Base URL of the system under test. |
+| `--locustfile PATH` | `main.py` or `lmstudio_user.py` next to the script, depending on `--target` | Locust file with the user behaviour. |
 | `--lmstudio-log VALUE` | `auto` | LM Studio log for exact token and timing figures: `auto` (default location), a path, or `off`. |
-| `--skip-preflight` | off | Skip the initial check of the API key, the workspace and a test question. |
+| `--skip-preflight` | off | Skip the initial check (AnythingLLM: API key and workspace; LM Studio: server reachable and model available). |
+| `--skip-warmup` | off | Start stage 1 right away. By default the test first sends one request and waits for its answer, so loading the model (LM Studio loads it on demand) and, for AnythingLLM, the embedding model is never part of a measurement. | Leave off |
 | `--dry-run` | off | Only print the planned stages and the expected duration, then exit. |
 
 ---
 
-## 3. Simulated users – `main.py`
+## 3. Simulated users for AnythingLLM – `main.py`
 
 Options for the simulated users. With `auto_loadtest.py` they go after `--`; with a manual Locust
 run they are passed to Locust directly (`python -m locust -f main.py --host … --mode chat`).
@@ -123,7 +133,38 @@ the test workspace.
 
 ---
 
-## 4. Live monitor – `lmstudio_monitor.py`
+## 4. Simulated users for LM Studio – `lmstudio_user.py`
+
+Used with `--target lmstudio`. The options go after `--`; with a manual Locust run they are passed
+to Locust directly (`python -m locust -f lmstudio_user.py --host http://localhost:1234 --model …`).
+Every question is a new conversation without chat history.
+
+| Option | Default | Description | Guideline |
+|---|---|---|---|
+| `--model ID` | first loaded model | Model id as listed by LM Studio (`lms ps` or the Developer tab). Without a loaded model, the first language model is used and LM Studio loads it on demand. From the dashboard: the model of the LM Studio model card. | The model AnythingLLM uses |
+| `--prompts PATH` | `prompts_lmstudio.json` | JSON list of questions. The default questions are general study questions that need no documents. | – |
+| `--system-prompt TEXT` | none | System prompt of every request. | Copy the workspace's system prompt from AnythingLLM for a close comparison |
+| `--context-tokens N` | `0` | Adds about N tokens of lecture-style text to every request, to simulate the document excerpts AnythingLLM adds in RAG mode. The sentences are shuffled per request, so LM Studio cannot reuse a cached prompt. The exact input size is shown under *Tokens in* in the report. | `0` for the pure model; for RAG: the *Tokens in* average of an AnythingLLM load test minus about 100, typically `1000`–`3000` |
+| `--max-tokens N` | `0` | Maximum tokens per answer; `0` = no limit, as in AnythingLLM. | `0`; a limit makes stages comparable but shortens answers |
+| `--temperature T` | model setting | Sampling temperature (0–2). Like all sampling options, only sent when given; otherwise the model's settings in LM Studio apply. | As configured in the AnythingLLM workspace |
+| `--top-p P` | model setting | Top P sampling (0–1). | `0.95` |
+| `--top-k K` | model setting | Top K sampling. | `40` |
+| `--min-p P` | model setting | Min P sampling (0–1). | `0.05` |
+| `--repeat-penalty R` | model setting | Repeat penalty (0.5–3). | `1.1` |
+| `--presence-penalty R` | model setting | Presence penalty (−2–2). | `0` |
+| `--reasoning MODE` | model setting | Thinking: `off`, `on`, or an effort level the model offers (`low`, `medium`, `high`, `xhigh`). | `off` for the fastest answers; as students use it for realistic load |
+| `--no-stream` | off | Request the complete answer at once instead of streaming. | Leave streaming on (realistic chat behaviour) |
+| `--wait-min S` / `--wait-max S` | `5` / `15` | Think time between two questions, as for AnythingLLM. | As for AnythingLLM, so results are comparable |
+| `--request-timeout S` | `300` | Timeout per request. | Above `--max-p95` |
+| `--refusal-log PATH`, `--run-id ID` | – | Set automatically by `auto_loadtest.py`. | – |
+
+The response time counts until the last streamed token has arrived, so it can be compared with the
+AnythingLLM test. Rejections (HTTP errors, timeouts, connection errors, an error in the stream or an
+empty answer) count as failures and are listed in the report.
+
+---
+
+## 5. Live monitor – `lmstudio_monitor.py`
 
 ```bash
 python lmstudio_monitor.py [options]
@@ -136,8 +177,8 @@ None of the options is required: the monitor finds the LM Studio log, the API an
 | Option | Default | Description |
 |---|---|---|
 | `--log PATH` | `~/.lmstudio/server-logs` | LM Studio log file or folder (or `LMSTUDIO_LOG_DIR`). |
-| `--lmstudio-url URL` | `http://localhost:1234` | LM Studio server, used for the loaded models and the status. |
-| `--token TOKEN` | `LMSTUDIO_API_TOKEN` | LM Studio API token, only if "Require API token" is enabled. |
+| `--lmstudio-url URL` | `http://localhost:1234` | LM Studio server, used for the status, the LM Studio model card (listing, loading, unloading models) and LM Studio native load tests started from the dashboard. |
+| `--token TOKEN` | `LMSTUDIO_API_TOKEN` | LM Studio API token, only if "Require API token" is enabled; also used by the model card and passed to LM Studio load tests. |
 | `--no-api` | off | Do not query the LM Studio API (log and GPU only). |
 | `--gpu-index N` | `0` | GPU to monitor in multi-GPU systems (NVIDIA). |
 | `--from-start` | off | Read the whole log from the beginning instead of new lines only. Rarely needed; see `--replay-minutes`. |
@@ -169,20 +210,22 @@ None of the options is required: the monitor finds the LM Studio log, the API an
 | `--interval S` | `60` | Aggregation interval of the CSV files, in seconds. Keep `60`, as the session reports work per minute. |
 | `--session LABEL` | – | Start a recording session right away (same as **Start session** in the dashboard). |
 | `--probe-interval S` | `0` | Send a short synthetic test request to LM Studio every S seconds to measure the response time even without users. `0` = off. Each probe adds a little load. |
-| `--anythingllm-url URL` | `http://localhost:3001` | AnythingLLM, used to delete load-test threads ("Stop & delete threads"). Needs `ANYTHING_API_KEY`. |
-| `--project-dir DIR` | folder of the script | Folder of `auto_loadtest.py`, its status and stop files and `loadtest_results/`. |
+| `--anythingllm-url URL` | `http://localhost:3001` | AnythingLLM, used to delete load-test threads ("Stop & delete threads") and to show which model AnythingLLM uses. Needs `ANYTHING_API_KEY` (and `WORKSPACE_SLUG` for the model). |
+| `--project-dir DIR` | folder of the script | Folder of `auto_loadtest.py`, its status and stop files, `loadtest_results/` and the saved model configurations (`model_configs.json`). |
 | `--diagnose` | off | Print which LM Studio log entry types are recognised (no content) and exit. |
 
 ---
 
-## 5. Load test form in the dashboard
+## 6. Load test form in the dashboard
 
 **New load test …** in the Load test card starts `auto_loadtest.py` with these fields. The monitor
 checks every value against the range below before starting; the process is started without a shell.
 
 | Field | Option | Allowed range | Default |
 |---|---|---|---|
-| AnythingLLM URL | `--host` | http(s) URL | `--anythingllm-url` of the monitor |
+| Name (optional) | `--name` | one line, at most 120 characters | – |
+| System under test | `--target` | AnythingLLM, LM Studio | AnythingLLM |
+| AnythingLLM URL / LM Studio URL | `--host` | http(s) URL | `--anythingllm-url` or `--lmstudio-url` of the monitor |
 | Workspace slug | `WORKSPACE_SLUG` | letters, digits, `-`, `_` | `WORKSPACE_SLUG` of the monitor |
 | API key | `ANYTHING_API_KEY` | – | `ANYTHING_API_KEY` of the monitor; passed to the process only, never stored |
 | Mode | `-- --mode` | `query`, `chat` | `query` |
@@ -196,15 +239,38 @@ checks every value against the range below before starting; the process is start
 | Limit: p95 response time (s) | `--max-p95` | 1–3600 | `120` |
 | Limit: failure rate (%) | `--max-fail-rate` (as a fraction) | 0–100 % | `5` |
 | Student think time for estimate (s) | `--student-think-time` | 1–3600 | `90` |
-| Threads kept in AnythingLLM | `-- --max-threads` | 0–10000 | `30` |
+| Threads kept in AnythingLLM *(AnythingLLM only)* | `-- --max-threads` | 0–10000 | `30` |
+| Context tokens per request *(LM Studio only)* | `-- --context-tokens` | 0–200000 | `0` |
 | Find the exact limit | `--refine` | on/off | off |
 
 The remaining options (GPU limits, refusal highlight, LM Studio log) keep their defaults; use the
-command line to change them.
+command line to change them. For "LM Studio native", the model and its request settings come from
+the LM Studio model card:
+
+### LM Studio model card
+
+| Field | Applies | Allowed range | Default |
+|---|---|---|---|
+| Model | – | language models on disk | the loaded model |
+| Context length | when loading | 256 – the model's maximum | as loaded / LM Studio default |
+| Parallel requests | when loading | 1–64 | as loaded / LM Studio default. Guideline: at least the number of concurrent users you expect, as far as GPU memory allows |
+| System prompt | every request | up to 8000 characters | German assistant prompt |
+| Max response tokens | every request | 0–131072, empty = no limit | no limit |
+| Temperature | every request | 0–2 | model setting |
+| Top P sampling | every request | 0–1 | model setting |
+| Thinking | every request | the model's options | model default |
+| *Advanced:* flash attention | when loading | on/off | as loaded / LM Studio default |
+| *Advanced:* evaluation batch size | when loading | 1–65536 | as loaded / LM Studio default |
+| *Advanced:* KV cache on GPU | when loading | on/off | as loaded / LM Studio default |
+| *Advanced:* experts | when loading | 1–512, MoE models only | model default |
+| *Advanced:* top K, min P, repeat penalty, presence penalty | every request | see section 4 | model setting |
+
+GPU offload, context overflow and unloading on idle are not offered by LM Studio's API; they stay
+as set in LM Studio.
 
 ---
 
-## 6. Session reports – `live_session.py`
+## 7. Session reports – `live_session.py`
 
 | Option | Required | Description |
 |---|---|---|
@@ -214,7 +280,7 @@ Sessions are normally started, ended and created for past time ranges in the das
 
 ---
 
-## 7. Typical commands
+## 8. Typical commands
 
 ```bash
 # Monitor for a live test with students (dashboard opens automatically)
@@ -231,4 +297,10 @@ python auto_loadtest.py --users 1,4,8 --stage-duration 120 --cooldown 15
 
 # Strict interactive limits for a chat workspace
 python auto_loadtest.py --users 2,4,8,12,16,24 --max-p95 45 --max-fail-rate 0.01 --refine -- --mode chat
+
+# LM Studio natively, pure model capacity
+python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32,48,64 --refine
+
+# LM Studio natively with a RAG-like input of about 2000 tokens per question and thinking off
+python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- --model google/gemma-4-12b --context-tokens 2000 --reasoning off
 ```

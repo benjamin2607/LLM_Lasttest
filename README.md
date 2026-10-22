@@ -1,39 +1,55 @@
 # LLM Load Test & Monitoring – AnythingLLM + LM Studio
 
 Tools to determine the capacity limits of a self-hosted AnythingLLM + LM Studio
-setup and to monitor its load in production and in live tests with students.
-Everything runs locally; no data leaves the machine.
+setup – through AnythingLLM or with LM Studio alone – and to monitor its load in
+production and in live tests with students. Everything runs locally; no data
+leaves the machine.
+
+What it offers:
+
+- **Automated load tests** of AnythingLLM or of LM Studio natively, stage by stage up to the
+  capacity limit, with an HTML report (and PDF export) per run
+- **A live dashboard** with requests, tokens, response times and hardware in real time,
+  load tests and LM Studio models controlled from there, and saved model configurations
+- **Recorded sessions** of live tests with real students, also created afterwards for any past
+  time range
 
 **Quick start**
 
 1. `pip install locust` (in a virtual environment)
 2. `python lmstudio_monitor.py` – opens the live dashboard at `http://127.0.0.1:8765`
 3. Set `ANYTHING_API_KEY` and `WORKSPACE_SLUG`, then `python auto_loadtest.py --users 1,2,4,8,16` – or start a load test from the dashboard
+4. Without AnythingLLM: `python auto_loadtest.py --target lmstudio --users 1,2,4,8,16` tests the model loaded in LM Studio
 
 Step-by-step guide for the first run: **[QUICKSTART.md](QUICKSTART.md)**. All options with descriptions and guideline values: **[PARAMETERS.md](PARAMETERS.md)**.
 
 | File | Purpose |
 |---|---|
 | `main.py` | Locust user behaviour against the AnythingLLM developer API (options for manual Locust runs: `PARAMETERS.md`) |
-| `auto_loadtest.py` | Automated capacity test: increases concurrent users stage by stage until a limit is exceeded |
+| `lmstudio_user.py` | Locust user behaviour against LM Studio's OpenAI-compatible API, without AnythingLLM |
+| `auto_loadtest.py` | Automated capacity test of AnythingLLM or LM Studio (`--target`): increases concurrent users stage by stage until a limit is exceeded |
+| `locust_final_stats.py` | Writes complete Locust statistics at the end of each stage (used by both Locust files) |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
+| `lmstudio_models.py` | LM Studio model card of the dashboard: list, load, reload and unload models, saved model configurations |
 | `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
 | `dashboard.html` | Dashboard front end, served by the monitor (no external libraries) |
 | `report_charts.py` | Self-contained SVG charts and HTML rendering for the reports |
 | `live_session.py` | Recording sessions for live tests: per-request data, per-minute values, hardware and report |
 | `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
-| `prompts.json` | Questions sent by the simulated users |
-| `tests/` | Unit tests for the log parser and the live sessions |
+| `prompts.json` | Questions for the AnythingLLM test (refer to the workspace documents) |
+| `prompts_lmstudio.json` | Questions for the LM Studio native test (general study questions, no documents needed) |
+| `tests/` | Unit tests for the log parser, the live sessions and the LM Studio load test |
 | `QUICKSTART.md` | Step-by-step guide: install, monitor, first load test, live session |
 | `PARAMETERS.md` | Reference of all options and environment variables with guideline values |
 
 No additional packages are required beyond `locust` (which ships `psutil`) and
-the Python standard library.
+the Python standard library. Files the tools create at run time (`loadtest_results/`,
+`monitoring/`, `model_configs.json`, `.loadtest_*`) are excluded from git.
 
 ## Prerequisites
 
 1. **Python virtual environment with Locust**: `pip install locust`
-2. **AnythingLLM API key** (AnythingLLM → Settings → Developer API) and the workspace slug as environment variables:
+2. **AnythingLLM API key** (AnythingLLM → Settings → Developer API) and the workspace slug as environment variables (not needed for LM Studio native tests):
    - Linux/macOS: `export ANYTHING_API_KEY=...` and `export WORKSPACE_SLUG=...`
    - Windows PowerShell: `$env:ANYTHING_API_KEY="..."` and `$env:WORKSPACE_SLUG="..."`
 3. **GPU metrics** are detected automatically (no configuration needed):
@@ -60,6 +76,11 @@ Run the test:
 python auto_loadtest.py --users 1,2,4,8,16,24,32,48,64 --stage-duration 300 --refine -- --mode query --wait-min 5 --wait-max 15
 ```
 
+Before the first stage, a **warm-up** request is sent and the test waits for its answer, so the
+model is loaded (LM Studio loads it on demand) before anything is measured; for AnythingLLM it
+runs in a temporary thread that is deleted afterwards. The report notes how long it took; the
+dashboard shows "waiting for the model" meanwhile (`--skip-warmup` turns it off).
+
 Each stage starts Locust headless, ramps up, measures for `--stage-duration`
 seconds while sampling GPU/host/token metrics, and evaluates the result. The
 first stage that violates a limit ends the run; `--refine` then bisects to find
@@ -67,7 +88,8 @@ the exact limit.
 
 Limits (configurable): `--max-fail-rate 0.05`, `--max-p95 120` (seconds, chat
 request), `--max-vram-pct 98`, `--max-gpu-temp 88`. Everything after `--` is
-forwarded to `main.py` (e.g. `--mode chat`).
+forwarded to the simulated users: `main.py` for AnythingLLM (e.g. `--mode chat`) or
+`lmstudio_user.py` for LM Studio (e.g. `--context-tokens 2000`).
 
 **Stopping a run.** The stage limits above are evaluated when a stage ends. To stop a run at any
 time, use the **"Stop & delete threads"** button at the bottom of the live monitor's dashboard: it
@@ -76,7 +98,7 @@ then deletes all threads the load test created in AnythingLLM. The report notes 
 The load test publishes its state in `.loadtest_status.json` and watches for `.loadtest_stop`;
 the monitor needs `ANYTHING_API_KEY` (and `--anythingllm-url` if AnythingLLM is not on
 `http://localhost:3001`) to delete the threads. Without a running load test, the button only
-deletes the load-test threads.
+deletes the load-test threads. LM Studio native tests create no threads; the button only stops them.
 
 Results are written to `loadtest_results/<timestamp>/`:
 
@@ -85,12 +107,73 @@ Results are written to `loadtest_results/<timestamp>/`:
 | `report.html` | The report, in the same layout as the live session reports. Sections: **Result** (stable limit, throughput, estimated number of students, models), **Requests** (answered, failed, refusals), **Response times**, **Tokens** and **Hardware** – each as tiles with average, median, p95 and maximum at the stage with the highest stable throughput – then the most frequent errors, **charts by load** (response time, throughput, tokens/s, failures and refusals, GPU and memory per number of users), **charts over time** (every request and the hardware over the whole run), refusals and the stage table |
 | `report.md` | The same as Markdown, charts as SVG files in `charts/` |
 | `results.csv` / `results.json` | All figures per stage |
-| `stage_XX_*` | Locust HTML report, CSV statistics and log per stage |
+| `stage_XX_*` | Locust HTML report, CSV statistics and log per stage; `*_final.csv` holds the complete statistics including the requests that finished during the stop grace period |
 
 The report also identifies throughput saturation and estimates how many *real* students the
 system can serve, using Little's law with `--student-think-time` (default: 90 s between two questions).
 
+**PDF export.** The **PDF** button next to a report opens it with a print layout (A4, light colours,
+no page breaks inside tiles, charts or table rows) and the browser's print dialog right away; choose
+"Save as PDF". This works in every browser and needs no extra software; reports created before
+this feature get the print layout when the monitor serves them. Give load tests a name
+(`--name` or the form) so the PDF has a meaningful title.
+
 Tip: run once with `--mode query` and once with `--mode chat`; for overnight runs, choose a generous `--users` list.
+
+### Testing LM Studio natively
+
+`--target lmstudio` ("LM Studio native" in the dashboard) runs the same test against LM Studio
+itself instead of AnythingLLM. Requests go to LM Studio's OpenAI-compatible endpoint
+(`/v1/chat/completions`), because LM Studio logs a completion ID for every chunk there, so
+parallel requests are tracked exactly:
+
+```bash
+python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- --context-tokens 2000
+```
+
+- No AnythingLLM API key or workspace is needed; `LMSTUDIO_API_TOKEN` is used if "Require API
+  token" is enabled. From the dashboard, the test uses the model and settings chosen in the
+  **LM Studio model** card (see below); on the command line the first loaded model is used
+  unless `-- --model ID` is given, and sampling options such as `-- --temperature 0.3
+  --reasoning off` are only sent when given.
+- The questions come from `prompts_lmstudio.json`: general study questions that need no documents
+  (the AnythingLLM questions in `prompts.json` refer to the workspace documents).
+- Answers are streamed as in a chat window; the response time counts until the last token.
+- `-- --context-tokens N` adds about N tokens of shuffled lecture-style text to every request, so
+  the model processes a similar input as with AnythingLLM's document excerpts. A good value is the
+  *Tokens in* average of an AnythingLLM report minus about 100.
+- Stages, limits, report layout and result files are the same, and the dashboard form offers the
+  same choice ("System under test"). Threads and "no relevant documents" refusals do not exist
+  here; technical rejections are reported as usual.
+
+#### LM Studio model card (dashboard)
+
+A card above the load test chooses and loads the model, independently of the load test:
+
+- **Model:** all language models on disk, with their load state and the settings of a loaded one.
+- **Loaded model:** *Keep current LM Studio settings* (test it as it is), *Adjust settings*
+  (reload with the settings of the card) or *Reload model* (reload with LM Studio's defaults).
+  A model that is not loaded can be loaded with the card's settings or with the defaults.
+- **Settings**, grouped like in LM Studio: *Load* (context length, parallel requests; under
+  Advanced: flash attention, evaluation batch size, KV cache on the GPU, experts), *Settings*
+  (system prompt, max response tokens), *Sampling* (temperature, top P; under Advanced: top K,
+  min P, repeat and presence penalty) and *Reasoning* (thinking, with the options the model
+  offers). Load settings apply when the model is loaded; the others are sent with every request
+  of an "LM Studio native" load test. GPU offload, context overflow and unloading on idle are
+  not offered by LM Studio's API and stay as set in LM Studio.
+- **Saved configurations:** save the card's settings under a name and pick them again later.
+  They are kept in `model_configs.json` in the project folder (settings only).
+- **Unload model** (bottom left) unloads the model after a confirmation.
+- Models cannot be changed while a load test is running.
+
+With "AnythingLLM" selected, the load test form shows which model AnythingLLM uses (workspace or
+system setting, read through its API) and warns if it is not loaded in LM Studio: AnythingLLM
+always uses its own model setting, system prompt and temperature, so the card's request settings
+do not apply to AnythingLLM tests. If an AnythingLLM model is not loaded, LM Studio loads it on
+demand with default settings, next to the model already loaded.
+
+Comparing both reports separates the model's capacity from the time AnythingLLM adds (document
+search, embedding, prompt building). All options: [PARAMETERS.md](PARAMETERS.md#4-simulated-users-for-lm-studio--lmstudio_userpy).
 
 ### Threads
 
@@ -131,9 +214,10 @@ Opens the dashboard at `http://127.0.0.1:8765` (reachable from the local machine
 only). It updates **every second** via a live stream and shows:
 
 - **Status bar:** a compact row of status LEDs (connection, LM Studio, log, model, GPU) that expands into the details on click, the load test status, and **Clear**, which resets all values shown and starts afresh (stored CSV data is kept; a restart does not restore cleared values). Warnings appear only in the tile they belong to
-- **Load test chip** at the top: shows stage, users and elapsed time; click it to see the settings of the running (or last) load test; technical details are under "Advanced"
-- **Load test card** at the bottom: status, link to the latest report, "Stop & delete threads", a table of all previous load tests (settings, result, throughput, p95, status, report, and a trash button that deletes the run's folder from disk after confirmation), and **New load test** – a form with all main parameters (stages, durations, think time, mode, limits, threads kept) and their defaults that starts `auto_loadtest.py`. The monitor needs `ANYTHING_API_KEY` and `WORKSPACE_SLUG` (or enter them in the form; the key is passed to the process only and never stored)
-- **Sessions card** at the bottom: **Report for a past time range** (see below) and the list of recorded sessions with links to their reports and a trash button (deletes the session folder from disk after confirmation; the recording session cannot be deleted)
+- **Load test chip** at the top: shows stage, users and elapsed time ("waiting for the model" during the warm-up); click it to see the settings of the running (or last) load test, including model and request settings; technical details are under "Advanced"
+- **LM Studio model card** above the load test: choose, load, reload and unload models with their settings, and save configurations (see [LM Studio model card](#lm-studio-model-card-dashboard))
+- **Load test card** at the bottom: status, link to the latest report, "Stop & delete threads", a table of all previous load tests (date, name, target, mode, stages, result, throughput, p95, status, **Open** and **PDF** for the report, and a trash button that deletes the run's folder from disk after confirmation), and **New load test** – a form with an optional name (shown as the report title; the result folder keeps its date name, so names may repeat), the system under test (AnythingLLM or LM Studio native, with a note on which model will be tested) and all main parameters with their defaults that starts `auto_loadtest.py`. For AnythingLLM the monitor needs `ANYTHING_API_KEY` and `WORKSPACE_SLUG` (or enter them in the form; the key is passed to the process only and never stored)
+- **Sessions card** at the bottom: **Create a report for a past time range** (see below) and the list of recorded sessions with **Open** and **PDF** for their reports and a trash button (deletes the session folder from disk after confirmation; the recording session cannot be deleted)
 - Long ranges (30 min, Max) are drawn with at most 600 points per chart, using fixed time buckets aligned to the clock (maximum per bucket), so the drawn data stays stable while the window moves
 - **Key metrics:** active requests (and how many are waiting), responses per minute, tokens per second, p95 response time and time to first token (last 5 minutes), totals since start. Below a divider, each tile also shows the average over the selected time range (5/15/30 min); the response time and first token tiles add the p95 for that range
 - **While busy vs. overall:** averages over time (active requests, responses per minute, generated tokens/s, GPU utilisation) are shown "while busy" – only the seconds with at least one request in flight, including waiting for the first token – and "overall", which includes idle time. The busy share tells how much of the range the system was working. Use "while busy" to judge performance and "overall" for usage and planning. Figures per request are never affected by idle time
@@ -246,6 +330,14 @@ python lmstudio_monitor.py --diagnose
 If a newer LM Studio release changes the log format, share that report; the patterns are
 defined at the top of `lmstudio_log_parser.py`.
 
+Other common issues:
+
+- **The model card says "LM Studio is not reachable"** – start the LM Studio server; with
+  "Require API token" enabled, start the monitor with `--token` or `LMSTUDIO_API_TOKEN`.
+- **"no model is loaded" when starting an LM Studio native test** – load a model in the model card first.
+- **A load test fails right away** – the first lines of its log are shown under the form; nearly
+  all failures at the lowest stage point to a configuration problem (see the hint in the report).
+
 ### Tests
 
 ```bash
@@ -268,9 +360,18 @@ On Macs the GPU shares system memory. The limit is taken from `sysctl iogpu.wire
 otherwise the macOS default (about two thirds of RAM up to 36 GB, three quarters above). The dashboard
 labels the metric "GPU memory" instead of "VRAM". In the load test, the GPU temperature limit is skipped on macOS.
 
-## Privacy
+## Privacy and security
 
 - All scripts run locally and send no data to third parties. The dashboard binds to `127.0.0.1` only and writes no access logs.
+- The dashboard accepts requests only with the Host and Origin `127.0.0.1:<port>` or `localhost:<port>`, so
+  other web pages cannot use it (also not through DNS rebinding). Every action (load test, model,
+  session, delete, stop) additionally needs a custom header that browsers only send from the dashboard itself.
+- API keys and tokens are only read from environment variables or the dashboard form and passed to
+  the load test process; they are never written to disk or shown. Load tests are started without a
+  shell and with range-checked values; only folders directly inside `loadtest_results/` and
+  `monitoring/sessions/` can be served or deleted.
+- `model_configs.json` holds model settings only (including the system prompt you enter); load test
+  reports contain the synthetic prompts and the start of a few answers as refusal examples.
 - Only **aggregated numeric metrics** are stored (counts, durations, tokens, model name, GPU values).
   Prompt and response text, IP addresses, user names and chat IDs are neither stored nor displayed.
 - **Important:** LM Studio itself writes full prompts and responses to its server log, and AnythingLLM stores chat histories in its database.
