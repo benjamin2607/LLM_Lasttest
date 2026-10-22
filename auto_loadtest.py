@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Automated capacity test for AnythingLLM backed by LM Studio.
+Automated capacity test for AnythingLLM backed by LM Studio, or for LM Studio directly.
 
-Runs main.py (Locust) headless several times with an increasing number of
-concurrent users. During each stage it samples GPU/host metrics and, if the
+Runs a Locust user file headless several times with an increasing number of
+concurrent users: main.py for AnythingLLM (--target anythingllm, the default) or
+lmstudio_user.py for LM Studio's OpenAI-compatible API (--target lmstudio). During each stage it samples GPU/host metrics and, if the
 LM Studio log is available, token throughput. As soon as a stage violates a
 limit (failure rate, p95 latency, VRAM, GPU temperature) the run stops; with
 --refine the exact limit is then located by bisection. Results are written as
 CSV/JSON plus a Markdown report to the results directory.
 
-Any argument not recognised by this script is forwarded to main.py
-(e.g. --mode chat --wait-min 2 --wait-max 5).
+Any argument not recognised by this script is forwarded to the Locust user file
+(e.g. --mode chat --wait-min 2 --wait-max 5 for AnythingLLM, --model ID --context-tokens 1500
+for LM Studio).
 
-Example:
+Examples:
     python auto_loadtest.py --users 1,2,4,8,16,32,48,64 --stage-duration 300 --refine -- --mode query
+    python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,32 -- --context-tokens 1500
 """
 import argparse
 import csv
@@ -40,6 +43,15 @@ from system_metrics import SystemSampler
 
 BASE_DIR = Path(__file__).resolve().parent
 
+# What differs between the systems under test; everything else (stages, limits, report) is shared.
+TARGETS = {
+    "anythingllm": {"label": "AnythingLLM", "host": "http://localhost:3001", "locustfile": "main.py",
+                    "chat": "/thread/chat"},
+    "lmstudio": {"label": "LM Studio (direct)", "host": "http://localhost:1234", "locustfile": "lmstudio_user.py",
+                 "chat": "/v1/chat/completions"},
+}
+CHAT_PREFIXES = tuple(t["chat"] for t in TARGETS.values())  # Names of the chat entries in the Locust statistics.
+
 
 def num(value):
     """Convert a Locust CSV cell to float, returning None for 'N/A' or empty cells."""
@@ -52,12 +64,19 @@ def num(value):
 REFUSAL_TYPES = ("REFUSAL", "REJECTED")  # Entry types reported by main.py next to the HTTP requests.
 
 
+def final(path):
+    """The complete statistics written when Locust quits (see locust_final_stats.py), if present."""
+    complete = path.with_name(path.stem + "_final" + path.suffix)
+    return complete if complete.exists() else path
+
+
 def read_locust_stats(path):
     """
     Parse a Locust *_stats.csv file. Returns (totals, chat row, refusal counts), where totals
     sums the HTTP requests only (refusal entries are excluded) and refusal counts maps
     e.g. "REJECTED http-503" or "REFUSAL no-context" to the number of occurrences.
     """
+    path = final(path)
     if not path.exists():
         return None, None, {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -65,7 +84,7 @@ def read_locust_stats(path):
     http_rows = [r for r in rows if r.get("Name") != "Aggregated" and r.get("Type") not in REFUSAL_TYPES]
     totals = {"Request Count": sum(int(num(r["Request Count"]) or 0) for r in http_rows),
               "Failure Count": sum(int(num(r["Failure Count"]) or 0) for r in http_rows)}
-    chat = next((r for r in http_rows if r.get("Name", "").startswith("/thread/chat")), None)
+    chat = next((r for r in http_rows if r.get("Name", "").startswith(CHAT_PREFIXES)), None)
     refusals = {f"{r['Type']} {r['Name']}": int(num(r["Request Count"]) or 0)
                 for r in rows if r.get("Type") in REFUSAL_TYPES}
     return totals, chat, refusals
@@ -87,7 +106,7 @@ def read_history(path):
     if not path.exists():
         return []
     with open(path, newline="", encoding="utf-8") as f:
-        rows = [r for r in csv.DictReader(f) if r.get("Name", "").startswith("/thread/chat")]
+        rows = [r for r in csv.DictReader(f) if r.get("Name", "").startswith(CHAT_PREFIXES)]
     out = []
     for r in rows:
         t = num(r.get("Timestamp"))
@@ -117,10 +136,16 @@ if USE_COLOR and os.name == "nt":
     os.system("")  # Enables ANSI escape sequences in the Windows console.
 
 
-SETUP_HINT = ("Nearly all requests failed at the lowest load. This usually indicates a configuration problem, "
-              "not a capacity limit: check the LLM provider in AnythingLLM. When AnythingLLM runs in Docker, "
-              "LM Studio must be configured as http://host.docker.internal:1234/v1 and "
-              "'Serve on Local Network' must be enabled in LM Studio.")
+SETUP_HINTS = {
+    "anythingllm": ("Nearly all requests failed at the lowest load. This usually indicates a configuration problem, "
+                    "not a capacity limit: check the LLM provider in AnythingLLM. When AnythingLLM runs in Docker, "
+                    "LM Studio must be configured as http://host.docker.internal:1234/v1 and "
+                    "'Serve on Local Network' must be enabled in LM Studio."),
+    "lmstudio": ("Nearly all requests failed at the lowest load. This usually indicates a configuration problem, "
+                 "not a capacity limit: check that the LM Studio server is running, that the model can be loaded "
+                 "(--model) and, if 'Require API token' is enabled, that LMSTUDIO_API_TOKEN is set."),
+}
+SETUP_HINT = SETUP_HINTS["anythingllm"]  # Replaced by the hint of the selected target in main().
 
 
 def looks_like_setup_problem(result):
@@ -142,6 +167,7 @@ def check_locust():
 
 def read_failures(path, limit=5):
     """Return the most frequent (error, occurrences) pairs from a Locust *_failures.csv file."""
+    path = final(path)
     if not path.exists():
         return []
     with open(path, newline="", encoding="utf-8") as f:
@@ -155,6 +181,26 @@ def log_tail(path, lines=25):
         return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
     except OSError:
         return []
+
+
+def preflight_lmstudio(host, model=None):
+    """Verify that LM Studio is reachable and offers a language model (or the requested one)."""
+    token = os.environ.get("LMSTUDIO_API_TOKEN")
+    req = urllib.request.Request(f"{host}/v1/models", headers={"Authorization": f"Bearer {token}"} if token else {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            ids = [m.get("id", "") for m in json.loads(resp.read()).get("data", [])]
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"ERROR: LM Studio refused the model list (HTTP {exc.code}). "
+                 "If 'Require API token' is enabled, set LMSTUDIO_API_TOKEN.")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        sys.exit(f"ERROR: LM Studio is not reachable at {host} ({exc}). Start the server in LM Studio.")
+    llms = [i for i in ids if "embed" not in i.lower()]
+    if model and model not in ids:
+        sys.exit(f"ERROR: LM Studio does not offer the model '{model}'. Available: {', '.join(llms) or 'none'}")
+    if not llms:
+        sys.exit("ERROR: LM Studio offers no language model. Download or load one first.")
+    print(f"[preflight] LM Studio reachable, model {model or 'auto (first loaded model)'}; available: {', '.join(llms)}.")
 
 
 def preflight(host):
@@ -215,10 +261,11 @@ def stop_requested():
 class StatusPublisher(threading.Thread):
     """Keeps the status file fresh (every 2 s) for as long as the run is active."""
 
-    def __init__(self, run):
+    def __init__(self, run, target="anythingllm"):
         super().__init__(daemon=True)
-        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time(),
-                       "workspace": os.environ.get("WORKSPACE_SLUG"), "run_started": time.time()}
+        self.fields = {"run": run, "stage": 0, "users": 0, "stage_started": time.time(), "target": target,
+                       "workspace": os.environ.get("WORKSPACE_SLUG") if target == "anythingllm" else None,
+                       "run_started": time.time()}
         self._stop = threading.Event()
 
     def update(self, **fields):
@@ -427,7 +474,8 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
     best = max(passing, key=lambda r: r["chat_rps"], default=None)
 
     lines = [f"# Load test report {out_dir.name}", "",
-             f"- Host: `{args.host}`, stage duration {args.stage_duration}s, forwarded to main.py: `{' '.join(args.passthrough) or '-'}`",
+             f"- Target: {TARGETS[args.target]['label']}, host `{args.host}`, stage duration {args.stage_duration}s, "
+             f"forwarded to {args.locustfile.name}: `{' '.join(args.passthrough) or '-'}`",
              f"- Limits: failure rate ≤ {args.max_fail_rate:.0%}, chat p95 ≤ {args.max_p95}s, "
              f"VRAM ≤ {args.max_vram_pct}%, GPU ≤ {args.max_gpu_temp}°C", ""]
     if aborted:
@@ -469,7 +517,8 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
     if refusal_stages:
         lines += ["", "## ⚠ Refusals", "",
                   "Requests that were answered with a refusal or rejected by the server, per stage. "
-                  "Technical rejections also count as failures; \"no relevant documents\" refusals count as answered.", "",
+                  "Technical rejections also count as failures; \"no relevant documents\" refusals (AnythingLLM "
+                  "query mode only) count as answered.", "",
                   "| Users | Chat requests | Rejected (technical) | No relevant documents | Refusal rate |",
                   "|---:|---:|---:|---:|---:|"]
         for r in ordered:
@@ -492,7 +541,7 @@ def write_results(out_dir, results, args, last_ok, first_bad, aborted, user_stop
                     seen[ex["category"]] = seen.get(ex["category"], 0) + 1
                     examples.append((r["users"], ex))
         if examples:
-            lines += ["", "Examples (prompt from prompts.json → start of the response):", ""]
+            lines += ["", "Examples (synthetic prompt → start of the response):", ""]
             for users, ex in examples:
                 response = " ".join(ex["response"].split()).replace("|", "\\|") or "(empty)"
                 thread = f", thread `{ex['thread']}`" if ex.get("thread") else ""
@@ -590,7 +639,8 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
         count_tile("Not answered", f"{sum(not_answered.values()):,}",
                    ", ".join(f"{n} {k}" for k, n in not_answered.items() if n) or "none"),
         count_tile("Refusals", f"{refused / chat_total:.1%}" if chat_total else "–",
-                   f"{refused} of {chat_total} (rejected or no relevant documents)" if chat_total else ""),
+                   (f"{refused} of {chat_total} (rejected or no relevant documents)" if args.target == "anythingllm"
+                    else f"{refused} of {chat_total} rejected") if chat_total else ""),
     ]
     if ref and ref.get("lm_max_active") is not None:
         request_tiles.append(count_tile("Peak concurrency in LM Studio", f"{ref['lm_max_active']:g}",
@@ -649,11 +699,17 @@ def html_report(out_dir, ordered, results, args, summary, lines, charts):
 
     gpu = getattr(args, "gpu_name", None)
     started = datetime.strptime(out_dir.name, "%Y%m%d_%H%M%S") if re.fullmatch(r"\d{8}_\d{6}", out_dir.name) else None
-    body = [f"<h1>Load test {html.escape(out_dir.name)}</h1>",
+    if args.target == "lmstudio":
+        model = passthrough_value(args.passthrough, "--model")
+        context = passthrough_value(args.passthrough, "--context-tokens")
+        details = [f"model {model}" if model else None,
+                   f"≈ {context} context tokens per request" if context and context != "0" else None]
+    else:
+        details = [f"mode {passthrough_value(args.passthrough, '--mode') or 'query'}"]
+    body = [f"<h1>Load test {html.escape(out_dir.name)} – {html.escape(TARGETS[args.target]['label'])}</h1>",
             "<p class='meta'>" + " · ".join(html.escape(x) for x in filter(None, [
-                started.strftime("%Y-%m-%d %H:%M") if started else None, args.host,
-                f"mode {passthrough_value(args.passthrough, '--mode') or 'query'}", f"{args.stage_duration} s per stage",
-                gpu])) + "</p>"]
+                started.strftime("%Y-%m-%d %H:%M") if started else None, args.host, *details,
+                f"{args.stage_duration} s per stage", gpu])) + "</p>"]
     body += [f"<div class='banner'>{html.escape(b)}</div>" for b in banners]
     if failed:
         body.append(f"<pre>{html.escape(failed['error'])}</pre>")
@@ -752,8 +808,11 @@ def build_charts(ordered, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host", default="http://localhost:3001", help="AnythingLLM base URL")
-    ap.add_argument("--locustfile", type=Path, default=BASE_DIR / "main.py")
+    ap.add_argument("--target", choices=sorted(TARGETS), default="anythingllm",
+                    help="System under test: AnythingLLM (via its developer API) or LM Studio directly")
+    ap.add_argument("--host", help="Base URL (default: http://localhost:3001 for AnythingLLM, "
+                                   "http://localhost:1234 for LM Studio)")
+    ap.add_argument("--locustfile", type=Path, help="Locust user file (default: main.py or lmstudio_user.py)")
     ap.add_argument("--users", help="Explicit stages, e.g. 1,2,4,8,16,32 (overrides start/step/max)")
     ap.add_argument("--start-users", type=int, default=1)
     ap.add_argument("--step", type=int, default=2, help="Additive step size")
@@ -781,7 +840,11 @@ def main():
     args, passthrough = ap.parse_known_args()
     sys.stdout.reconfigure(line_buffering=True)  # Flush every line, also when redirected to a file.
     args.passthrough = [p for p in passthrough if p != "--"]
-    args.locustfile = args.locustfile.resolve()
+    target = TARGETS[args.target]
+    args.host = (args.host or target["host"]).rstrip("/")
+    args.locustfile = (args.locustfile or BASE_DIR / target["locustfile"]).resolve()
+    global SETUP_HINT
+    SETUP_HINT = SETUP_HINTS[args.target]
 
     levels = build_levels(args)
     est = sum(math.ceil(u / args.spawn_rate) + args.stage_duration + args.cooldown for u in levels)
@@ -790,7 +853,10 @@ def main():
         return
     check_locust()
     if not args.skip_preflight:
-        preflight(args.host)
+        if args.target == "lmstudio":
+            preflight_lmstudio(args.host, passthrough_value(args.passthrough, "--model"))
+        else:
+            preflight(args.host)
 
     out_dir = (BASE_DIR / args.out if not Path(args.out).is_absolute() else Path(args.out)) \
         / datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -805,8 +871,9 @@ def main():
     global STATUS
     if stop_requested():
         STOP_FILE.unlink()  # A stop request from an earlier run must not end this one.
-    STATUS = StatusPublisher(out_dir.name)
+    STATUS = StatusPublisher(out_dir.name, args.target)
     STATUS.start()
+    print(f"Target: {target['label']} at {args.host}")
     print("Stop at any time with the \"Stop & delete threads\" button in the live monitor's dashboard.")
     if not sampler.gpu_available:
         print("Note: no supported GPU metrics source found, GPU limits will not be checked.")

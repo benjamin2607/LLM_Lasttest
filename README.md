@@ -15,15 +15,18 @@ Step-by-step guide for the first run: **[QUICKSTART.md](QUICKSTART.md)**. All op
 | File | Purpose |
 |---|---|
 | `main.py` | Locust user behaviour against the AnythingLLM developer API (options for manual Locust runs: `PARAMETERS.md`) |
-| `auto_loadtest.py` | Automated capacity test: increases concurrent users stage by stage until a limit is exceeded |
+| `lmstudio_user.py` | Locust user behaviour against LM Studio's OpenAI-compatible API, without AnythingLLM |
+| `auto_loadtest.py` | Automated capacity test of AnythingLLM or LM Studio (`--target`): increases concurrent users stage by stage until a limit is exceeded |
+| `locust_final_stats.py` | Writes complete Locust statistics at the end of each stage (used by both Locust files) |
 | `lmstudio_monitor.py` | Live monitor for production use (LM Studio log + API + GPU) with a real-time dashboard |
 | `lmstudio_log_parser.py` | Turns LM Studio log entries into request metrics (used by the monitor and the load test) |
 | `dashboard.html` | Dashboard front end, served by the monitor (no external libraries) |
 | `report_charts.py` | Self-contained SVG charts and HTML rendering for the reports |
 | `live_session.py` | Recording sessions for live tests: per-request data, per-minute values, hardware and report |
 | `system_metrics.py` | Shared GPU/host metrics sampler (NVIDIA via nvidia-smi, macOS via ioreg, psutil) |
-| `prompts.json` | Questions sent by the simulated users |
-| `tests/` | Unit tests for the log parser and the live sessions |
+| `prompts.json` | Questions for the AnythingLLM test (refer to the workspace documents) |
+| `prompts_lmstudio.json` | Questions for the direct LM Studio test (general study questions, no documents needed) |
+| `tests/` | Unit tests for the log parser, the live sessions and the LM Studio load test |
 | `QUICKSTART.md` | Step-by-step guide: install, monitor, first load test, live session |
 | `PARAMETERS.md` | Reference of all options and environment variables with guideline values |
 
@@ -85,12 +88,36 @@ Results are written to `loadtest_results/<timestamp>/`:
 | `report.html` | The report, in the same layout as the live session reports. Sections: **Result** (stable limit, throughput, estimated number of students, models), **Requests** (answered, failed, refusals), **Response times**, **Tokens** and **Hardware** – each as tiles with average, median, p95 and maximum at the stage with the highest stable throughput – then the most frequent errors, **charts by load** (response time, throughput, tokens/s, failures and refusals, GPU and memory per number of users), **charts over time** (every request and the hardware over the whole run), refusals and the stage table |
 | `report.md` | The same as Markdown, charts as SVG files in `charts/` |
 | `results.csv` / `results.json` | All figures per stage |
-| `stage_XX_*` | Locust HTML report, CSV statistics and log per stage |
+| `stage_XX_*` | Locust HTML report, CSV statistics and log per stage; `*_final.csv` holds the complete statistics including the requests that finished during the stop grace period |
 
 The report also identifies throughput saturation and estimates how many *real* students the
 system can serve, using Little's law with `--student-think-time` (default: 90 s between two questions).
 
 Tip: run once with `--mode query` and once with `--mode chat`; for overnight runs, choose a generous `--users` list.
+
+### Testing LM Studio directly
+
+`--target lmstudio` runs the same test against LM Studio's OpenAI-compatible API
+(`http://localhost:1234/v1/chat/completions`) instead of AnythingLLM:
+
+```bash
+python auto_loadtest.py --target lmstudio --users 1,2,4,8,16,24,32 --refine -- --context-tokens 2000
+```
+
+- No AnythingLLM API key or workspace is needed. The first loaded model is used unless
+  `-- --model ID` is given; `LMSTUDIO_API_TOKEN` is used if "Require API token" is enabled.
+- The questions come from `prompts_lmstudio.json`: general study questions that need no documents
+  (the AnythingLLM questions in `prompts.json` refer to the workspace documents).
+- Answers are streamed as in a chat window; the response time counts until the last token.
+- `-- --context-tokens N` adds about N tokens of shuffled lecture-style text to every request, so
+  the model processes a similar input as with AnythingLLM's document excerpts. A good value is the
+  *Tokens in* average of an AnythingLLM report minus about 100.
+- Stages, limits, report layout and result files are the same, and the dashboard form offers the
+  same choice ("System under test"). Threads and "no relevant documents" refusals do not exist
+  here; technical rejections are reported as usual.
+
+Comparing both reports separates the model's capacity from the time AnythingLLM adds (document
+search, embedding, prompt building). All options: [PARAMETERS.md](PARAMETERS.md#4-simulated-users-for-lm-studio--lmstudio_userpy).
 
 ### Threads
 

@@ -407,9 +407,10 @@ class LoadTestControl:
         "stop_timeout": (int, 0, 600), "max_p95": (float, 1, 3600), "max_fail_rate": (float, 0, 1),
         "student_think_time": (float, 1, 3600), "wait_min": (float, 0, 600), "wait_max": (float, 0, 600),
         "request_timeout": (float, 5, 3600), "max_threads": (int, 0, 10000),
+        "max_tokens": (int, 0, 131072), "context_tokens": (int, 0, 200000), "temperature": (float, 0, 2),
     }
 
-    def __init__(self, project_dir, anythingllm_url, api_key):
+    def __init__(self, project_dir, anythingllm_url, api_key, lmstudio_url="http://localhost:1234", lmstudio_token=None):
         self.project_dir = project_dir = Path(project_dir)
         self.process = None
         self.launch_info = None
@@ -418,6 +419,8 @@ class LoadTestControl:
         self.registry_file = project_dir / ".loadtest_threads.json"
         self.url = anythingllm_url.rstrip("/")
         self.api_key = api_key
+        self.lmstudio_url = lmstudio_url.rstrip("/")
+        self.lmstudio_token = lmstudio_token
         self.lock = threading.Lock()
         self.progress = {"phase": "idle"}
 
@@ -427,7 +430,7 @@ class LoadTestControl:
         except (OSError, ValueError):
             return {"running": False}
         running = time.time() - status.get("heartbeat", 0) < self.HEARTBEAT_TIMEOUT_S
-        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users", "workspace", "run_started")}}
+        return {"running": running, **{k: status.get(k) for k in ("run", "stage", "users", "workspace", "run_started", "target")}}
 
     def _run_config(self, run):
         """Settings of a load test run from its config.json (values as the run recorded them)."""
@@ -501,11 +504,14 @@ class LoadTestControl:
                 status = "no data"
             else:
                 status = "completed"
+            target = cfg.get("target") or "anythingllm"  # Runs from before --target existed tested AnythingLLM.
+            forwarded = cfg.get("forwarded", {})
             out.append({
-                "run": folder.name, "status": status,
+                "run": folder.name, "status": status, "target": target,
                 "users": cfg.get("users") if cfg.get("users") not in (None, "", "None")
                 else ",".join(str(r["users"]) for r in sorted(stages, key=lambda r: r["users"])),
-                "mode": cfg.get("forwarded", {}).get("mode", "query"), "stage_duration": cfg.get("stage_duration"),
+                "mode": forwarded.get("mode", "query") if target == "anythingllm" else forwarded.get("model", "auto"),
+                "stage_duration": cfg.get("stage_duration"),
                 "stages_run": len(stages), "highest_passing": max((r["users"] for r in passing), default=None),
                 "limit_at": first_fail["users"] if first_fail else None,
                 "limit_reason": first_fail.get("reasons") if first_fail else None,
@@ -531,8 +537,8 @@ class LoadTestControl:
         return {"loadtest": self.loadtest(), "threads": len(self.threads()),
                 "can_delete": bool(self.api_key), "progress": progress, "launch": launch,
                 "latest_report": self.latest_report(),
-                "defaults": {"host": self.url, "workspace": os.environ.get("WORKSPACE_SLUG", ""),
-                             "api_key_set": bool(self.api_key)}}
+                "defaults": {"host": self.url, "lmstudio_host": self.lmstudio_url,
+                             "workspace": os.environ.get("WORKSPACE_SLUG", ""), "api_key_set": bool(self.api_key)}}
 
     def latest_report(self):
         results = self.project_dir / "loadtest_results"
@@ -556,18 +562,33 @@ class LoadTestControl:
         users = str(params.get("users", "")).replace(" ", "")
         if not re.fullmatch(r"\d{1,4}(,\d{1,4}){0,40}", users) or not all(int(u) > 0 for u in users.split(",")):
             return False, "users must be a comma-separated list of positive numbers, e.g. 1,2,4,8"
-        host = str(params.get("host") or self.url).strip()
+        target = params.get("target") or "anythingllm"
+        if target not in ("anythingllm", "lmstudio"):
+            return False, "target must be anythingllm or lmstudio"
+        host = str(params.get("host") or (self.url if target == "anythingllm" else self.lmstudio_url)).strip()
         if not re.fullmatch(r"https?://[\w.\-\[\]:]+(/[\w./\-]*)?", host):
             return False, "host must be an http(s) URL"
-        workspace = str(params.get("workspace") or os.environ.get("WORKSPACE_SLUG", "")).strip()
-        if not re.fullmatch(r"[\w-]{1,100}", workspace):
-            return False, "workspace slug is missing or invalid"
-        api_key = str(params.get("api_key") or self.api_key or "")
-        if not api_key:
-            return False, "an AnythingLLM API key is required (field or env ANYTHING_API_KEY)"
-        mode = params.get("mode", "query")
-        if mode not in ("query", "chat"):
-            return False, "mode must be query or chat"
+        env = dict(os.environ)
+        if target == "anythingllm":
+            workspace = str(params.get("workspace") or os.environ.get("WORKSPACE_SLUG", "")).strip()
+            if not re.fullmatch(r"[\w-]{1,100}", workspace):
+                return False, "workspace slug is missing or invalid"
+            api_key = str(params.get("api_key") or self.api_key or "")
+            if not api_key:
+                return False, "an AnythingLLM API key is required (field or env ANYTHING_API_KEY)"
+            mode = params.get("mode", "query")
+            if mode not in ("query", "chat"):
+                return False, "mode must be query or chat"
+            env.update(ANYTHING_API_KEY=api_key, WORKSPACE_SLUG=workspace)
+            secret = api_key
+        else:
+            workspace, mode = None, None
+            model = str(params.get("model") or "").strip()
+            if model and not re.fullmatch(r"[\w][\w.:/@-]{0,199}", model):
+                return False, "model must be a model id as listed by LM Studio"
+            if self.lmstudio_token:
+                env["LMSTUDIO_API_TOKEN"] = self.lmstudio_token
+            secret = self.lmstudio_token
         values = {}
         for key, (kind, lo, hi) in self.LAUNCH_PARAMS.items():
             if params.get(key) in (None, ""):
@@ -582,18 +603,24 @@ class LoadTestControl:
         if values.get("wait_min", 0) > values.get("wait_max", values.get("wait_min", 0)):
             return False, "wait_min must not exceed wait_max"
 
-        cmd = [sys.executable, str(self.project_dir / "auto_loadtest.py"), "--host", host, "--users", users]
+        cmd = [sys.executable, str(self.project_dir / "auto_loadtest.py"), "--target", target, "--host", host,
+               "--users", users]
         for key in ("stage_duration", "spawn_rate", "cooldown", "stop_timeout", "max_p95", "max_fail_rate",
                     "student_think_time"):
             if key in values:
                 cmd += [f"--{key.replace('_', '-')}", str(values[key])]
         if params.get("refine"):
             cmd.append("--refine")
-        cmd += ["--", "--mode", mode]
-        for key in ("wait_min", "wait_max", "request_timeout", "max_threads"):
+        # Options of the Locust user file; each target only gets the ones it understands.
+        if target == "anythingllm":
+            cmd += ["--", "--mode", mode]
+            forwarded = ("wait_min", "wait_max", "request_timeout", "max_threads")
+        else:
+            cmd += ["--", "--model", model] if model else ["--"]
+            forwarded = ("wait_min", "wait_max", "request_timeout", "max_tokens", "context_tokens", "temperature")
+        for key in forwarded:
             if key in values:
                 cmd += [f"--{key.replace('_', '-')}", str(values[key])]
-        env = {**os.environ, "ANYTHING_API_KEY": api_key, "WORKSPACE_SLUG": workspace}
         log_dir = self.project_dir / "loadtest_results"
         log_dir.mkdir(exist_ok=True)
         log = log_dir / f"dashboard_{datetime.now():%Y%m%d_%H%M%S}.log"
@@ -602,9 +629,9 @@ class LoadTestControl:
             self.process = subprocess.Popen(cmd, cwd=self.project_dir, env=env, stdout=out, stderr=subprocess.STDOUT,
                                             **flags)
         with self.lock:
-            self.launch_info = {"pid": self.process.pid, "started": time.time(), "log": str(log),
+            self.launch_info = {"pid": self.process.pid, "started": time.time(), "log": str(log), "target": target,
                                 "users": users, "mode": mode, "host": host, "workspace": workspace}
-        printable = [c for c in cmd if c != api_key]
+        printable = [c for c in cmd if not secret or c != secret]
         print(f"[monitor] load test started from the dashboard: {' '.join(printable[1:])}")
         return True, f"load test started (log: {log.name})"
 
@@ -934,7 +961,8 @@ def main():
 
     if args.dashboard_port:
         try:
-            control = LoadTestControl(args.project_dir, args.anythingllm_url, os.environ.get("ANYTHING_API_KEY"))
+            control = LoadTestControl(args.project_dir, args.anythingllm_url, os.environ.get("ANYTHING_API_KEY"),
+                                      args.lmstudio_url, args.token)
             start_dashboard(args.dashboard_port, recorder, control, sessions)
         except OSError as exc:
             sys.exit(f"[monitor] ERROR: cannot bind dashboard to 127.0.0.1:{args.dashboard_port} ({exc.strerror}). "

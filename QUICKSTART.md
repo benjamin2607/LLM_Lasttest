@@ -97,6 +97,19 @@ above 120 s, more than 5 % failures, GPU memory or temperature too high).
 table. The *Result* section at the top shows the highest stable number of concurrent users and an
 estimate of how many real students the system can serve.
 
+### Testing LM Studio directly
+
+To measure the model alone, without AnythingLLM, choose **LM Studio directly** in the form, or:
+
+```bash
+python auto_loadtest.py --target lmstudio --users 1,2,4,8,16
+```
+
+No API key or workspace is needed; the first loaded model is used (`-- --model ID` picks another).
+The questions come from `prompts_lmstudio.json` and need no documents. Add
+`-- --context-tokens 2000` to put a RAG-like input load on the model. The report has the same
+layout; comparing it with an AnythingLLM report shows how much time AnythingLLM itself adds.
+
 ## 6. Record a live test with students
 
 1. Click **Start session** below the dashboard header and enter a name, e.g. `Seminar 22.10.`
@@ -111,7 +124,7 @@ Sessions store only numbers, times and model names, no prompts, answers or user 
 
 ## 7. Next steps
 
-- Compare `--mode query` and `--mode chat`; see [PARAMETERS.md](PARAMETERS.md#3-simulated-users--mainpy).
+- Compare `--mode query` and `--mode chat`; see [PARAMETERS.md](PARAMETERS.md#3-simulated-users-for-anythingllm--mainpy).
 - Adjust the limits to what students will tolerate, e.g. `--max-p95 45`.
 - Use `--refine` for the final measurement to find the exact limit.
 - Edit `prompts.json` so the questions match the documents in the workspace.

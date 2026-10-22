@@ -1,0 +1,22 @@
+[
+    "Erkläre den Unterschied zwischen TCP und UDP und nenne je ein typisches Anwendungsbeispiel.",
+    "Was ist ein neuronales Netz? Erkläre es so, dass es ein Erstsemester versteht.",
+    "Fasse die wichtigsten Prinzipien der objektorientierten Programmierung in Stichpunkten zusammen.",
+    "Wie funktioniert der Quicksort-Algorithmus? Beschreibe ihn Schritt für Schritt und nenne seine Laufzeit.",
+    "Nenne drei Vor- und drei Nachteile von Cloud Computing.",
+    "Was versteht man unter Datenschutz nach der DSGVO? Nenne die wichtigsten Grundsätze.",
+    "Erkläre den Unterschied zwischen einem Prozess und einem Thread.",
+    "Schreibe eine Python-Funktion, die prüft, ob ein Wort ein Palindrom ist, und erkläre den Code.",
+    "Was ist der Unterschied zwischen überwachtem und unüberwachtem Lernen? Nenne je ein Beispiel.",
+    "Erkläre in genau drei Sätzen, was eine relationale Datenbank ist.",
+    "Wie funktioniert asymmetrische Verschlüsselung? Erkläre das Prinzip am Beispiel einer E-Mail.",
+    "Formuliere drei Prüfungsfragen zum Thema Betriebssysteme und beantworte sie kurz.",
+    "Vergleiche Git und SVN in einer Tabelle.",
+    "Was ist die Big-O-Notation und warum ist sie wichtig? Nenne Beispiele für O(1), O(n) und O(n²).",
+    "Erkläre das OSI-Modell und beschreibe jede Schicht in einem Satz.",
+    "Was sind die Grundideen von agiler Softwareentwicklung und Scrum?",
+    "Erstelle einen Lernplan für eine Woche zur Vorbereitung auf eine Klausur in Mathematik für Informatiker.",
+    "Was ist ein Large Language Model und wo liegen seine Grenzen?",
+    "Erkläre den Unterschied zwischen Stack und Heap im Arbeitsspeicher.",
+    "Was ist REST? Erkläre die wichtigsten HTTP-Methoden mit je einem Beispiel."
+]

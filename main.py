@@ -41,6 +41,8 @@ from pathlib import Path
 
 from locust import HttpUser, task, events
 
+import locust_final_stats  # noqa: F401 - writes complete statistics when Locust quits.
+
 API_KEY = os.environ["ANYTHING_API_KEY"]
 WORKSPACE = os.environ["WORKSPACE_SLUG"]
 

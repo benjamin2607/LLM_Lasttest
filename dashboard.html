@@ -328,10 +328,15 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
     <details id="ltDetails">
       <summary>New load test …</summary>
       <form id="ltForm" class="form-grid" autocomplete="off">
-        <label>AnythingLLM URL<input name="host" type="url" required></label>
-        <label>Workspace slug<input name="workspace" required pattern="[A-Za-z0-9_\-]+"></label>
-        <label>API key<input name="api_key" type="password" id="ltKey" placeholder="from ANYTHING_API_KEY"></label>
-        <label>Mode<select name="mode"><option value="query">query (RAG, documents only)</option><option value="chat">chat</option></select></label>
+        <label>System under test<select name="target" id="ltTarget"><option value="anythingllm">AnythingLLM (with RAG)</option><option value="lmstudio">LM Studio directly</option></select></label>
+        <label><span id="ltHostLabel">AnythingLLM URL</span><input name="host" type="url" required></label>
+        <label data-for="anythingllm">Workspace slug<input name="workspace" required pattern="[A-Za-z0-9_\-]+"></label>
+        <label data-for="anythingllm">API key<input name="api_key" type="password" id="ltKey" placeholder="from ANYTHING_API_KEY"></label>
+        <label data-for="anythingllm">Mode<select name="mode"><option value="query">query (RAG, documents only)</option><option value="chat">chat</option></select></label>
+        <label data-for="lmstudio" hidden>Model<input name="model" placeholder="auto: first loaded model" pattern="[\w][\w.:/@\-]*" disabled></label>
+        <label data-for="lmstudio" hidden>Context tokens per request (RAG simulation)<input name="context_tokens" type="number" min="0" value="0" disabled></label>
+        <label data-for="lmstudio" hidden>Max tokens per answer (0 = no limit)<input name="max_tokens" type="number" min="0" value="0" disabled></label>
+        <label data-for="lmstudio" hidden>Temperature<input name="temperature" type="number" min="0" max="2" step="any" value="0.7" disabled></label>
         <label class="wide">Stages: concurrent users<input name="users" value="1,2,4,8,16" required pattern="\d+(,\d+)*"></label>
         <label>Measurement per stage (s)<input name="stage_duration" type="number" min="10" value="300"></label>
         <label>New users per second<input name="spawn_rate" type="number" min="0.1" step="any" value="1"></label>
@@ -343,20 +348,20 @@ footer { color: var(--text-3); font-size: 12px; margin-top: 6px; display: flex; 
         <label>Limit: p95 response time (s)<input name="max_p95" type="number" min="1" value="120"></label>
         <label>Limit: failure rate (%)<input name="max_fail_pct" type="number" min="0" max="100" step="any" value="5"></label>
         <label>Student think time for estimate (s)<input name="student_think_time" type="number" min="1" value="90"></label>
-        <label>Threads kept in AnythingLLM<input name="max_threads" type="number" min="0" value="30"></label>
+        <label data-for="anythingllm">Threads kept in AnythingLLM<input name="max_threads" type="number" min="0" value="30"></label>
         <label class="check"><input name="refine" type="checkbox"> Find the exact limit (bisection)</label>
         <div class="form-foot">
           <span class="text" id="ltEstimate"></span>
           <button type="submit" class="btn-rec">▶ Start load test</button>
         </div>
-        <p class="hint">The load test sends real requests to AnythingLLM and LM Studio. Do not run it while students are using the system.</p>
+        <p class="hint">The load test sends real requests to AnythingLLM and LM Studio (or to LM Studio only). Do not run it while students are using the system.</p>
       </form>
     </details>
     <pre id="ltLog" hidden></pre>
     <div class="listing">
       <div class="subhead">Previous load tests</div>
       <div class="tablewrap" style="max-height:none"><table>
-        <thead><tr><th>Date</th><th>Stages (users)</th><th>Mode</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th><th><span class="sr-only">Delete</span></th></tr></thead>
+        <thead><tr><th>Date</th><th>Stages (users)</th><th>Target</th><th>Per stage</th><th>Result</th><th>Max throughput</th><th>p95 at best</th><th>Status</th><th>Report</th><th><span class="sr-only">Delete</span></th></tr></thead>
         <tbody id="ltList"></tbody>
       </table></div>
     </div>
@@ -820,6 +825,7 @@ function renderLoadTestTools() {
   const d = control.defaults || {}, f = $("ltForm");
   if (!ltDefaultsSet && control.defaults) {
     f.host.value = d.host || "http://localhost:3001"; f.workspace.value = d.workspace || "";
+    f.host.dataset.anythingllm = f.host.value; f.host.dataset.lmstudio = d.lmstudio_host || "http://localhost:1234";
     $("ltKey").placeholder = d.api_key_set ? "from ANYTHING_API_KEY (set)" : "required: ANYTHING_API_KEY is not set";
     $("ltKey").required = !d.api_key_set;
     ltDefaultsSet = true;
@@ -835,12 +841,26 @@ function renderLoadTestTools() {
   $("ltEstimate").textContent = users.length ? `${users.length} stages, up to about ${duration(sec)}` + (f.refine.checked ? " plus bisection" : "") : "";
 }
 $("ltForm").addEventListener("input", renderLoadTestTools);
+// Show only the fields of the selected system; hidden fields are disabled, so they are neither validated nor sent.
+$("ltTarget").addEventListener("change", e => {
+  const f = $("ltForm"), target = e.target.value, other = target === "lmstudio" ? "anythingllm" : "lmstudio";
+  f.host.dataset[other] = f.host.value;
+  f.host.value = f.host.dataset[target] || "";
+  $("ltHostLabel").textContent = target === "lmstudio" ? "LM Studio URL" : "AnythingLLM URL";
+  f.querySelectorAll("[data-for]").forEach(label => {
+    const on = label.dataset.for === target;
+    label.hidden = !on;
+    label.querySelectorAll("input, select").forEach(el => { el.disabled = !on; });
+  });
+  if (target === "anythingllm") $("ltKey").required = !(control.defaults || {}).api_key_set;
+});
 $("ltForm").addEventListener("submit", async e => {
   e.preventDefault();
   const f = e.target, body = Object.fromEntries(new FormData(f));
   body.refine = f.refine.checked;
   body.max_fail_rate = (+body.max_fail_pct || 0) / 100; delete body.max_fail_pct;
-  if (!confirm(`Start a load test with ${body.users} concurrent users against ${body.host}?\n\nIt sends real requests to AnythingLLM and LM Studio.`)) return;
+  const system = body.target === "lmstudio" ? "LM Studio" : "AnythingLLM and LM Studio";
+  if (!confirm(`Start a load test with ${body.users} concurrent users against ${body.host}?\n\nIt sends real requests to ${system}.`)) return;
   try {
     const res = await fetch("api/loadtest/start", { method: "POST", headers: { "X-Monitor-Action": "loadtest", "Content-Type": "application/json" },
                                                      body: JSON.stringify(body) });
@@ -860,21 +880,26 @@ async function openLoadTestPanel() {
   try {
     const d = await (await fetch("api/loadtest/details", { cache: "no-store" })).json(), c = d.config || {}, f = c.forwarded || {};
     if (!d.run) { panel.innerHTML = `<h3>No load test yet</h3><div class="lt-sub">Start one in the Load test card at the bottom.</div>`; return; }
-    const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v;
+    const yes = v => v === "True" ? "yes" : v === "False" ? "no" : v, lms = c.target === "lmstudio";
     const started = /^\d{8}_\d{6}$/.test(d.run) ? `${d.run.slice(6, 8)}.${d.run.slice(4, 6)}. ${d.run.slice(9, 11)}:${d.run.slice(11, 13)}` : d.run;
     panel.innerHTML = `<h3>${d.running ? `Running – stage ${d.stage || 0} with ${d.users || 0} users` : "Last load test"}</h3>
       <div class="lt-sub">Run ${escapeHtml(d.run)}${d.running ? "" : " (finished)"}</div>`
-      + dl([["Started", started], ["Workspace", d.workspace], ["Stages (users)", c.users], ["Measurement per stage", c.stage_duration && `${c.stage_duration} s`],
-            ["Mode", f.mode || "query"], ["Think time", f.wait_min && `${f.wait_min}–${f.wait_max} s`],
+      + dl([["Started", started], ["System under test", lms ? "LM Studio directly" : "AnythingLLM"],
+            ...(lms ? [["Model", f.model || "auto (first loaded model)"], ["Context tokens per request", f.context_tokens || "0"],
+                       ["Max tokens per answer", f.max_tokens && f.max_tokens !== "0" ? f.max_tokens : "no limit"]]
+                    : [["Workspace", d.workspace], ["Mode", f.mode || "query"]]),
+            ["Stages (users)", c.users], ["Measurement per stage", c.stage_duration && `${c.stage_duration} s`],
+            ["Think time", f.wait_min && `${f.wait_min}–${f.wait_max} s`],
             ["Limit: p95 response time", c.max_p95 && `${c.max_p95} s`], ["Limit: failure rate", c.max_fail_rate && `${(+c.max_fail_rate * 100).toFixed(1)} %`],
-            ["Find exact limit", yes(c.refine)], ["Threads kept", f.max_threads || "30"]])
+            ["Find exact limit", yes(c.refine)], ...(lms ? [] : [["Threads kept", f.max_threads || "30"]])])
       + `<details><summary>Advanced</summary>` + dl([
-            ["AnythingLLM URL", c.host], ["New users per second", c.spawn_rate], ["Pause between stages", c.cooldown && `${c.cooldown} s`],
+            [lms ? "LM Studio URL" : "AnythingLLM URL", c.host], ["New users per second", c.spawn_rate], ["Pause between stages", c.cooldown && `${c.cooldown} s`],
             ["Grace for running requests", c.stop_timeout && `${c.stop_timeout} s`], ["Request timeout", f.request_timeout && `${f.request_timeout} s`],
             ["Student think time (estimate)", c.student_think_time && `${c.student_think_time} s`], ["Refusal highlight from", c.refusal_warn_rate && `${(+c.refusal_warn_rate * 100).toFixed(0)} %`],
             ["Limit: GPU memory", c.max_vram_pct && `${c.max_vram_pct} %`], ["Limit: GPU temperature", c.max_gpu_temp && `${c.max_gpu_temp} °C`],
             ["LM Studio log", c.lmstudio_log], ["Locust file", c.locustfile], ["Results folder", c.out],
-            ["Other options for main.py", Object.entries(f).filter(([k]) => !["mode", "wait_min", "wait_max", "request_timeout", "max_threads"].includes(k)).map(([k, v]) => `--${k.replace(/_/g, "-")} ${v}`).join(" ")]],
+            ["Temperature", lms ? f.temperature : null],
+            [`Other options for ${lms ? "lmstudio_user.py" : "main.py"}`, Object.entries(f).filter(([k]) => !["mode", "wait_min", "wait_max", "request_timeout", "max_threads", "model", "context_tokens", "max_tokens", "temperature"].includes(k)).map(([k, v]) => `--${k.replace(/_/g, "-")} ${v}`).join(" ")]],
           "adv") + `</details>`;
   } catch (e) { panel.innerHTML = `<div class="lt-sub">Could not load the settings.</div>`; }
 }
@@ -895,7 +920,7 @@ async function loadLoadTests() {
       const result = x.highest_passing != null ? `passed up to ${x.highest_passing} users` + (x.limit_at ? ` · limit at ${x.limit_at}` : "")
         : x.limit_at ? `limit at ${x.limit_at} users` : "–";
       const tag = x.status === "setup error" ? "error" : x.status;
-      return `<tr><td>${date}</td><td>${escapeHtml(x.users || "–")}</td><td>${escapeHtml(x.mode)}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
+      return `<tr><td>${date}</td><td>${escapeHtml(x.users || "–")}</td><td>${x.target === "lmstudio" ? "LM Studio · " : "AnythingLLM · "}${escapeHtml(x.mode)}</td><td>${x.stage_duration ? x.stage_duration + " s" : "–"}</td>
         <td title="${escapeHtml(x.limit_reason || "")}">${result}</td><td>${x.max_per_min != null ? fmt(x.max_per_min, 1) + " /min" : "–"}</td>
         <td>${x.p95_at_best != null ? fmt(x.p95_at_best, 1) + " s" : "–"}</td><td><span class="status-tag ${tag}">${escapeHtml(x.status)}</span></td>
         <td>${x.report ? `<a href="loadtest/${encodeURIComponent(x.run)}/report.html" target="_blank" rel="noopener">Open</a>` : "–"}</td>
